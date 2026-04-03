@@ -1,0 +1,98 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - 5432:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  mailhog:
+    image: arjenz/mailhog
+    ports:
+      - 8025:8025
+      - 1025:1025
+
+  valkey:
+    image: valkey/valkey@sha256:12ba4f45a7c3e1d0f076acd616cb230834e75a77e8516dde382720af32832d6d
+    command: "valkey-server --appendonly yes"
+    ports:
+      - 6380:6379
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=devminio
+      - MINIO_ROOT_PASSWORD=devminio123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  formbricks:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    ports:
+      - 3000:3000
+    volumes:
+      - uploads:/home/nextjs/apps/web/uploads
+    environment:
+      WEBAPP_URL: "http://localhost:3000"
+      NEXTAUTH_URL: "http://localhost:3000"
+      DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/postgres?schema=public"
+      # Secrets – vor dem ersten Start mit echten Werten befüllen:
+      # openssl rand -hex 32
+      NEXTAUTH_SECRET: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
+      ENCRYPTION_KEY: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
+      CRON_SECRET: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
+      REDIS_URL: "redis://valkey:6379"
+      EMAIL_VERIFICATION_DISABLED: 1
+      PASSWORD_RESET_DISABLED: 1
+      # Mailhog für lokales E-Mail-Testing
+      MAIL_FROM: "admin@companlabs.de"
+      SMTP_HOST: "mailhog"
+      SMTP_PORT: "1025"
+      SMTP_AUTHENTICATED: "0"
+      # MinIO als S3-kompatibler Speicher
+      S3_ACCESS_KEY: "devminio"
+      S3_SECRET_KEY: "devminio123"
+      S3_REGION: "us-east-1"
+      S3_BUCKET_NAME: "formbricks"
+      S3_ENDPOINT_URL: "http://minio:9000"
+      S3_FORCE_PATH_STYLE: "1"
+
+volumes:
+  postgres:
+    driver: local
+  valkey-data:
+    driver: local
+  minio-data:
+    driver: local
+  uploads:
+    driver: local
