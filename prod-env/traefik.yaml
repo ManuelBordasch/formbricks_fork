@@ -1,0 +1,36 @@
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+    transport:
+      respondingTimeouts:
+        readTimeout: 60s
+  websecure:
+    address: ":443"
+    transport:
+      respondingTimeouts:
+        readTimeout: 60s
+    http:
+      tls:
+        certResolver: default
+        options: default
+      middlewares:
+        - hstsHeader
+providers:
+  docker:
+    watch: true
+    exposedByDefault: false
+  file:
+    directory: /
+certificatesResolvers:
+  default:
+    acme:
+      email: admin@companlabs.de
+      storage: acme.json
+      caServer: https://acme-v02.api.letsencrypt.org/directory
+      tlsChallenge: {}

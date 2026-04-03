@@ -52,6 +52,7 @@ services:
     build:
       context: .
       dockerfile: apps/web/Dockerfile
+    image: formbricks_cl:latest
     restart: always
     depends_on:
       postgres:
