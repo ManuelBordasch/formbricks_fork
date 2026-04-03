@@ -67,7 +67,7 @@ services:
       NEXTAUTH_URL: "http://localhost:3000"
       DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/postgres?schema=public"
       # Secrets – vor dem ersten Start mit echten Werten befüllen:
-      # openssl rand -hex 32
+      # openssl rand -hex 32.
       NEXTAUTH_SECRET: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
       ENCRYPTION_KEY: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
       CRON_SECRET: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
