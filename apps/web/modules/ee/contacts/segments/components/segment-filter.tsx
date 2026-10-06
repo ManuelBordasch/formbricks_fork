@@ -33,6 +33,7 @@ import {
   type TSegmentOperator,
   type TSegmentPersonFilter,
   type TSegmentSegmentFilter,
+  type TSegmentSurveyInteractionFilter,
   isDateOperator,
 } from "@formbricks/types/segment";
 import { cn } from "@/lib/cn";
@@ -67,35 +68,41 @@ import {
 import { AddFilterModal } from "./add-filter-modal";
 import { AttributeValueInput } from "./attribute-value-input";
 import { DateFilterValue } from "./date-filter-value";
+import { SurveyInteractionFilter } from "./survey-interaction-filter";
 
-interface TSegmentFilterProps {
+// Props shared by every leaf filter component. The dispatcher-only props (workspace segments, attribute
+// keys, add-filter callback) live on TSegmentFilterProps so individual leaves don't declare props they
+// never use.
+export interface TBaseFilterProps {
   connector: TSegmentConnector;
   resource: TSegmentFilter;
-  environmentId: string;
   segment: TSegment;
-  segments: TSegment[];
-  contactAttributeKeys: TContactAttributeKey[];
   setSegment: (segment: TSegment) => void;
-  handleAddFilterBelow: (resourceId: string, filter: TBaseFilter) => void;
   onCreateGroup: (filterId: string) => void;
   onDeleteFilter: (filterId: string) => void;
   onMoveFilter: (filterId: string, direction: "up" | "down") => void;
   viewOnly?: boolean;
 }
 
-function SegmentFilterItemConnector({
+interface TSegmentFilterProps extends TBaseFilterProps {
+  segments: TSegment[];
+  contactAttributeKeys: TContactAttributeKey[];
+  handleAddFilterBelow: (resourceId: string, filter: TBaseFilter) => void;
+}
+
+export function SegmentFilterItemConnector({
   connector,
   segment,
   setSegment,
   filterId,
   viewOnly,
-}: {
+}: Readonly<{
   connector: TSegmentConnector;
   segment: TSegment;
   setSegment: (segment: TSegment) => void;
   filterId: string;
   viewOnly?: boolean;
-}) {
+}>) {
   const { t } = useTranslation();
   const updateLocalSurvey = (newConnector: TSegmentConnector) => {
     const updatedSegment = structuredClone(segment);
@@ -120,40 +127,40 @@ function SegmentFilterItemConnector({
     <div className="w-[40px]">
       <button
         type="button"
-        aria-label={connector ?? t("environments.segments.where")}
+        aria-label={connector ?? t("workspace.segments.where")}
         className={cn(Boolean(connector) && "cursor-pointer underline", viewOnly && "cursor-not-allowed")}
         onClick={() => {
           if (viewOnly) return;
           onConnectorChange();
         }}>
-        {connector ?? t("environments.segments.where")}
+        {connector ?? t("workspace.segments.where")}
       </button>
     </div>
   );
 }
 
-function SegmentFilterItemContextMenu({
+export function SegmentFilterItemContextMenu({
   filterId,
   onAddFilterBelow,
   onCreateGroup,
   onDeleteFilter,
   onMoveFilter,
   viewOnly,
-}: {
+}: Readonly<{
   filterId: string;
   onAddFilterBelow: () => void;
   onCreateGroup: (filterId: string) => void;
   onDeleteFilter: (filterId: string) => void;
   onMoveFilter: (filterId: string, direction: "up" | "down") => void;
   viewOnly?: boolean;
-}) {
+}>) {
   const { t } = useTranslation();
   return (
     <div className="flex items-center gap-2">
       <DropdownMenu>
         <DropdownMenuTrigger asChild disabled={viewOnly}>
           <Button variant="outline" size="icon">
-            <MoreVertical className="h-4 w-4" />
+            <MoreVertical className="size-4" />
           </Button>
         </DropdownMenuTrigger>
 
@@ -162,27 +169,27 @@ function SegmentFilterItemContextMenu({
             onClick={() => {
               onAddFilterBelow();
             }}>
-            {t("environments.segments.add_filter_below")}
+            {t("workspace.segments.add_filter_below")}
           </DropdownMenuItem>
 
           <DropdownMenuItem
             onClick={() => {
               onCreateGroup(filterId);
             }}>
-            {t("environments.segments.create_group")}
+            {t("workspace.segments.create_group")}
           </DropdownMenuItem>
           <DropdownMenuItem
             onClick={() => {
               onMoveFilter(filterId, "up");
             }}
-            icon={<ArrowUpIcon className="h-4 w-4" />}>
+            icon={<ArrowUpIcon className="size-4" />}>
             {t("common.move_up")}
           </DropdownMenuItem>
           <DropdownMenuItem
             onClick={() => {
               onMoveFilter(filterId, "down");
             }}
-            icon={<ArrowDownIcon className="h-4 w-4" />}>
+            icon={<ArrowDownIcon className="size-4" />}>
             {t("common.move_down")}
           </DropdownMenuItem>
         </DropdownMenuContent>
@@ -202,7 +209,8 @@ function SegmentFilterItemContextMenu({
   );
 }
 
-type TAttributeSegmentFilterProps = TSegmentFilterProps & {
+type TAttributeSegmentFilterProps = TBaseFilterProps & {
+  contactAttributeKeys: TContactAttributeKey[];
   onAddFilterBelow: () => void;
   resource: TSegmentAttributeFilter;
   updateValueInLocalSurvey: (filterId: string, newValue: TSegmentFilterValue) => void;
@@ -219,7 +227,7 @@ function AttributeSegmentFilter({
   setSegment,
   contactAttributeKeys,
   viewOnly,
-}: TAttributeSegmentFilterProps) {
+}: Readonly<TAttributeSegmentFilterProps>) {
   const { contactAttributeKey } = resource.root;
   const { t } = useTranslation();
   const operatorText = convertOperatorToText(resource.qualifier.operator, t);
@@ -236,7 +244,7 @@ function AttributeSegmentFilter({
       if (isNumber.success) {
         setValueError("");
       } else {
-        setValueError(t("environments.segments.value_must_be_a_number"));
+        setValueError(t("workspace.segments.value_must_be_a_number"));
       }
     }
   }, [resource.qualifier, resource.value, t]);
@@ -314,7 +322,6 @@ function AttributeSegmentFilter({
         return (
           <AttributeValueInput
             attributeKeyId={attributeKey.id}
-            environmentId={segment.environmentId}
             value={resource.value as string}
             onChange={(newValue) => {
               updateValueInLocalSurvey(resource.id, newValue);
@@ -337,7 +344,7 @@ function AttributeSegmentFilter({
             updateValueInLocalSurvey(resource.id, value);
 
             if (!value) {
-              setValueError(t("environments.segments.value_cannot_be_empty"));
+              setValueError(t("workspace.segments.value_cannot_be_empty"));
               return;
             }
 
@@ -350,7 +357,7 @@ function AttributeSegmentFilter({
                 setValueError("");
                 updateValueInLocalSurvey(resource.id, Number.parseInt(value, 10));
               } else {
-                setValueError(t("environments.segments.value_must_be_a_number"));
+                setValueError(t("workspace.segments.value_must_be_a_number"));
                 updateValueInLocalSurvey(resource.id, value);
               }
 
@@ -388,7 +395,7 @@ function AttributeSegmentFilter({
         }}
         value={attrKeyValue}>
         <SelectTrigger
-          className="flex w-auto items-center justify-center whitespace-nowrap bg-white"
+          className="flex w-auto items-center justify-center bg-white whitespace-nowrap"
           hideArrow>
           <SelectValue>
             <div className="flex items-center gap-2">
@@ -445,7 +452,7 @@ function AttributeSegmentFilter({
   );
 }
 
-type TPersonSegmentFilterProps = TSegmentFilterProps & {
+type TPersonSegmentFilterProps = TBaseFilterProps & {
   onAddFilterBelow: () => void;
   resource: TSegmentPersonFilter;
   updateValueInLocalSurvey: (filterId: string, newValue: TSegmentFilterValue) => void;
@@ -462,7 +469,7 @@ function PersonSegmentFilter({
   segment,
   setSegment,
   viewOnly,
-}: TPersonSegmentFilterProps) {
+}: Readonly<TPersonSegmentFilterProps>) {
   const { personIdentifier } = resource.root;
   const { t } = useTranslation();
   const operatorText = convertOperatorToText(resource.qualifier.operator, t);
@@ -478,7 +485,7 @@ function PersonSegmentFilter({
       if (isNumber.success) {
         setValueError("");
       } else {
-        setValueError(t("environments.segments.value_must_be_a_number"));
+        setValueError(t("workspace.segments.value_must_be_a_number"));
       }
     }
   }, [resource.qualifier, resource.value, t]);
@@ -513,7 +520,7 @@ function PersonSegmentFilter({
     updateValueInLocalSurvey(resource.id, value);
 
     if (!value) {
-      setValueError(t("environments.segments.value_cannot_be_empty"));
+      setValueError(t("workspace.segments.value_cannot_be_empty"));
       return;
     }
 
@@ -526,7 +533,7 @@ function PersonSegmentFilter({
         setValueError("");
         updateValueInLocalSurvey(resource.id, parseInt(value, 10));
       } else {
-        setValueError(t("environments.segments.value_must_be_a_number"));
+        setValueError(t("workspace.segments.value_must_be_a_number"));
         updateValueInLocalSurvey(resource.id, value);
       }
 
@@ -555,11 +562,11 @@ function PersonSegmentFilter({
         }}
         value={personIdentifier}>
         <SelectTrigger
-          className="flex w-auto items-center justify-center whitespace-nowrap bg-white"
+          className="flex w-auto items-center justify-center bg-white whitespace-nowrap"
           hideArrow>
           <SelectValue>
             <div className="flex items-center gap-1 lowercase">
-              <FingerprintIcon className="h-4 w-4 text-sm" />
+              <FingerprintIcon className="size-4 text-sm" />
               <p>{personIdentifier}</p>
             </div>
           </SelectValue>
@@ -625,7 +632,8 @@ function PersonSegmentFilter({
   );
 }
 
-type TSegmentSegmentFilterProps = TSegmentFilterProps & {
+type TSegmentSegmentFilterProps = TBaseFilterProps & {
+  segments: TSegment[];
   onAddFilterBelow: () => void;
   resource: TSegmentSegmentFilter;
 };
@@ -640,7 +648,7 @@ function SegmentSegmentFilter({
   segments,
   setSegment,
   viewOnly,
-}: TSegmentSegmentFilterProps) {
+}: Readonly<TSegmentSegmentFilterProps>) {
   const { segmentId } = resource.root;
   const { t } = useTranslation();
   const operatorText = convertOperatorToText(resource.qualifier.operator, t);
@@ -707,10 +715,10 @@ function SegmentSegmentFilter({
         }}
         value={currentSegment?.id}>
         <SelectTrigger
-          className="flex w-auto items-center justify-center whitespace-nowrap bg-white"
+          className="flex w-auto items-center justify-center bg-white whitespace-nowrap"
           hideArrow>
           <div className="flex items-center gap-1">
-            <Users2Icon className="h-4 w-4 text-sm" />
+            <Users2Icon className="size-4 text-sm" />
             <SelectValue />
           </div>
         </SelectTrigger>
@@ -738,7 +746,7 @@ function SegmentSegmentFilter({
   );
 }
 
-type TDeviceFilterProps = TSegmentFilterProps & {
+type TDeviceFilterProps = TBaseFilterProps & {
   onAddFilterBelow: () => void;
   resource: TSegmentDeviceFilter;
 };
@@ -752,7 +760,7 @@ function DeviceFilter({
   segment,
   setSegment,
   viewOnly,
-}: TDeviceFilterProps) {
+}: Readonly<TDeviceFilterProps>) {
   const { value } = resource;
   const { t } = useTranslation();
   const operatorText = convertOperatorToText(resource.qualifier.operator, t);
@@ -791,7 +799,7 @@ function DeviceFilter({
       />
 
       <div className="flex h-10 items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2">
-        <MonitorSmartphoneIcon className="h-4 w-4" />
+        <MonitorSmartphoneIcon className="size-4" />
         <p>Device</p>
       </div>
 
@@ -811,7 +819,9 @@ function DeviceFilter({
 
         <SelectContent>
           {operatorArr.map((operator) => (
-            <SelectItem value={operator.id}>{operator.name}</SelectItem>
+            <SelectItem key={operator.id} value={operator.id}>
+              {operator.name}
+            </SelectItem>
           ))}
         </SelectContent>
       </Select>
@@ -828,10 +838,12 @@ function DeviceFilter({
 
         <SelectContent>
           {[
-            { id: "desktop", name: t("environments.segments.desktop") },
-            { id: "phone", name: t("environments.segments.phone") },
+            { id: "desktop", name: t("workspace.segments.desktop") },
+            { id: "phone", name: t("workspace.segments.phone") },
           ].map((operator) => (
-            <SelectItem value={operator.id}>{operator.name}</SelectItem>
+            <SelectItem key={operator.id} value={operator.id}>
+              {operator.name}
+            </SelectItem>
           ))}
         </SelectContent>
       </Select>
@@ -851,7 +863,6 @@ function DeviceFilter({
 export function SegmentFilter({
   resource,
   connector,
-  environmentId,
   segment,
   segments,
   contactAttributeKeys,
@@ -861,7 +872,7 @@ export function SegmentFilter({
   onDeleteFilter,
   onMoveFilter,
   viewOnly = false,
-}: TSegmentFilterProps) {
+}: Readonly<TSegmentFilterProps>) {
   const { t } = useTranslation();
   const [addFilterModalOpen, setAddFilterModalOpen] = useState(false);
   const updateFilterValueInSegment = (filterId: string, newValue: TSegmentFilterValue) => {
@@ -877,19 +888,17 @@ export function SegmentFilter({
     setAddFilterModalOpen(true);
   };
 
-  function RenderFilterModal() {
-    return (
-      <AddFilterModal
-        contactAttributeKeys={contactAttributeKeys}
-        onAddFilter={(filter) => {
-          handleAddFilterBelow(resource.id, filter);
-        }}
-        open={addFilterModalOpen}
-        segments={segments}
-        setOpen={setAddFilterModalOpen}
-      />
-    );
-  }
+  const filterModal = (
+    <AddFilterModal
+      contactAttributeKeys={contactAttributeKeys}
+      onAddFilter={(filter) => {
+        handleAddFilterBelow(resource.id, filter);
+      }}
+      open={addFilterModalOpen}
+      segments={segments}
+      setOpen={setAddFilterModalOpen}
+    />
+  );
 
   switch (resource.root.type) {
     case "attribute":
@@ -898,21 +907,18 @@ export function SegmentFilter({
           <AttributeSegmentFilter
             contactAttributeKeys={contactAttributeKeys}
             connector={connector}
-            environmentId={environmentId}
-            handleAddFilterBelow={handleAddFilterBelow}
             onAddFilterBelow={onAddFilterBelow}
             onCreateGroup={onCreateGroup}
             onDeleteFilter={onDeleteFilter}
             onMoveFilter={onMoveFilter}
             resource={resource as TSegmentAttributeFilter}
             segment={segment}
-            segments={segments}
             setSegment={setSegment}
             updateValueInLocalSurvey={updateFilterValueInSegment}
             viewOnly={viewOnly}
           />
 
-          <RenderFilterModal />
+          {filterModal}
         </>
       );
 
@@ -920,23 +926,19 @@ export function SegmentFilter({
       return (
         <>
           <PersonSegmentFilter
-            contactAttributeKeys={contactAttributeKeys}
             connector={connector}
-            environmentId={environmentId}
-            handleAddFilterBelow={handleAddFilterBelow}
             onAddFilterBelow={onAddFilterBelow}
             onCreateGroup={onCreateGroup}
             onDeleteFilter={onDeleteFilter}
             onMoveFilter={onMoveFilter}
             resource={resource as TSegmentPersonFilter}
             segment={segment}
-            segments={segments}
             setSegment={setSegment}
             updateValueInLocalSurvey={updateFilterValueInSegment}
             viewOnly={viewOnly}
           />
 
-          <RenderFilterModal />
+          {filterModal}
         </>
       );
 
@@ -944,10 +946,7 @@ export function SegmentFilter({
       return (
         <>
           <SegmentSegmentFilter
-            contactAttributeKeys={contactAttributeKeys}
             connector={connector}
-            environmentId={environmentId}
-            handleAddFilterBelow={handleAddFilterBelow}
             onAddFilterBelow={onAddFilterBelow}
             onCreateGroup={onCreateGroup}
             onDeleteFilter={onDeleteFilter}
@@ -959,7 +958,7 @@ export function SegmentFilter({
             viewOnly={viewOnly}
           />
 
-          <RenderFilterModal />
+          {filterModal}
         </>
       );
 
@@ -967,26 +966,41 @@ export function SegmentFilter({
       return (
         <>
           <DeviceFilter
-            contactAttributeKeys={contactAttributeKeys}
             connector={connector}
-            environmentId={environmentId}
-            handleAddFilterBelow={handleAddFilterBelow}
             onAddFilterBelow={onAddFilterBelow}
             onCreateGroup={onCreateGroup}
             onDeleteFilter={onDeleteFilter}
             onMoveFilter={onMoveFilter}
             resource={resource as TSegmentDeviceFilter}
             segment={segment}
-            segments={segments}
             setSegment={setSegment}
             viewOnly={viewOnly}
           />
 
-          <RenderFilterModal />
+          {filterModal}
+        </>
+      );
+
+    case "surveyInteraction":
+      return (
+        <>
+          <SurveyInteractionFilter
+            connector={connector}
+            onAddFilterBelow={onAddFilterBelow}
+            onCreateGroup={onCreateGroup}
+            onDeleteFilter={onDeleteFilter}
+            onMoveFilter={onMoveFilter}
+            resource={resource as TSegmentSurveyInteractionFilter}
+            segment={segment}
+            setSegment={setSegment}
+            viewOnly={viewOnly}
+          />
+
+          {filterModal}
         </>
       );
 
     default:
-      return <div>{t("environments.segments.unknown_filter_type")}</div>;
+      return <div>{t("workspace.segments.unknown_filter_type")}</div>;
   }
 }

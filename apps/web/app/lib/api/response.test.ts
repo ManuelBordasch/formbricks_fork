@@ -152,7 +152,7 @@ describe("API Response Utilities", () => {
     test("should use custom cache control header when provided", () => {
       const message = "Something went wrong";
       const customCache = "no-cache";
-      const response = responses.internalServerErrorResponse(message, false, customCache);
+      const response = responses.internalServerErrorResponse(message, false, {}, customCache);
 
       expect(response.headers.get("Cache-Control")).toBe(customCache);
     });
@@ -334,6 +334,56 @@ describe("API Response Utilities", () => {
       const message = "Access denied";
       const customCache = "no-cache";
       const response = responses.forbiddenResponse(message, false, undefined, customCache);
+
+      expect(response.headers.get("Cache-Control")).toBe(customCache);
+    });
+  });
+
+  describe("conflictResponse", () => {
+    test("should return a conflict response", () => {
+      const message = "Resource already exists";
+      const details = { field: "singleUseId" };
+      const response = responses.conflictResponse(message, details);
+
+      expect(response.status).toBe(409);
+
+      return response.json().then((body) => {
+        expect(body).toEqual({
+          code: "conflict",
+          message,
+          details,
+        });
+      });
+    });
+
+    test("should handle undefined details", () => {
+      const message = "Resource already exists";
+      const response = responses.conflictResponse(message);
+
+      expect(response.status).toBe(409);
+
+      return response.json().then((body) => {
+        expect(body).toEqual({
+          code: "conflict",
+          message,
+          details: {},
+        });
+      });
+    });
+
+    test("should include CORS headers when cors is true", () => {
+      const message = "Resource already exists";
+      const response = responses.conflictResponse(message, undefined, true);
+
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(response.headers.get("Access-Control-Allow-Methods")).toBe("GET, POST, PUT, DELETE, OPTIONS");
+      expect(response.headers.get("Access-Control-Allow-Headers")).toBe("Content-Type, Authorization");
+    });
+
+    test("should use custom cache control header when provided", () => {
+      const message = "Resource already exists";
+      const customCache = "no-cache";
+      const response = responses.conflictResponse(message, undefined, false, customCache);
 
       expect(response.headers.get("Cache-Control")).toBe(customCache);
     });

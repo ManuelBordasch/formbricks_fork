@@ -1,9 +1,8 @@
-import { getServerSession } from "next-auth";
 import { notFound, redirect } from "next/navigation";
-import { getEnvironments } from "@/lib/environment/service";
-import { getMembershipByUserIdOrganizationId } from "@/lib/membership/service";
-import { getUserProjects } from "@/lib/project/service";
-import { authOptions } from "@/modules/auth/lib/authOptions";
+import { can } from "@/lib/authorization";
+import { withAuthorizationSurface } from "@/lib/authorization/context";
+import { getUserWorkspaces } from "@/lib/workspace/service";
+import { getSession } from "@/modules/auth/lib/session";
 
 const LandingLayout = async (props: {
   params: Promise<{ organizationId: string }>;
@@ -13,27 +12,31 @@ const LandingLayout = async (props: {
 
   const { children } = props;
 
-  const session = await getServerSession(authOptions);
+  const session = await getSession();
   if (!session || !session.user) {
     return redirect(`/auth/login`);
   }
 
-  const membership = await getMembershipByUserIdOrganizationId(session.user.id, params.organizationId);
+  // ENG-2388: was a direct `getMembershipByUserIdOrganizationId` truthiness check. `organization.read`
+  // is the same set — the schema grants it to every membership role (owner, manager, member, billing)
+  // and to nobody else — so a non-member still gets `notFound()` and every member still passes. Routing
+  // it here is what puts the decision on the shadow-comparison path.
+  const isMember = await withAuthorizationSurface("page", () =>
+    can({ type: "user", id: session.user.id }, "organization.read", {
+      type: "organization",
+      id: params.organizationId,
+    })
+  );
 
-  if (!membership) {
+  if (!isMember) {
     return notFound();
   }
 
-  const projects = await getUserProjects(session.user.id, params.organizationId);
+  const workspaces = await getUserWorkspaces(session.user.id, params.organizationId);
 
-  if (projects.length !== 0) {
-    const firstProject = projects[0];
-    const environments = await getEnvironments(firstProject.id);
-    const prodEnvironment = environments.find((e) => e.type === "production");
-
-    if (prodEnvironment) {
-      return redirect(`/environments/${prodEnvironment.id}/`);
-    }
+  if (workspaces.length !== 0) {
+    const firstWorkspace = workspaces[0];
+    return redirect(`/workspaces/${firstWorkspace.id}/`);
   }
 
   return <>{children}</>;

@@ -1,11 +1,14 @@
-import { IdentityProvider, Prisma } from "@prisma/client";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { IdentityProvider, Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
 import { TOrganization } from "@formbricks/types/organizations";
 import { TUserLocale, TUserUpdateInput } from "@formbricks/types/user";
+import { deleteUserOrganizationRelationships } from "@/lib/authzed/organization-membership";
+import { deleteUserTeamRelationships } from "@/lib/authzed/team-workspace";
 import { deleteOrganization, getOrganizationsWhereUserIsSingleOwner } from "@/lib/organization/service";
+import { publicUserSelect } from "./public-user";
 import { deleteUser, getUser, getUserByEmail, getUsersWithOrganization, updateUser } from "./service";
 
 vi.mock("@formbricks/database", () => ({
@@ -17,6 +20,9 @@ vi.mock("@formbricks/database", () => ({
       delete: vi.fn(),
       findMany: vi.fn(),
     },
+    invite: {
+      deleteMany: vi.fn(),
+    },
   },
 }));
 
@@ -25,16 +31,26 @@ vi.mock("@/lib/organization/service", () => ({
   deleteOrganization: vi.fn(),
 }));
 
+vi.mock("@/lib/authzed/organization-membership", () => ({
+  deleteUserOrganizationRelationships: vi.fn(),
+}));
+vi.mock("@/lib/authzed/team-workspace", () => ({
+  deleteUserTeamRelationships: vi.fn(),
+}));
+
 describe("User Service", () => {
   afterEach(() => {
     vi.clearAllMocks();
   });
 
+  // Shaped as the `publicUserSelect` payload the service actually returns (no sensitive
+  // columns). Asserted to the full Prisma `User` row so the select-unaware vitest mocks accept
+  // it, while keeping the sensitive keys absent so the `not.toHaveProperty` checks below hold.
   const mockPrismaUser = {
     id: "user1",
     name: "Test User",
     email: "test@example.com",
-    emailVerified: new Date(),
+    emailVerified: true,
     createdAt: new Date(),
     updatedAt: new Date(),
     twoFactorEnabled: false,
@@ -47,12 +63,7 @@ describe("User Service", () => {
     locale: "en-US" as TUserLocale,
     lastLoginAt: new Date(),
     isActive: true,
-    twoFactorSecret: null,
-    backupCodes: null,
-    password: null,
-    identityProviderAccountId: null,
-    groupId: null,
-  };
+  } as Prisma.UserGetPayload<object>;
 
   const mockOrganizations: TOrganization[] = [
     {
@@ -63,7 +74,7 @@ describe("User Service", () => {
       billing: {
         stripeCustomerId: null,
         limits: {
-          projects: 3,
+          workspaces: 3,
           monthly: {
             responses: 1500,
           },
@@ -71,7 +82,6 @@ describe("User Service", () => {
         usageCycleAnchor: new Date(),
       },
       isAISmartToolsEnabled: false,
-      isAIDataAnalysisEnabled: false,
     },
     {
       id: "org2",
@@ -81,7 +91,7 @@ describe("User Service", () => {
       billing: {
         stripeCustomerId: null,
         limits: {
-          projects: 3,
+          workspaces: 3,
           monthly: {
             responses: 1500,
           },
@@ -89,7 +99,6 @@ describe("User Service", () => {
         usageCycleAnchor: new Date(),
       },
       isAISmartToolsEnabled: false,
-      isAIDataAnalysisEnabled: false,
     },
   ];
 
@@ -102,8 +111,12 @@ describe("User Service", () => {
       expect(result).toEqual(mockPrismaUser);
       expect(prisma.user.findUnique).toHaveBeenCalledWith({
         where: { id: "user1" },
-        select: expect.any(Object),
+        select: publicUserSelect,
       });
+      expect(result).not.toHaveProperty("password");
+      expect(result).not.toHaveProperty("twoFactorSecret");
+      expect(result).not.toHaveProperty("backupCodes");
+      expect(result).not.toHaveProperty("identityProviderAccountId");
     });
 
     test("should return null when user not found", async () => {
@@ -134,7 +147,7 @@ describe("User Service", () => {
       expect(result).toEqual(mockPrismaUser);
       expect(prisma.user.findFirst).toHaveBeenCalledWith({
         where: { email: "test@example.com" },
-        select: expect.any(Object),
+        select: publicUserSelect,
       });
     });
 
@@ -176,13 +189,13 @@ describe("User Service", () => {
       expect(prisma.user.update).toHaveBeenCalledWith({
         where: { id: "user1" },
         data: updateData,
-        select: expect.any(Object),
+        select: publicUserSelect,
       });
     });
 
     test("should throw ResourceNotFoundError when user not found", async () => {
       const prismaError = new Prisma.PrismaClientKnownRequestError("Record not found", {
-        code: PrismaErrorType.RecordDoesNotExist,
+        code: PrismaErrorType.RecordNotFound,
         clientVersion: "5.0.0",
       });
       vi.mocked(prisma.user.update).mockRejectedValue(prismaError);
@@ -194,6 +207,7 @@ describe("User Service", () => {
   describe("deleteUser", () => {
     test("should delete user and their organizations when they are single owner", async () => {
       vi.mocked(prisma.user.delete).mockResolvedValue(mockPrismaUser);
+      vi.mocked(prisma.invite.deleteMany).mockResolvedValue({ count: 0 });
       vi.mocked(getOrganizationsWhereUserIsSingleOwner).mockResolvedValue(mockOrganizations);
       vi.mocked(deleteOrganization).mockResolvedValue();
 
@@ -202,10 +216,29 @@ describe("User Service", () => {
       expect(result).toEqual(mockPrismaUser);
       expect(getOrganizationsWhereUserIsSingleOwner).toHaveBeenCalledWith("user1");
       expect(deleteOrganization).toHaveBeenCalledWith("org1");
+      expect(prisma.invite.deleteMany).toHaveBeenCalledWith({ where: { creatorId: "user1" } });
       expect(prisma.user.delete).toHaveBeenCalledWith({
         where: { id: "user1" },
-        select: expect.any(Object),
+        select: publicUserSelect,
       });
+      expect(deleteUserOrganizationRelationships).toHaveBeenCalledWith("user1");
+      expect(deleteUserTeamRelationships).toHaveBeenCalledWith("user1");
+    });
+
+    // Regression for ENG-1057: Invite.creatorId has no onDelete rule, so any
+    // pending invite created by the user must be cleared before user.delete
+    // or Postgres rejects with a foreign-key constraint violation.
+    test("should delete pending invites where the user is creator before deleting the user", async () => {
+      vi.mocked(prisma.user.delete).mockResolvedValue(mockPrismaUser);
+      vi.mocked(prisma.invite.deleteMany).mockResolvedValue({ count: 3 });
+      vi.mocked(getOrganizationsWhereUserIsSingleOwner).mockResolvedValue([]);
+
+      await deleteUser("user1");
+
+      expect(prisma.invite.deleteMany).toHaveBeenCalledWith({ where: { creatorId: "user1" } });
+      const inviteDeleteOrder = vi.mocked(prisma.invite.deleteMany).mock.invocationCallOrder[0];
+      const userDeleteOrder = vi.mocked(prisma.user.delete).mock.invocationCallOrder[0];
+      expect(inviteDeleteOrder).toBeLessThan(userDeleteOrder);
     });
 
     test("should throw DatabaseError when prisma throws", async () => {
@@ -214,6 +247,7 @@ describe("User Service", () => {
         clientVersion: "5.0.0",
       });
       vi.mocked(getOrganizationsWhereUserIsSingleOwner).mockResolvedValue([]);
+      vi.mocked(prisma.invite.deleteMany).mockResolvedValue({ count: 0 });
       vi.mocked(prisma.user.delete).mockRejectedValue(prismaError);
 
       await expect(deleteUser("user1")).rejects.toThrow(DatabaseError);
@@ -236,7 +270,7 @@ describe("User Service", () => {
             },
           },
         },
-        select: expect.any(Object),
+        select: publicUserSelect,
       });
     });
 

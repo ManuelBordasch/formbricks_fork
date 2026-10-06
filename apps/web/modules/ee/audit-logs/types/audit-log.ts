@@ -6,17 +6,18 @@ export const UNKNOWN_DATA = "unknown";
 export const ZAuditTarget = z.enum([
   "segment",
   "survey",
+  "workflow",
   "webhook",
   "user",
   "contactAttributeKey",
-  "projectTeam",
+  "workspaceTeam",
   "team",
   "actionClass",
   "response",
   "contact",
   "organization",
   "tag",
-  "project",
+  "workspace",
   "language",
   "invite",
   "membership",
@@ -25,16 +26,25 @@ export const ZAuditTarget = z.enum([
   "integration",
   "file",
   "quota",
+  "chart",
+  "dashboard",
+  "dashboardWidget",
+  "cubeQuery",
+  "feedbackDirectory",
+  "feedbackRecord",
+  "feedbackSource",
 ]);
 export const ZAuditAction = z.enum([
   "created",
   "updated",
   "deleted",
+  "archived",
+  "restored",
   "signedIn",
   "merged",
   "verificationEmailSent",
   "createdFromCSV",
-  "copiedToOtherEnvironment",
+  "copiedToOtherWorkspace",
   "addedToResponse",
   "removedFromResponse",
   "createdUpdated",
@@ -52,6 +62,17 @@ export const ZAuditAction = z.enum([
   "userSignedOut",
   "passwordReset",
   "bulkCreated",
+  // Destroys every record a resource holds while keeping the resource itself. Distinct from
+  // "deleted" (the resource is gone) and from "updated" (nothing is lost) so a purge is unambiguous
+  // in the audit trail.
+  "purged",
+  "queried",
+  // A bulk export of stored data out of the product (e.g. the response-attachment ZIP). Distinct
+  // from "queried": this leaves the system as files the actor keeps.
+  "exported",
+  "sso_recovery_started",
+  "sso_recovery_completed",
+  "sso_recovery_failed",
 ]);
 export const ZActor = z.enum(["user", "api", "system"]);
 export const ZAuditStatus = z.enum(["success", "failure"]);

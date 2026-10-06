@@ -1,18 +1,21 @@
-import { Response } from "@prisma/client";
 import { NextRequest } from "next/server";
 import { sendToPipeline } from "@/app/lib/pipelines";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
+import { applyAnonymizePolicy } from "@/lib/response/anonymize";
+import { getWorkspaceLegacyStoragePrefixes } from "@/lib/workspace/service";
 import { formatValidationErrorsForV2Api, validateResponseData } from "@/modules/api/lib/validation";
 import { authenticatedApiClient } from "@/modules/api/v2/auth/authenticated-api-client";
 import { validateOtherOptionLengthForMultipleChoice } from "@/modules/api/v2/lib/element";
 import { responses } from "@/modules/api/v2/lib/response";
 import { handleApiError } from "@/modules/api/v2/lib/utils";
-import { getEnvironmentId } from "@/modules/api/v2/management/lib/helper";
+import { getAuthorizedApiKeyWorkspaceIds } from "@/modules/api/v2/management/lib/authorized-workspace-ids";
+import { getWorkspaceId } from "@/modules/api/v2/management/lib/helper";
 import { getResponseForPipeline } from "@/modules/api/v2/management/responses/[responseId]/lib/response";
 import { getSurveyQuestions } from "@/modules/api/v2/management/responses/[responseId]/lib/survey";
 import { ZGetResponsesFilter, ZResponseInput } from "@/modules/api/v2/management/responses/types/responses";
 import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
-import { hasPermission } from "@/modules/organization/settings/api-keys/lib/utils";
-import { resolveStorageUrlsInObject, validateFileUploads } from "@/modules/storage/utils";
+import { resolveStorageUrlsInObject, validateClientFileUploads } from "@/modules/storage/utils";
 import { createResponseWithQuotaEvaluation, getResponses } from "./lib/response";
 
 export const GET = async (request: NextRequest) =>
@@ -31,21 +34,17 @@ export const GET = async (request: NextRequest) =>
         });
       }
 
-      const environmentIds = authentication.environmentPermissions.map(
-        (permission) => permission.environmentId
-      );
+      const workspaceIds = await getAuthorizedApiKeyWorkspaceIds(authentication);
 
-      const environmentResponses: Response[] = [];
-      const res = await getResponses(environmentIds, query);
+      const res = await getResponses(workspaceIds, query);
 
       if (!res.ok) {
         return handleApiError(request, res.error);
       }
 
-      environmentResponses.push(...res.data.data);
-
       return responses.successResponse({
-        data: environmentResponses.map((r) => ({ ...r, data: resolveStorageUrlsInObject(r.data) })),
+        data: res.data.data.map((r) => ({ ...r, data: resolveStorageUrlsInObject(r.data) })),
+        meta: res.data.meta,
       });
     },
   });
@@ -70,15 +69,21 @@ export const POST = async (request: Request) =>
         );
       }
 
-      const environmentIdResult = await getEnvironmentId(body.surveyId, false);
+      const workspaceIdResult = await getWorkspaceId(body.surveyId, false);
 
-      if (!environmentIdResult.ok) {
-        return handleApiError(request, environmentIdResult.error, auditLog);
+      if (!workspaceIdResult.ok) {
+        return handleApiError(request, workspaceIdResult.error, auditLog);
       }
 
-      const environmentId = environmentIdResult.data;
+      const { workspaceId } = workspaceIdResult.data;
 
-      if (!hasPermission(authentication.environmentPermissions, environmentId, "POST")) {
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("POST"),
+          { type: "workspace", id: workspaceId }
+        ))
+      ) {
         return handleApiError(
           request,
           {
@@ -88,28 +93,43 @@ export const POST = async (request: Request) =>
         );
       }
 
-      // if there is a createdAt but no updatedAt, set updatedAt to createdAt
       if (body.createdAt && !body.updatedAt) {
         body.updatedAt = body.createdAt;
       }
 
       const surveyQuestions = await getSurveyQuestions(body.surveyId);
       if (!surveyQuestions.ok) {
-        return handleApiError(request, surveyQuestions.error as ApiErrorResponseV2, auditLog); // NOSONAR // We need to assert or we get a type error
+        return handleApiError(request, surveyQuestions.error as ApiErrorResponseV2, auditLog); // NOSONAR
       }
 
-      if (!validateFileUploads(body.data, surveyQuestions.data.questions)) {
+      if (
+        !validateClientFileUploads({
+          data: body.data,
+          workspaceId,
+          surveyId: body.surveyId,
+          blocks: surveyQuestions.data.blocks,
+          questions: surveyQuestions.data.questions,
+          // Management callers replay stored responses whose file URLs may predate the scoped shape;
+          // accept those against a prefix this workspace owns (ENG-1981 review).
+          legacyOwnedStoragePrefixes: await getWorkspaceLegacyStoragePrefixes(workspaceId),
+        })
+      ) {
         return handleApiError(
           request,
           {
             type: "bad_request",
-            details: [{ field: "response", issue: "Invalid file upload response" }],
+            details: [
+              {
+                field: "response",
+                issue:
+                  "Invalid file upload response: each file URL must reference a file uploaded to this survey's file-upload element",
+              },
+            ],
           },
           auditLog
         );
       }
 
-      // Validate response data for "other" options exceeding character limit
       const otherResponseInvalidQuestionId = validateOtherOptionLengthForMultipleChoice({
         responseData: body.data,
         surveyQuestions: surveyQuestions.data.questions,
@@ -131,7 +151,6 @@ export const POST = async (request: Request) =>
         });
       }
 
-      // Validate response data against validation rules
       const validationErrors = validateResponseData(
         surveyQuestions.data.blocks,
         body.data,
@@ -150,30 +169,41 @@ export const POST = async (request: Request) =>
         );
       }
 
-      const createResponseResult = await createResponseWithQuotaEvaluation(environmentId, body);
+      // "Anonymize responses" is a property of the SURVEY, not of the door a response arrived
+      // through: `ZResponseInput` picks `meta`, so without this a caller could write ipAddress,
+      // country, userAgent and an unredacted url onto a survey that has the toggle on. The realistic
+      // case is a customer proxying submissions from their own backend, which uses this route rather
+      // than the client one. Applied at the route, matching the client routes, because the survey read
+      // already happened here and `createResponse` does not load it.
+      const createResponseResult = await createResponseWithQuotaEvaluation(workspaceId, {
+        ...body,
+        meta: applyAnonymizePolicy(body.meta, surveyQuestions.data.isAnonymizeResponsesEnabled),
+      });
       if (!createResponseResult.ok) {
         return handleApiError(request, createResponseResult.error, auditLog);
       }
 
-      // Fetch created response with relations for pipeline
-      const createdResponseForPipeline = await getResponseForPipeline(createResponseResult.data.id);
-      if (createdResponseForPipeline.ok) {
-        sendToPipeline({
-          event: "responseCreated",
-          environmentId: environmentId,
-          surveyId: body.surveyId,
-          response: createdResponseForPipeline.data,
-        });
+      getResponseForPipeline(createResponseResult.data.id)
+        .then((createdResponseForPipeline) => {
+          if (createdResponseForPipeline.ok) {
+            sendToPipeline({
+              event: "responseCreated",
+              workspaceId,
+              surveyId: body.surveyId,
+              response: createdResponseForPipeline.data,
+            }).catch(() => {});
 
-        if (createResponseResult.data.finished) {
-          sendToPipeline({
-            event: "responseFinished",
-            environmentId: environmentId,
-            surveyId: body.surveyId,
-            response: createdResponseForPipeline.data,
-          });
-        }
-      }
+            if (createResponseResult.data.finished) {
+              sendToPipeline({
+                event: "responseFinished",
+                workspaceId,
+                surveyId: body.surveyId,
+                response: createdResponseForPipeline.data,
+              }).catch(() => {});
+            }
+          }
+        })
+        .catch(() => {});
 
       if (auditLog) {
         auditLog.targetId = createResponseResult.data.id;

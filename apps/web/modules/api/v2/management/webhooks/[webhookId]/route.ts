@@ -1,9 +1,11 @@
 import { NextRequest } from "next/server";
 import { z } from "zod";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
 import { authenticatedApiClient } from "@/modules/api/v2/auth/authenticated-api-client";
 import { responses } from "@/modules/api/v2/lib/response";
 import { handleApiError } from "@/modules/api/v2/lib/utils";
-import { getEnvironmentIdFromSurveyIds } from "@/modules/api/v2/management/lib/helper";
+import { getWorkspaceIdFromSurveyIds } from "@/modules/api/v2/management/lib/helper";
 import {
   deleteWebhook,
   getWebhook,
@@ -14,7 +16,6 @@ import {
   ZWebhookUpdateSchema,
 } from "@/modules/api/v2/management/webhooks/[webhookId]/types/webhooks";
 import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
-import { hasPermission } from "@/modules/organization/settings/api-keys/lib/utils";
 
 export const GET = async (request: NextRequest, props: { params: Promise<{ webhookId: string }> }) =>
   authenticatedApiClient({
@@ -39,7 +40,13 @@ export const GET = async (request: NextRequest, props: { params: Promise<{ webho
         return handleApiError(request, webhook.error as ApiErrorResponseV2);
       }
 
-      if (!hasPermission(authentication.environmentPermissions, webhook.data.environmentId, "GET")) {
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("GET"),
+          { type: "workspace", id: webhook.data.workspaceId }
+        ))
+      ) {
         return handleApiError(request, {
           type: "unauthorized",
           details: [{ field: "webhook", issue: "unauthorized" }],
@@ -75,22 +82,28 @@ export const PUT = async (request: NextRequest, props: { params: Promise<{ webho
         );
       }
 
-      const surveysEnvironmentIdResult = await getEnvironmentIdFromSurveyIds(body.surveyIds);
+      const surveysWorkspaceIdResult = await getWorkspaceIdFromSurveyIds(body.surveyIds);
 
-      if (!surveysEnvironmentIdResult.ok) {
-        return handleApiError(request, surveysEnvironmentIdResult.error, auditLog);
+      if (!surveysWorkspaceIdResult.ok) {
+        return handleApiError(request, surveysWorkspaceIdResult.error, auditLog);
       }
 
-      const surveysEnvironmentId = surveysEnvironmentIdResult.data;
+      const surveysWorkspaceId = surveysWorkspaceIdResult.data;
 
-      // get webhook environment
+      // get webhook workspace
       const webhook = await getWebhook(params.webhookId);
 
       if (!webhook.ok) {
         return handleApiError(request, webhook.error as ApiErrorResponseV2, auditLog);
       }
 
-      if (!hasPermission(authentication.environmentPermissions, webhook.data.environmentId, "PUT")) {
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("PUT"),
+          { type: "workspace", id: webhook.data.workspaceId }
+        ))
+      ) {
         return handleApiError(
           request,
           {
@@ -101,14 +114,14 @@ export const PUT = async (request: NextRequest, props: { params: Promise<{ webho
         );
       }
 
-      // check if webhook environment matches the surveys environment
-      if (surveysEnvironmentId && webhook.data.environmentId !== surveysEnvironmentId) {
+      // check if webhook workspace matches the surveys workspace
+      if (surveysWorkspaceId && webhook.data.workspaceId !== surveysWorkspaceId) {
         return handleApiError(
           request,
           {
             type: "bad_request",
             details: [
-              { field: "surveys id", issue: "webhook environment does not match the surveys environment" },
+              { field: "surveyIds", issue: "webhook workspace does not match the surveys workspace" },
             ],
           },
           auditLog
@@ -162,7 +175,13 @@ export const DELETE = async (request: NextRequest, props: { params: Promise<{ we
         return handleApiError(request, webhook.error as ApiErrorResponseV2, auditLog);
       }
 
-      if (!hasPermission(authentication.environmentPermissions, webhook.data.environmentId, "DELETE")) {
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("DELETE"),
+          { type: "workspace", id: webhook.data.workspaceId }
+        ))
+      ) {
         return handleApiError(
           request,
           {

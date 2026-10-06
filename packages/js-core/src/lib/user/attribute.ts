@@ -15,9 +15,10 @@ import { type NetworkError, type Result, okVoid } from "@/types/error";
  *
  * @param attributes - Key-value pairs where values can be strings, numbers, or Date objects
  */
-export const setAttributes = async (
+// Not `async` (nothing to await), but keeps the Promise return type: this is public
+// SDK API and callers rely on awaiting it.
+export const setAttributes = (
   attributes: Record<string, string | number | Date>
-  // eslint-disable-next-line @typescript-eslint/require-await -- we want to use promises here
 ): Promise<Result<void, NetworkError>> => {
   // Normalize values: convert Date to ISO string, preserve numbers as numbers
   const normalizedAttributes: Record<string, string | number> = {};
@@ -34,5 +35,5 @@ export const setAttributes = async (
   const updateQueue = UpdateQueue.getInstance();
   updateQueue.updateAttributes(normalizedAttributes);
   void updateQueue.processUpdates();
-  return okVoid();
+  return Promise.resolve(okVoid());
 };

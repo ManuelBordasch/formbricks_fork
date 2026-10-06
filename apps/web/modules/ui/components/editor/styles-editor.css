@@ -3,18 +3,10 @@
   font-size: 14px;
 }
 
-.editor li {
-  padding-left: 1.28571429em;
-  text-indent: -1.28571429em;
-}
-
-.editor ul {
-  list-style: disc inside;
-}
-
-.editor ol {
-  list-style: decimal inside;
-}
+/*
+ * List rendering lives in styles-editor-frontend.css, which the survey runtime injects too, so the
+ * editor and the respondent view stay in sync. Editor-only list rules would re-introduce the drift.
+ */
 
 .editor-container {
   border-radius: 6px;
@@ -27,7 +19,33 @@
 }
 
 .editor-container:focus-within {
-  @apply border-brand-dark;
+  border-color: var(--color-brand-dark);
+}
+
+/*
+ * Read-only mode (`editable={false}`): the same `disabled:opacity-50` treatment `Input` and
+ * `Textarea` carry, plus dropping the resize grip — nothing inside the editor is a native disabled
+ * control, so there is no `:disabled` for those utilities to hook onto and the state is painted on
+ * the wrapper instead.
+ *
+ * It lives here rather than in Tailwind classes on the component because `.editor-inner` sets
+ * `resize` in this stylesheet, which Next.js emits unlayered — that beats any `resize-none` from
+ * `@layer utilities` no matter the specificity, so the grip would survive.
+ *
+ * The toolbar's buttons opt out of the fade: they already carry their own `disabled:opacity-50`,
+ * and compounding the two washes the icons out to 25%. At full opacity inside this 50% wrapper they
+ * composite to the same 50% a disabled button shows anywhere else.
+ */
+.editor-container-disabled {
+  opacity: 0.5;
+}
+
+.editor-container-disabled .editor-inner {
+  resize: none;
+}
+
+.editor-container-disabled button:disabled {
+  opacity: 1;
 }
 
 .editor-inner {
@@ -44,6 +62,10 @@
 
 .editor-input {
   height: auto;
+  /* Fill the wrapper's min-height so a click anywhere in the visible box focuses the editor —
+     with height:auto alone, the area below the last line belongs to .editor-inner and clicks
+     there land outside the contentEditable. */
+  min-height: var(--editor-min-height, 48px);
   font-size: 14px;
   position: relative;
   tab-size: 1;

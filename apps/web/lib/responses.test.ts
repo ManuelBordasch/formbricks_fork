@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import { TSurvey } from "@formbricks/types/surveys/types";
+import { parseRecallInfo } from "@/lib/utils/recall";
 import { convertResponseValue, getElementResponseMapping, processResponseData } from "./responses";
 
 // Mock the recall and i18n utils
@@ -188,7 +189,6 @@ describe("Response Processing", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
       name: "Test Survey",
-      environmentId: "env1",
       createdBy: null,
       blocks: [
         {
@@ -234,7 +234,7 @@ describe("Response Processing", () => {
             createdAt: new Date(),
             updatedAt: new Date(),
             alias: null,
-            projectId: "proj1",
+            workspaceId: "proj1",
           },
           default: true,
           enabled: true,
@@ -254,10 +254,9 @@ describe("Response Processing", () => {
       showLanguageSwitch: false,
       isBackButtonHidden: false,
       isVerifyEmailEnabled: false,
-      isSingleResponsePerEmailEnabled: false,
       displayPercentage: 100,
       styling: null,
-      projectOverwrites: null,
+      workspaceOverwrites: null,
       inlineTriggers: [],
       pin: null,
       triggers: [],
@@ -312,6 +311,19 @@ describe("Response Processing", () => {
         element: "Question 2",
         response: "Option 1; Option 2",
         type: TSurveyElementTypeEnum.MultipleChoiceMulti,
+      });
+    });
+
+    test("recall receives the response's variables, which the value map cannot carry", () => {
+      // A variable is stored outside `response.data` and addressed by its id, so it is absent from
+      // the merged reserved+answers map. Omitting this argument left a headline recalling a variable
+      // rendering its fallback in the notification email while the same token resolved in the body.
+      vi.mocked(parseRecallInfo).mockClear();
+
+      getElementResponseMapping(mockSurvey, { ...mockResponse, variables: { var1: "gold" } });
+
+      expect(vi.mocked(parseRecallInfo)).toHaveBeenCalledWith("Question 1", expect.anything(), {
+        var1: "gold",
       });
     });
 
@@ -375,7 +387,7 @@ describe("Response Processing", () => {
               createdAt: new Date(),
               updatedAt: new Date(),
               alias: null,
-              projectId: "proj1",
+              workspaceId: "proj1",
             },
             default: true,
             enabled: true,
@@ -387,7 +399,7 @@ describe("Response Processing", () => {
               createdAt: new Date(),
               updatedAt: new Date(),
               alias: null,
-              projectId: "proj1",
+              workspaceId: "proj1",
             },
             default: false,
             enabled: true,

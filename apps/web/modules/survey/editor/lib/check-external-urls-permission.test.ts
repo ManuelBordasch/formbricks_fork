@@ -24,7 +24,7 @@ describe("checkExternalUrlsPermission", () => {
     updatedAt: new Date(),
     name: "Test Survey",
     type: "link",
-    environmentId: "env123",
+    workspaceId: "ws123",
     createdBy: "user123",
     status: "draft",
     displayOption: "displayOnce",
@@ -33,7 +33,7 @@ describe("checkExternalUrlsPermission", () => {
     hiddenFields: { enabled: false },
     delay: 0,
     autoComplete: null,
-    projectOverwrites: null,
+    workspaceOverwrites: null,
     styling: null,
     showLanguageSwitch: false,
     segment: null,
@@ -41,7 +41,6 @@ describe("checkExternalUrlsPermission", () => {
     singleUse: null,
     isVerifyEmailEnabled: false,
     recaptcha: null,
-    isSingleResponsePerEmailEnabled: false,
     isBackButtonHidden: false,
     pin: null,
     displayPercentage: null,
@@ -66,7 +65,9 @@ describe("checkExternalUrlsPermission", () => {
   });
 
   test("should throw ResourceNotFoundError when organization billing is not found", async () => {
-    vi.mocked(getOrganizationBilling).mockResolvedValue(null);
+    vi.mocked(getOrganizationBilling).mockRejectedValue(
+      new ResourceNotFoundError("Organization", mockOrganizationId)
+    );
 
     await expect(checkExternalUrlsPermission(mockOrganizationId, baseSurvey, null)).rejects.toThrow(
       ResourceNotFoundError

@@ -1,9 +1,10 @@
-import { Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
 import { TOrganizationBilling } from "@formbricks/types/organizations";
 import { TSurvey } from "@formbricks/types/surveys/types";
+import { selectSurveyEmbeddedDataLinks } from "@/lib/embedded-data/survey-fields";
 import { getOrganizationBillingWithReadThroughSync } from "@/modules/ee/billing/lib/organization-billing";
 import { transformPrismaSurvey } from "@/modules/survey/lib/utils";
 
@@ -13,7 +14,7 @@ export const selectSurvey = {
   updatedAt: true,
   name: true,
   type: true,
-  environmentId: true,
+  workspaceId: true,
   createdBy: true,
   status: true,
   welcomeCard: true,
@@ -29,11 +30,13 @@ export const selectSurvey = {
   delay: true,
   displayPercentage: true,
   autoComplete: true,
+  publishOn: true,
+  closeOn: true,
   isVerifyEmailEnabled: true,
-  isSingleResponsePerEmailEnabled: true,
   isCaptureIpEnabled: true,
+  isAnonymizeResponsesEnabled: true,
   redirectUrl: true,
-  projectOverwrites: true,
+  workspaceOverwrites: true,
   styling: true,
   surveyClosedMessage: true,
   singleUse: true,
@@ -41,6 +44,7 @@ export const selectSurvey = {
   showLanguageSwitch: true,
   recaptcha: true,
   isBackButtonHidden: true,
+  isAutoProgressingEnabled: true,
   metadata: true,
   slug: true,
   customHeadScripts: true,
@@ -55,7 +59,7 @@ export const selectSurvey = {
           createdAt: true,
           updatedAt: true,
           code: true,
-          projectId: true,
+          workspaceId: true,
           alias: true,
         },
       },
@@ -68,7 +72,7 @@ export const selectSurvey = {
           id: true,
           createdAt: true,
           updatedAt: true,
-          environmentId: true,
+          workspaceId: true,
           name: true,
           description: true,
           type: true,
@@ -83,7 +87,7 @@ export const selectSurvey = {
       id: true,
       createdAt: true,
       updatedAt: true,
-      environmentId: true,
+      workspaceId: true,
       title: true,
       description: true,
       isPrivate: true,
@@ -96,6 +100,9 @@ export const selectSurvey = {
     },
   },
   followUps: true,
+  // ENG-1837: the definitions every reader resolves through, joined and inlined by
+  // `transformPrismaSurvey`. Read-only — the rows are written by `reconcileEmbeddedData`.
+  embeddedDataLinks: selectSurveyEmbeddedDataLinks,
 } satisfies Prisma.SurveySelect;
 
 export const getOrganizationBilling = reactCache(

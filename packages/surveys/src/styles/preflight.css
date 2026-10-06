@@ -67,22 +67,24 @@
 
 #fbjs b,
 #fbjs strong {
-  font-weight: bolder;
+  font-weight: bold;
 }
 
 #fbjs code,
 #fbjs kbd,
 #fbjs samp,
 #fbjs pre {
-  font-family: theme("fontFamily.mono",
-      ui-monospace,
-      SFMono-Regular,
-      Menlo,
-      Monaco,
-      Consolas,
-      "Liberation Mono",
-      "Courier New",
-      monospace);
+  font-family: theme(
+    "fontFamily.mono",
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    "Liberation Mono",
+    "Courier New",
+    monospace
+  );
   /* 1 */
   font-size: 1em;
   /* 2 */
@@ -213,6 +215,10 @@
 #fbjs fieldset {
   margin: 0;
   padding: 0;
+  /* The UA default min-inline-size: min-content stops the fieldset shrinking, which breaks
+     responsive layouts and the matrix's overflow-x scroll now that grouped questions are
+     wrapped in <fieldset> instead of <div>. */
+  min-width: 0;
 }
 
 #fbjs legend {

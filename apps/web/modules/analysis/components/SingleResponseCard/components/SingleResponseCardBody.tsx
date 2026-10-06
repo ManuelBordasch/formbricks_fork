@@ -2,17 +2,22 @@
 
 import { CheckCircle2Icon } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import {
+  getComputedEmbeddedFields,
+  getIngestedEmbeddedFields,
+} from "@formbricks/types/embedded-data-resolver";
 import { TResponseWithQuotas } from "@formbricks/types/responses";
 import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/constants";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { getTextContent } from "@formbricks/types/surveys/validation";
 import { TUserLocale } from "@formbricks/types/user";
 import { getLocalizedValue } from "@/lib/i18n/utils";
+import { buildServerEmbeddedValues } from "@/lib/surveyLogic/utils";
 import { getSurveyDateFormatMap } from "@/lib/utils/date-display";
 import { parseRecallInfo } from "@/lib/utils/recall";
 import { ResponseCardQuotas } from "@/modules/ee/quotas/components/single-response-card-quotas";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
-import { isValidValue } from "../util";
+import { isValidValue, splitRecallHighlights } from "../util";
 import { ElementSkip } from "./ElementSkip";
 import { HiddenFields } from "./HiddenFields";
 import { RenderResponse } from "./RenderResponse";
@@ -31,15 +36,21 @@ export const SingleResponseCardBody = ({
   response,
   skippedQuestions,
   locale,
-}: SingleResponseCardBodyProps) => {
+}: Readonly<SingleResponseCardBodyProps>) => {
   const elements = getElementsFromBlocks(survey.blocks);
+  // ENG-1837: both blocks below render the survey's Embedded Data definitions, resolved through the
+  // tables with the legacy columns as fallback.
+  const computedFields = getComputedEmbeddedFields(survey);
+  const ingestedFields = getIngestedEmbeddedFields(survey);
   const dateFormats = getSurveyDateFormatMap(elements);
+  // ENG-2538: recall's lookup map, not `response.data` — a reserved token such as `#recall:country#`
+  // rendered its fallback on this card while resolving correctly in the live survey. Shared with
+  // `ElementSkip`, which recalls the same headlines for skipped elements.
+  const recallValues = buildServerEmbeddedValues(response, survey);
   const isFirstElementAnswered = elements[0] ? !!response.data[elements[0].id] : false;
   const { t } = useTranslation();
   const formatTextWithSlashes = (text: string) => {
-    // Updated regex to match content between #/ and \#
-    const regex = /#\/(.*?)\\#/g;
-    const parts = text.split(regex);
+    const parts = splitRecallHighlights(text);
 
     return parts.map((part, index) => {
       // Check if the part was inside #/ and \#
@@ -47,7 +58,7 @@ export const SingleResponseCardBody = ({
         return (
           <span
             key={index}
-            className="ml-0.5 mr-0.5 rounded-md border border-slate-200 bg-slate-50 px-1 py-0.5 text-sm first:ml-0">
+            className="mr-0.5 ml-0.5 rounded-md border border-slate-200 bg-slate-50 px-1 py-0.5 text-sm first:ml-0">
             @{part}
           </span>
         );
@@ -65,7 +76,8 @@ export const SingleResponseCardBody = ({
           elements={elements}
           status={"welcomeCard"}
           isFirstElementAnswered={isFirstElementAnswered}
-          responseData={response.data}
+          recallValues={recallValues}
+          variables={response.variables}
           locale={locale}
         />
       )}
@@ -102,7 +114,7 @@ export const SingleResponseCardBody = ({
                       getTextContent(
                         parseRecallInfo(
                           getLocalizedValue(question.headline, "default"),
-                          response.data,
+                          recallValues,
                           response.variables,
                           true,
                           locale,
@@ -126,7 +138,8 @@ export const SingleResponseCardBody = ({
                 <ElementSkip
                   skippedElements={skipped}
                   elements={elements}
-                  responseData={response.data}
+                  recallValues={recallValues}
+                  variables={response.variables}
                   locale={locale}
                   status={
                     response.finished ||
@@ -141,18 +154,17 @@ export const SingleResponseCardBody = ({
           );
         })}
       </div>
-      {survey.variables.length > 0 && (
-        <ResponseVariables variables={survey.variables} variablesData={response.variables} />
+      {computedFields.length > 0 && (
+        <ResponseVariables variables={computedFields} variablesData={response.variables} />
       )}
-      {survey.hiddenFields.fieldIds && (
-        <HiddenFields hiddenFields={survey.hiddenFields} responseData={response.data} />
+      {ingestedFields.length > 0 && (
+        <HiddenFields hiddenFields={ingestedFields} responseData={response.data} />
       )}
-
       <ResponseCardQuotas quotas={response.quotas} />
 
       {response.finished && (
         <div className="mt-4 flex items-center">
-          <CheckCircle2Icon className="h-6 w-6 text-slate-400" />
+          <CheckCircle2Icon className="size-6 text-slate-400" />
           <p className="mx-2 rounded-lg bg-slate-100 px-2 text-sm font-medium text-slate-700">
             {t("common.completed")}
           </p>

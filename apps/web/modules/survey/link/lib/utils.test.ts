@@ -1,9 +1,17 @@
 import { describe, expect, test } from "vitest";
-import { TJsEnvironmentStateSurvey } from "@formbricks/types/js";
+import { TJsWorkspaceStateSurvey } from "@formbricks/types/js";
 import { TSurveyBlock } from "@formbricks/types/surveys/blocks";
 import { TSurveyElement, TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import { TSurvey } from "@formbricks/types/surveys/types";
-import { getElementsFromSurveyBlocks, getWebAppLocale, isRTL, isRTLLanguage } from "./utils";
+import {
+  getElementsFromSurveyBlocks,
+  getGateLocale,
+  getSurveyLanguageTag,
+  getWebAppLocale,
+  isRTL,
+  isRTLLanguage,
+  resolveWebAppLocale,
+} from "./utils";
 
 const createMockSurvey = (languages: TSurvey["languages"] = []): TSurvey =>
   ({
@@ -12,11 +20,14 @@ const createMockSurvey = (languages: TSurvey["languages"] = []): TSurvey =>
     updatedAt: new Date(),
     name: "Test",
     type: "link",
-    environmentId: "env-1",
+    workspaceId: "ws-1",
     createdBy: null,
     status: "draft",
     displayOption: "displayOnce",
     autoClose: null,
+    publishOn: null,
+    closeOn: null,
+    isAutoProgressingEnabled: false,
     triggers: [],
     recontactDays: null,
     displayLimit: null,
@@ -36,10 +47,9 @@ const createMockSurvey = (languages: TSurvey["languages"] = []): TSurvey =>
     languages,
     displayPercentage: null,
     isVerifyEmailEnabled: false,
-    isSingleResponsePerEmailEnabled: false,
     singleUse: null,
     pin: null,
-    projectOverwrites: null,
+    workspaceOverwrites: null,
     surveyClosedMessage: null,
     followUps: [],
     delay: 0,
@@ -48,6 +58,7 @@ const createMockSurvey = (languages: TSurvey["languages"] = []): TSurvey =>
     recaptcha: null,
     isBackButtonHidden: false,
     isCaptureIpEnabled: false,
+    isAnonymizeResponsesEnabled: false,
     slug: null,
     metadata: {},
   }) as TSurvey;
@@ -64,7 +75,7 @@ describe("getWebAppLocale", () => {
           alias: null,
           createdAt: new Date(),
           updatedAt: new Date(),
-          projectId: "p1",
+          workspaceId: "p1",
         },
         default: true,
         enabled: true,
@@ -83,7 +94,7 @@ describe("getWebAppLocale", () => {
           alias: null,
           createdAt: new Date(),
           updatedAt: new Date(),
-          projectId: "p1",
+          workspaceId: "p1",
         },
         default: false,
         enabled: true,
@@ -98,6 +109,85 @@ describe("getWebAppLocale", () => {
   });
 });
 
+const createLanguage = (code: string, isDefault = false, enabled = true) => ({
+  language: {
+    id: `l-${code}`,
+    code,
+    alias: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    workspaceId: "p1",
+  },
+  default: isDefault,
+  enabled,
+});
+
+describe("resolveWebAppLocale", () => {
+  test("returns null instead of English when the app has no translation for the language", () => {
+    // A Hebrew survey must not drag the chrome to English — the caller keeps its own fallback.
+    expect(resolveWebAppLocale("he", createMockSurvey())).toBeNull();
+    expect(resolveWebAppLocale("xx", createMockSurvey())).toBeNull();
+    expect(resolveWebAppLocale("default", createMockSurvey())).toBeNull();
+  });
+
+  test("keeps a variant the app ships rather than collapsing to the base language", () => {
+    expect(resolveWebAppLocale("pt-PT", createMockSurvey())).toBe("pt-PT");
+    expect(resolveWebAppLocale("pt", createMockSurvey())).toBe("pt-BR");
+    expect(resolveWebAppLocale("pt-BR", createMockSurvey())).toBe("pt-BR");
+  });
+
+  test("distinguishes the Chinese scripts, which share a base code", () => {
+    expect(resolveWebAppLocale("zh-Hant", createMockSurvey())).toBe("zh-Hant-TW");
+    expect(resolveWebAppLocale("zh-Hans", createMockSurvey())).toBe("zh-Hans-CN");
+    expect(resolveWebAppLocale("zh", createMockSurvey())).toBe("zh-Hans-CN");
+  });
+
+  test("matches survey language codes regardless of case", () => {
+    expect(resolveWebAppLocale("DE-de", createMockSurvey())).toBe("de-DE");
+    expect(resolveWebAppLocale("zh-hant-tw", createMockSurvey())).toBe("zh-Hant-TW");
+  });
+
+  test("resolves 'default' through the survey's default language", () => {
+    expect(resolveWebAppLocale("default", createMockSurvey([createLanguage("de", true)]))).toBe("de-DE");
+  });
+});
+
+describe("getGateLocale", () => {
+  const survey = createMockSurvey([createLanguage("en", true), createLanguage("de")]);
+
+  test("uses the requested language, so the gate matches the survey behind it", () => {
+    expect(getGateLocale({ langParam: "de-DE", languageCode: "de", survey, fallbackLocale: "en-US" })).toBe(
+      "de-DE"
+    );
+  });
+
+  test("keeps the Accept-Language locale when the link requests no language", () => {
+    expect(
+      getGateLocale({ langParam: undefined, languageCode: "default", survey, fallbackLocale: "fr-FR" })
+    ).toBe("fr-FR");
+    // An empty `?lang=` is no request either.
+    expect(getGateLocale({ langParam: "", languageCode: "default", survey, fallbackLocale: "fr-FR" })).toBe(
+      "fr-FR"
+    );
+  });
+
+  test("keeps the Accept-Language locale when the requested language is not one the app speaks", () => {
+    // `?lang=` was given but resolves to a language with no app translation (Hebrew here): the
+    // respondent's own browser locale is a better guess than forcing English on them.
+    expect(getGateLocale({ langParam: "he", languageCode: "he", survey, fallbackLocale: "fr-FR" })).toBe(
+      "fr-FR"
+    );
+  });
+
+  test("follows the survey default for a language the survey has not enabled", () => {
+    // getLanguageCode resolves an unknown or disabled `?lang=` to "default", and the content will
+    // render in the survey's default language — so the gate reads that language, not the browser's.
+    expect(
+      getGateLocale({ langParam: "it-IT", languageCode: "default", survey, fallbackLocale: "fr-FR" })
+    ).toBe("en-US");
+  });
+});
+
 describe("isRTL", () => {
   test("detects RTL characters", () => {
     expect(isRTL("مرحبا")).toBe(true);
@@ -108,16 +198,16 @@ describe("isRTL", () => {
 
 describe("isRTLLanguage", () => {
   const createJsSurvey = (
-    languages: TJsEnvironmentStateSurvey["languages"] = [],
+    languages: TJsWorkspaceStateSurvey["languages"] = [],
     blocks: TSurveyBlock[] = []
-  ): TJsEnvironmentStateSurvey =>
+  ): TJsWorkspaceStateSurvey =>
     ({
       id: "s1",
       createdAt: new Date(),
       updatedAt: new Date(),
       name: "Test",
       type: "link",
-      environmentId: "env-1",
+      workspaceId: "ws-1",
       welcomeCard: {
         enabled: false,
         headline: { default: "Welcome" },
@@ -126,7 +216,7 @@ describe("isRTLLanguage", () => {
       },
       blocks,
       languages,
-    }) as unknown as TJsEnvironmentStateSurvey;
+    }) as unknown as TJsWorkspaceStateSurvey;
 
   test("checks language codes when multi-language enabled", () => {
     const survey = createJsSurvey([
@@ -137,7 +227,7 @@ describe("isRTLLanguage", () => {
           alias: null,
           createdAt: new Date(),
           updatedAt: new Date(),
-          projectId: "p1",
+          workspaceId: "p1",
         },
         default: true,
         enabled: true,
@@ -162,7 +252,7 @@ describe("isRTLLanguage", () => {
     const survey = {
       ...createJsSurvey([], []),
       welcomeCard: { enabled: true, headline: { default: "مرحبا" } },
-    } as unknown as TJsEnvironmentStateSurvey;
+    } as unknown as TJsWorkspaceStateSurvey;
     expect(isRTLLanguage(survey, "default")).toBe(true);
   });
 
@@ -170,6 +260,36 @@ describe("isRTLLanguage", () => {
     const element = { id: "q1", type: TSurveyElementTypeEnum.OpenText, headline: {}, required: false };
     const block = { id: "b1", name: "Block", elements: [element] } as TSurveyBlock;
     expect(isRTLLanguage(createJsSurvey([], [block]), "default")).toBe(false);
+  });
+});
+
+describe("getSurveyLanguageTag", () => {
+  const langSurvey = (languages: TJsWorkspaceStateSurvey["languages"] = []): TJsWorkspaceStateSurvey =>
+    ({ languages }) as unknown as TJsWorkspaceStateSurvey;
+
+  const enAU = {
+    language: {
+      id: "l1",
+      code: "en-AU",
+      alias: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      workspaceId: "p1",
+    },
+    default: true,
+    enabled: true,
+  };
+
+  test("returns an explicit (non-default) code as-is", () => {
+    expect(getSurveyLanguageTag(langSurvey([enAU]), "he")).toBe("he");
+  });
+
+  test("resolves 'default' to the survey's default language code", () => {
+    expect(getSurveyLanguageTag(langSurvey([enAU]), "default")).toBe("en-AU");
+  });
+
+  test("returns null when 'default' but no language is configured", () => {
+    expect(getSurveyLanguageTag(langSurvey([]), "default")).toBeNull();
   });
 });
 

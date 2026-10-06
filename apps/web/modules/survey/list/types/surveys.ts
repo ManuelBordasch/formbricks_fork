@@ -1,16 +1,19 @@
-import { Language, Project } from "@prisma/client";
 import { z } from "zod";
+import { Language, Workspace } from "@formbricks/database/prisma";
 import { ZSurveyStatus } from "@formbricks/types/surveys/types";
 
 export const ZSurvey = z.object({
   id: z.string(),
   name: z.string(),
-  environmentId: z.string(),
+  workspaceId: z.string(),
   type: z.enum(["link", "app", "website", "web"]), //we can replace this with ZSurveyType after we remove "web" from schema
   status: ZSurveyStatus,
+  publishOn: z.date().nullable(),
+  archivedAt: z.date().nullable(),
   createdAt: z.date(),
   updatedAt: z.date(),
   responseCount: z.number(),
+  completedResponseCount: z.number(),
   creator: z
     .object({
       name: z.string(),
@@ -26,17 +29,6 @@ export const ZSurvey = z.object({
 
 export type TSurvey = z.infer<typeof ZSurvey>;
 
-export const ZSurveyCopyFormValidation = z.object({
-  projects: z.array(
-    z.object({
-      project: z.string(),
-      environments: z.array(z.string()),
-    })
-  ),
-});
-
-export type TSurveyCopyFormData = z.infer<typeof ZSurveyCopyFormValidation>;
-
-export interface TProjectWithLanguages extends Pick<Project, "id"> {
+export interface TWorkspaceWithLanguages extends Pick<Workspace, "id"> {
   languages: Pick<Language, "code" | "alias">[];
 }

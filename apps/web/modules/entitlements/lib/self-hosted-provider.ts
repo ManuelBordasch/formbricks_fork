@@ -1,5 +1,6 @@
 import "server-only";
 import { ResourceNotFoundError } from "@formbricks/types/errors";
+import { COMMUNITY_WORKSPACE_LIMIT } from "@/lib/constants";
 import { getOrganization } from "@/lib/organization/service";
 import { CLOUD_STRIPE_FEATURE_LOOKUP_KEYS } from "@/modules/billing/lib/stripe-catalog";
 import { getEnterpriseLicense } from "@/modules/ee/license-check/lib/license";
@@ -30,8 +31,14 @@ const mapLicenseFeaturesToEntitlements = (
   if (features.aiSmartTools) {
     entitlementKeys.push(CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.AI_SMART_TOOLS);
   }
-  if (features.aiDataAnalysis) {
-    entitlementKeys.push(CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.AI_DATA_ANALYSIS);
+  if (features.feedbackDirectories) {
+    entitlementKeys.push(CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.FEEDBACK_DIRECTORIES);
+  }
+  if (features.dashboards) {
+    entitlementKeys.push(CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.DASHBOARDS);
+  }
+  if (features.workflows) {
+    entitlementKeys.push(CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.WORKFLOWS);
   }
 
   return entitlementKeys;
@@ -54,10 +61,15 @@ export const getSelfHostedOrganizationEntitlementsContext = async (
     source: "self_hosted_license",
     features: license.active ? mapLicenseFeaturesToEntitlements(license.features) : [],
     limits: {
-      projects: license.active ? (license.features?.projects ?? 3) : 3,
+      // null = unlimited; only an inactive or feature-less license falls back to the community default.
+      workspaces:
+        license.active && license.features ? license.features.workspaces : COMMUNITY_WORKSPACE_LIMIT,
       // Self-hosted response limits are not license-server-managed today.
       monthlyResponses: null,
+      // Self-hosted workflows are gated by the boolean license feature, not metered (ENG-1936).
+      monthlyWorkflowRuns: null,
     },
+    licenseActive: license.active,
     licenseStatus: license.status,
     licenseFeatures: license.features,
     stripeCustomerId: null,

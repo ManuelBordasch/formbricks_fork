@@ -1,12 +1,18 @@
-import { Prisma } from "@prisma/client";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
 import {
   getOrganizationLogoUrl,
   removeOrganizationEmailLogoUrl,
   updateOrganizationEmailLogoUrl,
 } from "./organization";
+
+vi.mock("server-only", () => ({}));
+
+vi.mock("@/lib/utils/validate", () => ({
+  validateInputs: vi.fn(),
+}));
 
 vi.mock("@formbricks/database", () => ({
   prisma: {
@@ -36,10 +42,9 @@ describe("organization", () => {
       };
 
       const mockUpdatedOrganization = {
-        projects: [
+        workspaces: [
           {
             id: "clp123456789012345678901234",
-            environments: [{ id: "cle123456789012345678901234" }],
           },
         ],
       };
@@ -62,14 +67,9 @@ describe("organization", () => {
           },
         },
         select: {
-          projects: {
+          workspaces: {
             select: {
               id: true,
-              environments: {
-                select: {
-                  id: true,
-                },
-              },
             },
           },
         },
@@ -88,6 +88,20 @@ describe("organization", () => {
       });
       expect(prisma.organization.update).not.toHaveBeenCalled();
     });
+
+    test("should throw ResourceNotFoundError when the update targets a missing organization (P2025)", async () => {
+      const prismaError = new Prisma.PrismaClientKnownRequestError("Record to update not found", {
+        code: "P2025",
+        clientVersion: "5.0.0",
+      });
+
+      vi.mocked(prisma.organization.findUnique).mockResolvedValue({ whitelabel: {} } as any);
+      vi.mocked(prisma.organization.update).mockRejectedValue(prismaError);
+
+      await expect(
+        updateOrganizationEmailLogoUrl("clg123456789012345678901234", "new-logo.png")
+      ).rejects.toThrow(ResourceNotFoundError);
+    });
   });
 
   describe("removeOrganizationEmailLogoUrl", () => {
@@ -97,10 +111,9 @@ describe("organization", () => {
         whitelabel: {
           logoUrl: "old-logo.png",
         },
-        projects: [
+        workspaces: [
           {
             id: "clp123456789012345678901234",
-            environments: [{ id: "cle123456789012345678901234" }],
           },
         ],
       };
@@ -115,14 +128,9 @@ describe("organization", () => {
         where: { id: "clg123456789012345678901234" },
         select: {
           whitelabel: true,
-          projects: {
+          workspaces: {
             select: {
               id: true,
-              environments: {
-                select: {
-                  id: true,
-                },
-              },
             },
           },
         },
@@ -149,19 +157,31 @@ describe("organization", () => {
         where: { id: "clg123456789012345678901234" },
         select: {
           whitelabel: true,
-          projects: {
+          workspaces: {
             select: {
               id: true,
-              environments: {
-                select: {
-                  id: true,
-                },
-              },
             },
           },
         },
       });
       expect(prisma.organization.update).not.toHaveBeenCalled();
+    });
+
+    test("should throw ResourceNotFoundError when the update targets a missing organization (P2025)", async () => {
+      const prismaError = new Prisma.PrismaClientKnownRequestError("Record to update not found", {
+        code: "P2025",
+        clientVersion: "5.0.0",
+      });
+
+      vi.mocked(prisma.organization.findUnique).mockResolvedValue({
+        whitelabel: {},
+        workspaces: [],
+      } as any);
+      vi.mocked(prisma.organization.update).mockRejectedValue(prismaError);
+
+      await expect(removeOrganizationEmailLogoUrl("clg123456789012345678901234")).rejects.toThrow(
+        ResourceNotFoundError
+      );
     });
   });
 

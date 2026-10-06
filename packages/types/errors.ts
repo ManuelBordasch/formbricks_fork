@@ -31,6 +31,14 @@ class ValidationError extends Error {
   }
 }
 
+class QueryExecutionError extends Error {
+  statusCode = 500;
+  constructor(message: string) {
+    super(message);
+    this.name = "QueryExecutionError";
+  }
+}
+
 class UnknownError extends Error {
   statusCode = 500;
   constructor(message: string) {
@@ -135,6 +143,7 @@ export {
   ResourceNotFoundError,
   InvalidInputError,
   ValidationError,
+  QueryExecutionError,
   DatabaseError,
   UniqueConstraintError,
   UnknownError,
@@ -147,6 +156,13 @@ export {
 };
 export type { NetworkError, ForbiddenError };
 
+export const FILE_UPLOAD_ERROR_NAMES = {
+  INVALID_FILE_NAME: "InvalidFileNameError",
+  STORAGE_NOT_CONFIGURED: "StorageNotConfiguredError",
+  STORAGE_UPLOAD_FAILED: "StorageUploadFailedError",
+  FILE_TOO_LARGE: "FileTooLargeError",
+} as const;
+
 /**
  * Error names that represent expected business-logic failures.
  * These are handled gracefully in the UI and should NOT be reported to Sentry.
@@ -156,10 +172,13 @@ export const EXPECTED_ERROR_NAMES = new Set([
   "AuthorizationError",
   "InvalidInputError",
   "ValidationError",
+  "QueryExecutionError",
   "AuthenticationError",
   "OperationNotAllowedError",
   "TooManyRequestsError",
   "InvalidPasswordResetTokenError",
+  "UniqueConstraintError",
+  "RequestBodyTooLargeError",
 ]);
 
 /**
@@ -167,6 +186,42 @@ export const EXPECTED_ERROR_NAMES = new Set([
  * Works with both error instances and serialised errors (where only `name` survives).
  */
 export const isExpectedError = (error: Error): boolean => EXPECTED_ERROR_NAMES.has(error.name);
+
+/**
+ * Stable, locale-independent marker placed in an ApiErrorResponse's `details.code` when a
+ * response update is rejected because the response was already finalized. Clients key off this
+ * instead of the human-readable (and potentially localized/reworded) error message.
+ */
+export const RESPONSE_ALREADY_FINISHED_ERROR_CODE = "response_already_finished";
+
+/**
+ * Stable, locale-independent marker used when a Formbricks Cloud sign-up is rejected because the
+ * email uses a personal/free/disposable domain. Reused as the sign-up action's `serverError`
+ * sentinel and as the `?error=` code on the SSO rejection redirect, so the client can map it to a
+ * localized message without depending on the (server-only) blocklist utility.
+ */
+export const SIGNUP_EMAIL_DOMAIN_BLOCKED_ERROR_CODE = "email_domain_not_allowed";
+
+/**
+ * Stable, locale-independent marker used when a password is rejected because it appears in the
+ * Have-I-Been-Pwned breach corpus (ENG-1587). Set as the `code` on the Better Auth APIError thrown
+ * by the breach-check plugin, then re-surfaced as the sign-up / reset action's `serverError`
+ * sentinel so the client can map it to a localized message.
+ */
+export const PASSWORD_COMPROMISED_ERROR_CODE = "password_compromised";
+
+/**
+ * Stable, locale-independent marker used when a sign-up presents an invite token that is malformed,
+ * expired, or issued to a different email address than the account being created.
+ */
+export const INVITE_TOKEN_INVALID_ERROR_CODE = "invite_token_invalid";
+
+/**
+ * Stable, locale-independent marker used when a sign-up is rejected because the instance has public
+ * sign-up closed (`SIGNUP_DISABLED`, or multi-org disabled) and the caller presented neither a valid
+ * invite nor a fresh instance to bootstrap.
+ */
+export const SIGNUP_DISABLED_ERROR_CODE = "signup_disabled";
 
 export interface ApiErrorResponse {
   code:

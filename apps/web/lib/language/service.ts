@@ -1,35 +1,42 @@
-import { Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
+import { CANONICAL_LANGUAGE_CODES, normalizeLanguageCode } from "@formbricks/i18n-utils";
 import { logger } from "@formbricks/logger";
 import { ZId } from "@formbricks/types/common";
-import { DatabaseError, ResourceNotFoundError, ValidationError } from "@formbricks/types/errors";
+import {
+  DatabaseError,
+  OperationNotAllowedError,
+  ResourceNotFoundError,
+  ValidationError,
+} from "@formbricks/types/errors";
 import {
   TLanguage,
   TLanguageInput,
   TLanguageUpdate,
   ZLanguageInput,
   ZLanguageUpdate,
-} from "@formbricks/types/project";
-import { getProject } from "../project/service";
+} from "@formbricks/types/workspace";
+import { isWorkspaceDefaultSurveyLanguage } from "../i18n/default-survey-language";
 import { validateInputs } from "../utils/validate";
+import { getWorkspace } from "../workspace/service";
 
 const languageSelect = {
   id: true,
   code: true,
   alias: true,
-  projectId: true,
+  workspaceId: true,
   createdAt: true,
   updatedAt: true,
 };
 
-export const getLanguage = async (languageId: string): Promise<TLanguage & { projectId: string }> => {
+export const getLanguage = async (languageId: string): Promise<TLanguage & { workspaceId: string }> => {
   try {
     validateInputs([languageId, ZId]);
 
     const language = await prisma.language.findFirst({
       where: { id: languageId },
-      select: { ...languageSelect, projectId: true },
+      select: { ...languageSelect, workspaceId: true },
     });
 
     if (!language) {
@@ -47,22 +54,35 @@ export const getLanguage = async (languageId: string): Promise<TLanguage & { pro
 };
 
 export const createLanguage = async (
-  projectId: string,
+  workspaceId: string,
   languageInput: TLanguageInput
 ): Promise<TLanguage> => {
   try {
-    validateInputs([projectId, ZId], [languageInput, ZLanguageInput]);
-    const project = await getProject(projectId);
-    if (!project) throw new ResourceNotFoundError("Workspace not found", projectId);
+    validateInputs([workspaceId, ZId], [languageInput, ZLanguageInput]);
+    const workspace = await getWorkspace(workspaceId);
+    if (!workspace) throw new ResourceNotFoundError("Workspace not found", workspaceId);
     if (!languageInput.code) {
       throw new ValidationError("Language code is required");
+    }
+
+    // Standardize on a canonical BCP-47 tag (ENG-1067) and only allow codes from the curated catalog.
+    // Normalizing rejects malformed/unparseable codes; the catalog check additionally rejects valid-but-
+    // uncurated CLDR fallbacks (e.g. "nso" -> "nso-ZA"), so persisted rows can't drift from the codes the
+    // app actually supports — regardless of the caller.
+    const canonicalCode = normalizeLanguageCode(languageInput.code);
+    if (!canonicalCode) {
+      throw new ValidationError(`Invalid language code: '${languageInput.code}'`);
+    }
+    if (!CANONICAL_LANGUAGE_CODES.includes(canonicalCode)) {
+      throw new ValidationError(`Unsupported language code: '${languageInput.code}'`);
     }
 
     const language = await prisma.language.create({
       data: {
         ...languageInput,
-        project: {
-          connect: { id: projectId },
+        code: canonicalCode,
+        workspace: {
+          connect: { id: workspaceId },
         },
       },
       select: languageSelect,
@@ -106,13 +126,33 @@ export const getSurveysUsingGivenLanguage = reactCache(async (languageId: string
   }
 });
 
-export const deleteLanguage = async (languageId: string, projectId: string): Promise<TLanguage> => {
+export const deleteLanguage = async (languageId: string, workspaceId: string): Promise<TLanguage> => {
   try {
-    validateInputs([languageId, ZId], [projectId, ZId]);
-    const project = await getProject(projectId);
-    if (!project) throw new ResourceNotFoundError("Workspace not found", projectId);
+    validateInputs([languageId, ZId], [workspaceId, ZId]);
+    const workspace = await getWorkspace(workspaceId);
+    if (!workspace) throw new ResourceNotFoundError("Workspace not found", workspaceId);
+
+    // The language has to belong to the workspace the caller was authorized against, or a caller with
+    // `workspace.manage` on their own workspace could delete another tenant's language by id.
+    const languageToDelete = workspace.languages.find(
+      (workspaceLanguage) => workspaceLanguage.id === languageId
+    );
+    if (!languageToDelete) {
+      throw new ResourceNotFoundError("Language", languageId);
+    }
+
+    // Removing the language the workspace default survey language points at would leave the setting
+    // naming a language the workspace no longer has, so it is blocked until the default is changed.
+    if (isWorkspaceDefaultSurveyLanguage(languageToDelete.code, workspace.config.defaultSurveyLanguage)) {
+      throw new OperationNotAllowedError(
+        "This language is the workspace's default survey language and cannot be removed"
+      );
+    }
+
     const prismaLanguage = await prisma.language.delete({
-      where: { id: languageId },
+      // Scoped to the workspace as well as the id: the check above reads a snapshot, this is what the
+      // database enforces at write time.
+      where: { id: languageId, workspaceId },
       select: { ...languageSelect, surveyLanguages: { select: { surveyId: true } } },
     });
 
@@ -130,17 +170,22 @@ export const deleteLanguage = async (languageId: string, projectId: string): Pro
 };
 
 export const updateLanguage = async (
-  projectId: string,
+  workspaceId: string,
   languageId: string,
   languageInput: TLanguageUpdate
 ): Promise<TLanguage> => {
   try {
-    validateInputs([languageId, ZId], [languageInput, ZLanguageUpdate], [projectId, ZId]);
-    const project = await getProject(projectId);
-    if (!project) throw new ResourceNotFoundError("Workspace not found", projectId);
+    validateInputs([languageId, ZId], [languageInput, ZLanguageUpdate], [workspaceId, ZId]);
+    const workspace = await getWorkspace(workspaceId);
+    if (!workspace) throw new ResourceNotFoundError("Workspace not found", workspaceId);
+    // Only the alias is mutable on update — the `code` is immutable, so `Language.code` stays canonical
+    // regardless of caller (createLanguage enforces the canonical catalog; a code change means delete +
+    // create). Write `alias` explicitly rather than spreading `languageInput`: a caller can pass a `code`
+    // in the runtime object even though the declared type is alias-only, and spreading it would persist an
+    // arbitrary, non-canonical code — the exact hole the create-side hardening closed.
     const prismaLanguage = await prisma.language.update({
       where: { id: languageId },
-      data: { ...languageInput, updatedAt: new Date() },
+      data: { alias: languageInput.alias, updatedAt: new Date() },
       select: { ...languageSelect, surveyLanguages: { select: { surveyId: true } } },
     });
 

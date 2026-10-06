@@ -1,13 +1,14 @@
 import { z } from "zod";
-import { ZSurveyFollowUp } from "@formbricks/database/types/survey-follow-up";
 import { ZActionClass, ZActionClassNoCodeConfig } from "../action-classes";
 import { ZColor, ZEndingCardUrl, ZId, ZOverlay, ZPlacement, ZStorageUrl, getZSafeUrl } from "../common";
 import { ZContactAttributes } from "../contact-attribute";
+import { ZLinkedEmbeddedField } from "../embedded-data";
 import { type TI18nString, ZI18nString } from "../i18n";
-import { ZLanguage } from "../project";
+import { isLegacyIdCharset, isLegacyVariableName } from "../safe-identifier";
 import { ZSegment } from "../segment";
 import { ZAllowedFileExtension } from "../storage";
 import { ZBaseStyling } from "../styling";
+import { ZLanguage } from "../workspace";
 import { type TSurveyBlock, type TSurveyBlockLogicAction, ZSurveyBlocks } from "./blocks";
 import { findBlocksWithCyclicLogic } from "./blocks-validation";
 import {
@@ -16,8 +17,10 @@ import {
   ZSurveyAddressElement,
   ZSurveyCTAElement,
   ZSurveyCalElement,
+  ZSurveyCesElement,
   ZSurveyConsentElement,
   ZSurveyContactInfoElement,
+  ZSurveyCsatElement,
   ZSurveyDateElement,
   ZSurveyFileUploadElement,
   ZSurveyMatrixElement,
@@ -29,6 +32,7 @@ import {
   ZSurveyRatingElement,
 } from "./elements";
 import { validateElementLabels } from "./elements-validation";
+import { ZSurveyFollowUp } from "./follow-up";
 import {
   type TConditionGroup,
   type TConditionGroupDeprecated,
@@ -62,6 +66,9 @@ export const ZSurveyEndScreenCard = ZSurveyEndingBase.extend({
   buttonLink: ZEndingCardUrl.optional(),
   imageUrl: ZStorageUrl.optional(),
   videoUrl: ZStorageUrl.optional(),
+  // Absent means "show it": the checkmark predates this field, so every survey written before it has to
+  // keep rendering the icon.
+  hideDefaultIcon: z.boolean().optional(),
 });
 
 export type TSurveyEndScreenCard = z.infer<typeof ZSurveyEndScreenCard>;
@@ -104,6 +111,8 @@ export enum TSurveyQuestionTypeEnum {
   Address = "address",
   Ranking = "ranking",
   ContactInfo = "contactInfo",
+  CSAT = "csat",
+  CES = "ces",
 }
 
 /**
@@ -173,7 +182,10 @@ export const ZSurveyHiddenFields = z.object({
           });
         }
 
-        if (!/^[a-zA-Z0-9_-]+$/.test(field)) {
+        // Lenient on purpose: this schema also parses surveys loaded from the database, which
+        // still hold hidden field names created before `isSafeIdentifier`. New names are gated
+        // strictly by `validateId` in the editor.
+        if (!isLegacyIdCharset(field)) {
           ctx.addIssue({
             code: "custom",
             message:
@@ -203,8 +215,10 @@ export const ZSurveyVariable = z
     }),
   ])
   .superRefine((data, ctx) => {
-    // variable name can only contain lowercase letters, numbers, and underscores
-    if (!/^[a-z0-9_]+$/.test(data.name)) {
+    // Lenient on purpose: this schema also parses surveys loaded from the database, which still
+    // hold variable names created before `isSafeIdentifier` (e.g. `_legacy`). New names are gated
+    // strictly by the variable editor.
+    if (!isLegacyVariableName(data.name)) {
       ctx.addIssue({
         code: "custom",
         message: "Variable name can only contain lowercase letters, numbers, and underscores",
@@ -223,7 +237,7 @@ export const ZSurveySlug = z
 
 export type TSurveySlug = z.infer<typeof ZSurveySlug>;
 
-export const ZSurveyProjectOverwrites = z.object({
+export const ZSurveyWorkspaceOverwrites = z.object({
   brandColor: ZColor.nullish(),
   highlightBorderColor: ZColor.nullish(),
   placement: ZPlacement.nullish(),
@@ -231,7 +245,7 @@ export const ZSurveyProjectOverwrites = z.object({
   overlay: ZOverlay.nullish(),
 });
 
-export type TSurveyProjectOverwrites = z.infer<typeof ZSurveyProjectOverwrites>;
+export type TSurveyWorkspaceOverwrites = z.infer<typeof ZSurveyWorkspaceOverwrites>;
 
 export const ZSurveyBackgroundBgType = z.enum(["animation", "color", "upload", "image"]);
 
@@ -274,11 +288,13 @@ export const ZSurveyRecaptcha = z
 
 export type TSurveyRecaptcha = z.infer<typeof ZSurveyRecaptcha>;
 
-export const ZSurveyMetadata = z.object({
-  title: ZI18nString.optional(),
-  description: ZI18nString.optional(),
-  ogImage: ZStorageUrl.optional(),
-});
+export const ZSurveyMetadata = z
+  .object({
+    title: ZI18nString.optional(),
+    description: ZI18nString.optional(),
+    ogImage: ZStorageUrl.optional(),
+  })
+  .catchall(z.unknown());
 
 export type TSurveyMetadata = z.infer<typeof ZSurveyMetadata>;
 
@@ -714,6 +730,40 @@ export const ZSurveyRankingQuestion = ZSurveyQuestionBase.extend({
 export type TSurveyRankingQuestion = z.infer<typeof ZSurveyRankingQuestion>;
 
 /**
+ * @deprecated Use ZSurveyCsatElement instead. Kept for v1 API backward compatibility only.
+ */
+export const ZSurveyCsatQuestion = ZSurveyQuestionBase.extend({
+  type: z.literal(TSurveyQuestionTypeEnum.CSAT),
+  scale: z.enum(["number", "smiley", "star"]),
+  range: z.literal(5),
+  lowerLabel: ZI18nString.optional(),
+  upperLabel: ZI18nString.optional(),
+  isColorCodingEnabled: z.boolean().optional().prefault(false),
+});
+
+/**
+ * @deprecated Use TSurveyCsatElement instead. Kept for v1 API backward compatibility only.
+ */
+export type TSurveyCsatQuestion = z.infer<typeof ZSurveyCsatQuestion>;
+
+/**
+ * @deprecated Use ZSurveyCesElement instead. Kept for v1 API backward compatibility only.
+ */
+export const ZSurveyCesQuestion = ZSurveyQuestionBase.extend({
+  type: z.literal(TSurveyQuestionTypeEnum.CES),
+  scale: z.enum(["number", "smiley", "star"]),
+  range: z.union([z.literal(5), z.literal(7)]),
+  lowerLabel: ZI18nString.optional(),
+  upperLabel: ZI18nString.optional(),
+  isColorCodingEnabled: z.boolean().optional().prefault(false),
+});
+
+/**
+ * @deprecated Use TSurveyCesElement instead. Kept for v1 API backward compatibility only.
+ */
+export type TSurveyCesQuestion = z.infer<typeof ZSurveyCesQuestion>;
+
+/**
  * @deprecated Use TSurveyElement instead. Kept for v1 API backward compatibility only.
  */
 export const ZSurveyQuestion = z.union([
@@ -731,6 +781,8 @@ export const ZSurveyQuestion = z.union([
   ZSurveyAddressQuestion,
   ZSurveyRankingQuestion,
   ZSurveyContactInfoQuestion,
+  ZSurveyCsatQuestion,
+  ZSurveyCesQuestion,
 ]);
 
 /**
@@ -767,6 +819,8 @@ export const ZSurveyQuestionType = z.enum([
   TSurveyQuestionTypeEnum.Cal,
   TSurveyQuestionTypeEnum.Ranking,
   TSurveyQuestionTypeEnum.ContactInfo,
+  TSurveyQuestionTypeEnum.CSAT,
+  TSurveyQuestionTypeEnum.CES,
 ]);
 
 /**
@@ -825,12 +879,14 @@ export const ZSurveyBase = z.object({
   updatedAt: z.date(),
   name: z.string(),
   type: ZSurveyType,
-  environmentId: z.string(),
+  workspaceId: z.cuid2(),
   createdBy: z.string().nullable(),
   status: ZSurveyStatus,
   displayOption: ZSurveyDisplayOption,
   autoClose: z.number().nullable(),
   triggers: z.array(z.object({ actionClass: ZActionClass })),
+  // This variable should be called `cooldownPeriod`, not `recontactDays`. It is related to the
+  // Survey Cooldown Period feature (across surveys) and not the Recontact Options (per survey).
   recontactDays: z.number().nullable(),
   displayLimit: z.number().nullable(),
   welcomeCard: ZSurveyWelcomeCard,
@@ -869,6 +925,18 @@ export const ZSurveyBase = z.object({
     }
   }),
   hiddenFields: ZSurveyHiddenFields,
+  /**
+   * The survey's Embedded Data definitions, joined from `EmbeddedData` / `SurveyEmbeddedData` and
+   * inlined when the survey is loaded (ENG-1837). This is the **read** source of truth for every
+   * reader — reach it through `getSurveyEmbeddedFields`, never directly, so surveys read through a
+   * select that omits the join still fall back to the legacy columns below.
+   *
+   * Read-only and optional. Optional because every survey literal, fixture and create payload in the
+   * codebase predates it; read-only because `variables` / `hiddenFields` remain the written columns
+   * until the legacy JSON is dropped — the write paths that spread a survey object into Prisma strip
+   * this key explicitly, and both create-input schemas omit it.
+   */
+  embeddedFields: z.array(ZLinkedEmbeddedField).optional(),
   variables: ZSurveyVariables.superRefine((variables, ctx) => {
     // variable ids must be unique
     const variableIds = variables.map((v) => v.id);
@@ -898,13 +966,25 @@ export const ZSurveyBase = z.object({
     })
   ),
   delay: z.number(),
+  publishOn: z.coerce
+    .date()
+    .nullish()
+    .transform((value) => value ?? null),
+  closeOn: z.coerce
+    .date()
+    .nullish()
+    .transform((value) => value ?? null),
+  // Soft-delete marker (ENG-1042). Optional (no transform) so it stays non-required on the inferred
+  // TSurvey type — existing survey literals/payloads that omit it keep compiling and validating.
+  // Reads populate it from the DB so archived state is available to the editor/summary surfaces.
+  archivedAt: z.coerce.date().nullish(),
   autoComplete: z
     .number()
     .min(1, {
       error: "Response limit must be greater than 0",
     })
     .nullable(),
-  projectOverwrites: ZSurveyProjectOverwrites.nullable(),
+  workspaceOverwrites: ZSurveyWorkspaceOverwrites.nullable(),
   styling: ZSurveyStyling.nullable(),
   showLanguageSwitch: z.boolean().nullable(),
   surveyClosedMessage: ZSurveyClosedMessage.nullable(),
@@ -912,9 +992,17 @@ export const ZSurveyBase = z.object({
   singleUse: ZSurveySingleUse.nullable(),
   isVerifyEmailEnabled: z.boolean(),
   recaptcha: ZSurveyRecaptcha.nullable(),
-  isSingleResponsePerEmailEnabled: z.boolean(),
   isBackButtonHidden: z.boolean(),
+  isAutoProgressingEnabled: z.boolean().optional().prefault(false),
   isCaptureIpEnabled: z.boolean(),
+  /**
+   * "Anonymize responses". Suppresses the privacy-sensitive reserved fields **at ingest**, so the
+   * response is stored without them rather than stored and filtered on read.
+   *
+   * A field of its own and deliberately not `!isCaptureIpEnabled`: that flag also defaults to false,
+   * so reading anonymize off it would retroactively anonymize every survey that already exists.
+   */
+  isAnonymizeResponsesEnabled: z.boolean(),
   pin: z
     .string()
     .length(4, {
@@ -2033,6 +2121,23 @@ const isInvalidOperatorsForQuestionType = (
   return isInvalidOperator;
 };
 
+/**
+ * Compile-time exhaustiveness guard for a left-operand chain. The parameter is `never`, so passing a
+ * still-possible operand type is a type error, and adding a member to `ZDynamicLogicFieldValue` fails
+ * the build at every chain that has not learned about it.
+ *
+ * This exists because ENG-1840 added `reserved` to that union and two validators here kept treating
+ * it as a hidden field for a whole milestone — a bare `else` commented `leftOperand.type ===
+ * "hiddenField"` accepted the new member silently, and every survey with a logic condition on a
+ * reserved field became unsaveable (ENG-2538). A type error is what that should have been.
+ *
+ * Does nothing at runtime, deliberately: a stored survey that somehow carries an unknown operand
+ * should still validate rather than throw inside a Zod refinement.
+ */
+const assertNoUnhandledLeftOperand = (_leftOperand: never): void => {
+  // Exhaustiveness is enforced entirely by the parameter type.
+};
+
 const isInvalidOperatorsForVariableType = (
   variableType: "text" | "number",
   operator: TSurveyLogicConditionsOperator
@@ -2603,7 +2708,18 @@ const validateConditions = (
           }
         }
       }
-    } else {
+    } else if (leftOperand.type === "element") {
+      // Nothing to check: `element` is the blocks-era operand and this validator resolves against
+      // `survey.questions`. It was already dropping out of this chain unvalidated — spelled out so the
+      // guard at the end can be exhaustive without changing what the validator accepts.
+    } else if (leftOperand.type === "reserved") {
+      // Same as the block-path arm below — see the comment there. The legacy validator carried the
+      // identical bare `else`, so a reserved operand on a questions-shaped survey was reported as a
+      // missing hidden field too.
+      // Checked rather than a bare `else`: this comes from persisted JSON parsed by a lenient
+      // schema, so a row from a different catalog version can carry a `type` outside the union.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- see above
+    } else if (leftOperand.type === "hiddenField") {
       const hiddenFieldId = leftOperand.value;
       const hiddenField = survey.hiddenFields.fieldIds?.find((fieldId) => fieldId === hiddenFieldId);
 
@@ -2686,6 +2802,11 @@ const validateConditions = (
           });
         }
       }
+    } else {
+      // The block-path chain's guard, on the second of the two chains that carried the ENG-2538 bug.
+      // Without it `assertNoUnhandledLeftOperand`'s own promise — a build failure at *every* chain
+      // that has not learned about a new member — held for only one of them.
+      assertNoUnhandledLeftOperand(leftOperand);
     }
   };
 
@@ -2693,9 +2814,9 @@ const validateConditions = (
     group.conditions.forEach((condition) => {
       // Check if it's a group by checking for "conditions" property
       if ("conditions" in condition && "connector" in condition) {
-        validateConditionGroup(condition as TConditionGroup | TConditionGroupDeprecated);
+        validateConditionGroup(condition);
       } else {
-        validateSingleCondition(condition as TSingleCondition);
+        validateSingleCondition(condition);
       }
     });
   };
@@ -2992,6 +3113,8 @@ const isInvalidOperatorsForElementType = (
       break;
     case TSurveyElementTypeEnum.NPS:
     case TSurveyElementTypeEnum.Rating:
+    case TSurveyElementTypeEnum.CSAT:
+    case TSurveyElementTypeEnum.CES:
       if (
         ![
           "equals",
@@ -3485,8 +3608,31 @@ const validateBlockConditions = (
           });
         }
       }
-    } else {
-      // leftOperand.type === "hiddenField"
+    } else if (leftOperand.type === "reserved") {
+      // A reserved operand names a `RESERVED_FIELD_CATALOG` entry, not anything stored on the survey,
+      // so there is nothing to look up and nothing to report — and that is deliberate, not an
+      // omission (ENG-2538). `ZDynamicReservedField` validates the name as non-empty only, precisely
+      // so a survey saved against a newer catalog still parses on an older self-hosted deployment;
+      // checking it against the catalog here would reintroduce exactly the failure that schema
+      // avoids, for the whole survey rather than one condition. An operand naming an entry that does
+      // not exist resolves as unset, the same outcome a stale variable or hidden-field operand
+      // already has.
+      //
+      // The arm exists because the chain below used to end in a bare `else` commented
+      // `leftOperand.type === "hiddenField"`, which was true until ENG-1840 added this fourth type.
+      // A reserved operand fell into it, was looked up in `survey.hiddenFields.fieldIds` and reported
+      // missing — so picking any of the 16 reserved fields the picker offers made the survey
+      // unsaveable, and the "usable in logic" half of ENG-1840 did not work at all.
+      //
+      // No operator validation here, deliberately: the `hiddenField` arm's allowlist is string-only,
+      // so reusing it would reject `isGreaterThan` on `durationSeconds` — a comparison the picker
+      // legitimately offers. Operators for reserved operands stay unchecked until they can be judged
+      // against the entry's own dataType, which must also tolerate an entry an older self-hosted
+      // catalog does not know. An unknown operator evaluates to `false`, so nothing misbehaves.
+      // Checked rather than a bare `else`: this comes from persisted JSON parsed by a lenient
+      // schema, so a row from a different catalog version can carry a `type` outside the union.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- see above
+    } else if (leftOperand.type === "hiddenField") {
       const fieldId = leftOperand.value;
       const field = survey.hiddenFields.fieldIds?.find((id) => id === fieldId);
 
@@ -3497,6 +3643,11 @@ const validateBlockConditions = (
           path: ["blocks", blockIndex, "logic", logicIndex, "conditions"],
         });
       }
+    } else {
+      // Spelled out rather than left as the `hiddenField` fallthrough so a fifth operand type is a
+      // compile error here instead of being silently validated as a hidden field, which is how the
+      // fourth one got through review.
+      assertNoUnhandledLeftOperand(leftOperand);
     }
   };
 
@@ -3746,7 +3897,18 @@ const validateBlockLogic = (
 };
 
 // ZSurvey is refined, so update/create inputs start from ZSurveyBase and reapply the same refinement.
-export const ZSurveyUpdateInput = ZSurveyBase.omit({ createdAt: true, updatedAt: true, followUps: true })
+export const ZSurveyUpdateInput = ZSurveyBase.omit({
+  createdAt: true,
+  updatedAt: true,
+  followUps: true,
+  // Read-only projection of the EmbeddedData tables (ENG-1837), omitted for the same reason as on
+  // both create inputs: nothing may reach a Prisma write through this schema. Omitting STRIPS rather
+  // than rejects, so the v1 PUT round-trip — which re-parses the loaded survey merged with the patch
+  // — is unaffected; `updateSurveyInternal` still destructures the key out, because callers that hand
+  // it a raw `TSurvey` (the editor's save actions, the summary's single-use toggle) never go through
+  // this schema at all.
+  embeddedFields: true,
+})
   .extend({
     followUps: z
       .array(
@@ -3773,9 +3935,7 @@ const makeSchemaOptional = <T extends z.ZodRawShape>(
 ): z.ZodObject<{
   [K in keyof T]: z.ZodOptional<T[K]>;
 }> => {
-  return schema.partial() as z.ZodObject<{
-    [K in keyof T]: z.ZodOptional<T[K]>;
-  }>;
+  return schema.partial();
 };
 
 export const ZSurveyCreateInput = makeSchemaOptional(ZSurveyBase)
@@ -3783,9 +3943,17 @@ export const ZSurveyCreateInput = makeSchemaOptional(ZSurveyBase)
     id: true,
     createdAt: true,
     updatedAt: true,
-    projectOverwrites: true,
+    workspaceOverwrites: true,
     languages: true,
     followUps: true,
+    // archivedAt is owned exclusively by the archive/restore flows; a create must never set it,
+    // otherwise a caller could POST an already-archived, purge-eligible survey.
+    archivedAt: true,
+    // Read-only projection of the EmbeddedData tables (ENG-1837). `createSurvey` spreads the parsed
+    // body straight into `Prisma.SurveyCreateInput`, and `Survey` owns relations named
+    // `embeddedData` / `embeddedDataLinks`, so admitting this key would turn a read projection into
+    // a nested relation write. The rows are written by `reconcileEmbeddedData` instead.
+    embeddedFields: true,
   })
   .extend({
     name: z.string(), // Keep name required
@@ -3798,6 +3966,7 @@ export const ZSurveyCreateInput = makeSchemaOptional(ZSurveyBase)
     endings: ZSurveyEndings.prefault([]),
     type: ZSurveyType.prefault("link"),
     followUps: z.array(ZSurveyFollowUp.omit({ createdAt: true, updatedAt: true })).prefault([]),
+    isAutoProgressingEnabled: z.boolean().prefault(false),
   })
   .superRefine((survey, ctx) => {
     surveyRefinement(survey as z.infer<typeof ZSurveyBase>, ctx);
@@ -3825,18 +3994,26 @@ export const ZSurveyCreateInput = makeSchemaOptional(ZSurveyBase)
 
 export type TSurvey = z.infer<typeof ZSurvey>;
 
-export const ZSurveyCreateInputWithEnvironmentId = makeSchemaOptional(ZSurveyBase)
+export const ZSurveyCreateInputWithWorkspaceId = makeSchemaOptional(ZSurveyBase)
   .omit({
     id: true,
     createdAt: true,
     updatedAt: true,
-    projectOverwrites: true,
+    workspaceOverwrites: true,
     languages: true,
     followUps: true,
+    // archivedAt is owned exclusively by the archive/restore flows; a create must never set it,
+    // otherwise a caller could POST an already-archived, purge-eligible survey.
+    archivedAt: true,
+    // Read-only projection of the EmbeddedData tables (ENG-1837). `createSurvey` spreads the parsed
+    // body straight into `Prisma.SurveyCreateInput`, and `Survey` owns relations named
+    // `embeddedData` / `embeddedDataLinks`, so admitting this key would turn a read projection into
+    // a nested relation write. The rows are written by `reconcileEmbeddedData` instead.
+    embeddedFields: true,
   })
   .extend({
     name: z.string(), // Keep name required
-    environmentId: z.string(),
+    workspaceId: z.string(),
     questions: ZSurveyBase.shape.questions,
     blocks: ZSurveyBase.shape.blocks,
     languages: z.array(ZSurveyLanguage).prefault([]),
@@ -3846,6 +4023,7 @@ export const ZSurveyCreateInputWithEnvironmentId = makeSchemaOptional(ZSurveyBas
     endings: ZSurveyEndings.prefault([]),
     type: ZSurveyType.prefault("link"),
     followUps: z.array(ZSurveyFollowUp.omit({ createdAt: true, updatedAt: true })).prefault([]),
+    isAutoProgressingEnabled: z.boolean().prefault(false),
   })
   .superRefine((survey, ctx) => {
     surveyRefinement(survey as z.infer<typeof ZSurveyBase>, ctx);
@@ -3871,7 +4049,7 @@ export const ZSurveyCreateInputWithEnvironmentId = makeSchemaOptional(ZSurveyBas
     }
   });
 
-export type TSurveyCreateInputWithEnvironmentId = z.infer<typeof ZSurveyCreateInputWithEnvironmentId>;
+export type TSurveyCreateInputWithWorkspaceId = z.infer<typeof ZSurveyCreateInputWithWorkspaceId>;
 export interface TSurveyDates {
   createdAt: TSurvey["createdAt"];
   updatedAt: TSurvey["updatedAt"];
@@ -3879,7 +4057,7 @@ export interface TSurveyDates {
 
 export type TSurveyCreateInput = z.input<typeof ZSurveyCreateInput>;
 
-export type TSurveyEditorTabs = "elements" | "settings" | "styling" | "followUps";
+export type TSurveyEditorTabs = "elements" | "styling" | "language" | "settings" | "followUps";
 
 export const ZSurveyElementSummaryOpenText = z.object({
   type: z.literal(TSurveyElementTypeEnum.OpenText),
@@ -3968,10 +4146,6 @@ export const ZSurveyElementSummaryRating = z.object({
   dismissed: z.object({
     count: z.number(),
   }),
-  csat: z.object({
-    satisfiedCount: z.number(),
-    satisfiedPercentage: z.number(),
-  }),
 });
 
 export type TSurveyElementSummaryRating = z.infer<typeof ZSurveyElementSummaryRating>;
@@ -4008,6 +4182,48 @@ export const ZSurveyElementSummaryNps = z.object({
 });
 
 export type TSurveyElementSummaryNps = z.infer<typeof ZSurveyElementSummaryNps>;
+
+export const ZSurveyElementSummaryCsat = z.object({
+  type: z.literal(TSurveyElementTypeEnum.CSAT),
+  element: ZSurveyCsatElement,
+  responseCount: z.number(),
+  average: z.number(),
+  choices: z.array(
+    z.object({
+      rating: z.number(),
+      count: z.number(),
+      percentage: z.number(),
+    })
+  ),
+  dismissed: z.object({
+    count: z.number(),
+  }),
+  csat: z.object({
+    satisfiedCount: z.number(),
+    satisfiedPercentage: z.number(),
+  }),
+});
+
+export type TSurveyElementSummaryCsat = z.infer<typeof ZSurveyElementSummaryCsat>;
+
+export const ZSurveyElementSummaryCes = z.object({
+  type: z.literal(TSurveyElementTypeEnum.CES),
+  element: ZSurveyCesElement,
+  responseCount: z.number(),
+  average: z.number(),
+  choices: z.array(
+    z.object({
+      rating: z.number(),
+      count: z.number(),
+      percentage: z.number(),
+    })
+  ),
+  dismissed: z.object({
+    count: z.number(),
+  }),
+});
+
+export type TSurveyElementSummaryCes = z.infer<typeof ZSurveyElementSummaryCes>;
 
 export const ZSurveyElementSummaryCta = z.object({
   type: z.literal(TSurveyElementTypeEnum.CTA),
@@ -4228,6 +4444,8 @@ export const ZSurveyElementSummary = z.union([
   ZSurveyElementSummaryAddress,
   ZSurveyElementSummaryRanking,
   ZSurveyElementSummaryContactInfo,
+  ZSurveyElementSummaryCsat,
+  ZSurveyElementSummaryCes,
 ]);
 
 export type TSurveyElementSummary = z.infer<typeof ZSurveyElementSummary>;
@@ -4281,6 +4499,9 @@ export const ZSurveyFilterCriteria = z.object({
     })
     .optional(),
   sortBy: z.enum(["createdAt", "updatedAt", "name", "relevance"]).optional(),
+  // When true, include archived surveys (archivedAt not null) in results.
+  // When false/undefined, archived surveys are excluded (hidden by default).
+  includeArchived: z.boolean().optional(),
 });
 
 export type TSurveyFilterCriteria = z.infer<typeof ZSurveyFilterCriteria>;
@@ -4295,13 +4516,6 @@ export const ZSurveyFilters = z.object({
 
 export type TSurveyFilters = z.infer<typeof ZSurveyFilters>;
 
-export const ZFilterOption = z.object({
-  label: z.string(),
-  value: z.string(),
-});
-
-export type TFilterOption = z.infer<typeof ZFilterOption>;
-
 export const ZSortOption = z.object({
   label: z.string(),
   value: z.enum(["createdAt", "updatedAt", "name", "relevance"]),
@@ -4312,7 +4526,8 @@ export type TSortOption = z.infer<typeof ZSortOption>;
 export const ZSurveyRecallItem = z.object({
   id: z.string(),
   label: z.string(),
-  type: z.enum(["element", "hiddenField", "attributeClass", "variable"]),
+  // "reserved" (ENG-1840) addresses a RESERVED_FIELD_CATALOG entry by name rather than a stored id.
+  type: z.enum(["element", "hiddenField", "attributeClass", "variable", "reserved"]),
 });
 
 export type TSurveyRecallItem = z.infer<typeof ZSurveyRecallItem>;

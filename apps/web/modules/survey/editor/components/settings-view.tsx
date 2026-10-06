@@ -1,57 +1,74 @@
-import { ActionClass, Environment, OrganizationRole } from "@prisma/client";
 import { type Dispatch, type SetStateAction } from "react";
+import { ActionClass, OrganizationRole } from "@formbricks/database/prisma-browser";
 import { TContactAttributeKey } from "@formbricks/types/contact-attribute-key";
 import { TSurveyQuota } from "@formbricks/types/quota";
 import { TSegment } from "@formbricks/types/segment";
 import { TSurvey } from "@formbricks/types/surveys/types";
+import { TUserLocale } from "@formbricks/types/user";
 import { TargetingCard } from "@/modules/ee/contacts/segments/components/targeting-card";
 import { QuotasCard } from "@/modules/ee/quotas/components/quotas-card";
-import { TTeamPermission } from "@/modules/ee/teams/project-teams/types/team";
+import { TTeamPermission } from "@/modules/ee/teams/workspace-teams/types/team";
 import { HowToSendCard } from "@/modules/survey/editor/components/how-to-send-card";
 import { RecontactOptionsCard } from "@/modules/survey/editor/components/recontact-options-card";
 import { ResponseOptionsCard } from "@/modules/survey/editor/components/response-options-card";
 import { SurveyPlacementCard } from "@/modules/survey/editor/components/survey-placement-card";
 import { TargetingLockedCard } from "@/modules/survey/editor/components/targeting-locked-card";
 import { WhenToSendCard } from "@/modules/survey/editor/components/when-to-send-card";
+import { type TSurveySchedulingConfig } from "@/modules/survey/scheduling/lib/config";
 
 interface SettingsViewProps {
-  environment: Pick<Environment, "id" | "appSetupCompleted">;
   localSurvey: TSurvey;
   setLocalSurvey: Dispatch<SetStateAction<TSurvey>>;
   actionClasses: ActionClass[];
   contactAttributeKeys: TContactAttributeKey[];
   segments: TSegment[];
   responseCount: number;
+  finishedResponseCount: number;
   membershipRole?: OrganizationRole;
   isUserTargetingAllowed?: boolean;
   isSpamProtectionAllowed: boolean;
-  projectPermission: TTeamPermission | null;
+  workspacePermission: TTeamPermission | null;
   isFormbricksCloud: boolean;
   isQuotasAllowed: boolean;
   quotas: TSurveyQuota[];
+  surveySchedulingConfig: TSurveySchedulingConfig;
+  locale: TUserLocale;
+  appSetupCompleted: boolean;
+  enterpriseLicenseRequestFormUrl: string;
+  /** A save or publish was blocked because the survey has no trigger (ENG-2581). */
+  hasTriggerError?: boolean;
 }
 
 export const SettingsView = ({
-  environment,
   localSurvey,
   setLocalSurvey,
   actionClasses,
   contactAttributeKeys,
   segments,
   responseCount,
+  finishedResponseCount,
   membershipRole,
   isUserTargetingAllowed = false,
   isSpamProtectionAllowed,
   isQuotasAllowed,
-  projectPermission,
+  workspacePermission,
   isFormbricksCloud,
   quotas,
-}: SettingsViewProps) => {
+  surveySchedulingConfig,
+  locale,
+  appSetupCompleted,
+  enterpriseLicenseRequestFormUrl,
+  hasTriggerError = false,
+}: Readonly<SettingsViewProps>) => {
   const isAppSurvey = localSurvey.type === "app";
 
   return (
     <div className="mt-12 space-y-3 p-5">
-      <HowToSendCard localSurvey={localSurvey} setLocalSurvey={setLocalSurvey} environment={environment} />
+      <HowToSendCard
+        localSurvey={localSurvey}
+        setLocalSurvey={setLocalSurvey}
+        appSetupCompleted={appSetupCompleted}
+      />
 
       {localSurvey.type === "app" ? (
         <div>
@@ -62,7 +79,6 @@ export const SettingsView = ({
                   key={localSurvey.segment?.id}
                   localSurvey={localSurvey}
                   setLocalSurvey={setLocalSurvey}
-                  environmentId={environment.id}
                   contactAttributeKeys={contactAttributeKeys}
                   segments={segments}
                   initialSegment={segments.find((segment) => segment.id === localSurvey.segment?.id)}
@@ -70,7 +86,10 @@ export const SettingsView = ({
               </div>
             </div>
           ) : (
-            <TargetingLockedCard isFormbricksCloud={isFormbricksCloud} environmentId={environment.id} />
+            <TargetingLockedCard
+              isFormbricksCloud={isFormbricksCloud}
+              enterpriseLicenseRequestFormUrl={enterpriseLicenseRequestFormUrl}
+            />
           )}
         </div>
       ) : null}
@@ -78,10 +97,11 @@ export const SettingsView = ({
       <WhenToSendCard
         localSurvey={localSurvey}
         setLocalSurvey={setLocalSurvey}
-        environmentId={environment.id}
+        workspaceId={localSurvey.workspaceId}
         propActionClasses={actionClasses}
         membershipRole={membershipRole}
-        projectPermission={projectPermission}
+        workspacePermission={workspacePermission}
+        hasError={hasTriggerError}
       />
       <QuotasCard
         localSurvey={localSurvey}
@@ -89,24 +109,21 @@ export const SettingsView = ({
         isFormbricksCloud={isFormbricksCloud}
         quotas={quotas}
         hasResponses={responseCount > 0}
+        enterpriseLicenseRequestFormUrl={enterpriseLicenseRequestFormUrl}
       />
 
       <ResponseOptionsCard
         localSurvey={localSurvey}
         setLocalSurvey={setLocalSurvey}
-        responseCount={responseCount}
+        finishedResponseCount={finishedResponseCount}
         isSpamProtectionAllowed={isSpamProtectionAllowed}
+        surveySchedulingConfig={surveySchedulingConfig}
+        locale={locale}
       />
 
       <RecontactOptionsCard localSurvey={localSurvey} setLocalSurvey={setLocalSurvey} />
 
-      {isAppSurvey && (
-        <SurveyPlacementCard
-          localSurvey={localSurvey}
-          setLocalSurvey={setLocalSurvey}
-          environmentId={environment.id}
-        />
-      )}
+      {isAppSurvey && <SurveyPlacementCard localSurvey={localSurvey} setLocalSurvey={setLocalSurvey} />}
     </div>
   );
 };

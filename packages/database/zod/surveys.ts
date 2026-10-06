@@ -1,8 +1,5 @@
-/* eslint-disable import/no-relative-packages -- Need to import from parent package */
-import { SurveyStatus, SurveyType } from "@prisma/client";
 import { z } from "zod";
 import { ZOverlay } from "../../types/common";
-// eslint-disable-next-line import/no-relative-packages -- Need to import from parent package
 import { ZLogo } from "../../types/styling";
 import { ZSurveyBlocks } from "../../types/surveys/blocks";
 import {
@@ -12,6 +9,7 @@ import {
   ZSurveyRecaptcha,
   ZSurveyVariable,
 } from "../../types/surveys/types";
+import { SurveyStatus, SurveyType } from "../src/prisma";
 
 const ZColor = z.string().regex(/^#(?:[A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/);
 
@@ -20,12 +18,16 @@ export const ZStylingColor = z.object({
   dark: ZColor.nullish(),
 });
 
-export const ZCardArrangementOptions = z.enum(["casual", "straight", "simple"]);
+// "cardless" is only supported for link surveys; app surveys keep the card-based arrangements.
+export const ZLinkSurveyCardArrangementOptions = z.enum(["casual", "straight", "simple", "cardless"]);
+export const ZAppSurveyCardArrangementOptions = z.enum(["casual", "straight", "simple"]);
 
 export const ZCardArrangement = z.object({
-  linkSurveys: ZCardArrangementOptions,
-  appSurveys: ZCardArrangementOptions,
+  linkSurveys: ZLinkSurveyCardArrangementOptions,
+  appSurveys: ZAppSurveyCardArrangementOptions,
 });
+
+export const ZLinkSurveyCardWidthOptions = z.enum(["narrow", "default", "wide"]);
 
 export const ZSurveyStylingBackground = z.object({
   bg: z.string().nullish(),
@@ -71,7 +73,7 @@ const ZSurveyBase = z.object({
   displayProgressBar: z.boolean().nullable().describe("Whether to display the progress bar"),
   pin: z.string().nullable().describe("The pin of the survey"),
   createdBy: z.string().nullable().describe("The user who created the survey"),
-  environmentId: z.cuid2().describe("The environment ID of the survey"),
+  workspaceId: z.cuid2().describe("The workspace ID of the survey"),
   questions: z.array(ZSurveyQuestion).describe("The questions of the survey"),
   blocks: ZSurveyBlocks.prefault([]).describe("The blocks of the survey"),
   endings: z.array(ZSurveyEnding).prefault([]).describe("The endings of the survey"),
@@ -90,6 +92,8 @@ const ZSurveyBase = z.object({
   autoClose: z.number().nullable().describe("Auto close time in seconds"),
   autoComplete: z.number().nullable().describe("Auto complete time in seconds"),
   delay: z.number().describe("Delay before showing survey"),
+  publishOn: z.coerce.date().nullable().describe("Date when the survey should be published"),
+  closeOn: z.coerce.date().nullable().describe("Date when the survey should be closed"),
   surveyClosedMessage: z
     .object({
       enabled: z.boolean(),
@@ -99,7 +103,7 @@ const ZSurveyBase = z.object({
     .nullable()
     .describe("Message shown when survey is closed"),
   segmentId: z.string().nullable().describe("ID of the segment"),
-  projectOverwrites: z
+  workspaceOverwrites: z
     .object({
       brandColor: ZColor.nullish(),
       highlightBorderColor: ZColor.nullish(),
@@ -108,12 +112,10 @@ const ZSurveyBase = z.object({
       overlay: ZOverlay.nullish(),
     })
     .nullable()
-    .describe("Project specific overwrites"),
+    .describe("Workspace specific overwrites"),
   styling: z
     .object({
       brandColor: ZStylingColor.nullish(),
-      questionColor: ZStylingColor.nullish(),
-      inputColor: ZStylingColor.nullish(),
       inputBorderColor: ZStylingColor.nullish(),
       cardBackgroundColor: ZStylingColor.nullish(),
       cardBorderColor: ZStylingColor.nullish(),
@@ -121,6 +123,7 @@ const ZSurveyBase = z.object({
       isDarkModeEnabled: z.boolean().nullish(),
       roundness: z.number().nullish(),
       cardArrangement: ZCardArrangement.nullish(),
+      linkSurveyCardWidth: ZLinkSurveyCardWidthOptions.nullish(),
       background: ZSurveyStylingBackground.nullish(),
       hideProgressBar: z.boolean().nullish(),
       isLogoHidden: z.boolean().nullish(),
@@ -135,9 +138,9 @@ const ZSurveyBase = z.object({
     })
     .describe("Single use configuration"),
   isVerifyEmailEnabled: z.boolean().describe("Whether email verification is enabled"),
-  isSingleResponsePerEmailEnabled: z.boolean().describe("Whether single response per email is enabled"),
   inlineTriggers: z.array(z.any()).nullable().describe("Inline triggers configuration"),
   isBackButtonHidden: z.boolean().describe("Whether the back button is hidden"),
+  isAutoProgressingEnabled: z.boolean().describe("Whether auto-progress is enabled for eligible questions"),
   recaptcha: ZSurveyRecaptcha.describe("Google reCAPTCHA configuration"),
   metadata: ZSurveyMetadata.describe("Custom link metadata for social sharing"),
   displayPercentage: z.number().nullable().describe("The display percentage of the survey"),

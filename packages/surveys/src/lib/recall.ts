@@ -11,10 +11,19 @@ const extractId = (text: string): string | null => {
 };
 
 // Extracts the fallback value from a string containing the "fallback" pattern.
+// An index scan, not `/fallback:([^#]*)#/`: that pattern is O(N^2) on a long run of `fallback:`
+// with no `#` after it, because the engine rescans to the end from every occurrence. Identical
+// result — `[^#]*` cannot cross a `#`, so the regex ends at the first `#` after the FIRST
+// `fallback:`, and if none follows that one none follows a later one either.
+const FALLBACK_MARKER = "fallback:";
+
 const extractFallbackValue = (text: string): string => {
-  const pattern = /fallback:([^#]*)#/;
-  const match = text.match(pattern);
-  return match?.[1] ?? "";
+  const markerStart = text.indexOf(FALLBACK_MARKER);
+  if (markerStart === -1) return "";
+
+  const valueStart = markerStart + FALLBACK_MARKER.length;
+  const valueEnd = text.indexOf("#", valueStart);
+  return valueEnd === -1 ? "" : text.slice(valueStart, valueEnd);
 };
 
 // Extracts the complete recall information (ID and fallback) from a headline string.
@@ -76,7 +85,9 @@ export const parseRecallInformation = (
   variables: TResponseVariables
 ): TSurveyElement => {
   const modifiedQuestion = JSON.parse(JSON.stringify(question));
-  if (question.headline[languageCode].includes("recall:")) {
+  // Use getLocalizedValue (falls back to the `default` key) instead of indexing by languageCode
+  // directly — a code that isn't a content key (e.g. a legacy SDK language) would otherwise throw.
+  if (getLocalizedValue(question.headline, languageCode).includes("recall:")) {
     modifiedQuestion.headline[languageCode] = replaceRecallInfo(
       getLocalizedValue(modifiedQuestion.headline, languageCode),
       responseData,
@@ -86,7 +97,7 @@ export const parseRecallInformation = (
   }
   if (
     question.subheader &&
-    question.subheader[languageCode].includes("recall:") &&
+    getLocalizedValue(question.subheader, languageCode).includes("recall:") &&
     modifiedQuestion.subheader
   ) {
     modifiedQuestion.subheader[languageCode] = replaceRecallInfo(

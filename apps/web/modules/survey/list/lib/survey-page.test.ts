@@ -1,10 +1,12 @@
-import { Prisma } from "@prisma/client";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { logger } from "@formbricks/logger";
 import { DatabaseError, InvalidInputError } from "@formbricks/types/errors";
 import { buildWhereClause } from "@/modules/survey/lib/utils";
 import { decodeSurveyListPageCursor, encodeSurveyListPageCursor, getSurveyListPage } from "./survey-page";
+
+vi.mock("server-only", () => ({}));
 
 vi.mock("@/modules/survey/lib/utils", () => ({
   buildWhereClause: vi.fn(() => ({ AND: [] })),
@@ -15,6 +17,9 @@ vi.mock("@formbricks/database", () => ({
     survey: {
       findMany: vi.fn(),
     },
+    response: {
+      groupBy: vi.fn(),
+    },
   },
 }));
 
@@ -24,20 +29,19 @@ vi.mock("@formbricks/logger", () => ({
   },
 }));
 
-const environmentId = "env_123";
+const workspaceId = "ws_123";
 
 function makeSurveyRow(overrides: Record<string, unknown> = {}) {
   return {
     id: "survey_1",
     name: "Survey 1",
-    environmentId,
+    workspaceId,
     type: "link",
     status: "draft",
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-02T00:00:00.000Z"),
     creator: { name: "Alice" },
     singleUse: null,
-    _count: { responses: 3 },
     ...overrides,
   };
 }
@@ -74,6 +78,8 @@ describe("survey-page cursor helpers", () => {
 describe("getSurveyListPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(prisma.survey.findMany).mockReset();
+    vi.mocked(prisma.response.groupBy).mockReset();
   });
 
   test("uses a stable updatedAt order with a next cursor", async () => {
@@ -81,8 +87,12 @@ describe("getSurveyListPage", () => {
       makeSurveyRow({ id: "survey_2", updatedAt: new Date("2025-01-03T00:00:00.000Z") }),
       makeSurveyRow({ id: "survey_1", updatedAt: new Date("2025-01-02T00:00:00.000Z") }),
     ] as never);
+    vi.mocked(prisma.response.groupBy).mockResolvedValue([
+      { surveyId: "survey_2", finished: true, _count: { _all: 2 } },
+      { surveyId: "survey_2", finished: false, _count: { _all: 1 } },
+    ] as never);
 
-    const page = await getSurveyListPage(environmentId, {
+    const page = await getSurveyListPage(workspaceId, {
       limit: 1,
       cursor: null,
       sortBy: "updatedAt",
@@ -90,14 +100,14 @@ describe("getSurveyListPage", () => {
 
     expect(buildWhereClause).toHaveBeenCalledWith(undefined);
     expect(prisma.survey.findMany).toHaveBeenCalledWith({
-      where: { environmentId, AND: [] },
+      where: { workspaceId: workspaceId, AND: [] },
       select: expect.any(Object),
       orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
       take: 2,
     });
     expect(page.surveys).toHaveLength(1);
     expect(page.surveys[0].responseCount).toBe(3);
-    expect(page.surveys[0]).not.toHaveProperty("_count");
+    expect(page.surveys[0].completedResponseCount).toBe(2);
     expect(page.nextCursor).not.toBeNull();
     expect(decodeSurveyListPageCursor(page.nextCursor as string, "updatedAt")).toEqual({
       version: 1,
@@ -121,8 +131,11 @@ describe("getSurveyListPage", () => {
     vi.mocked(prisma.survey.findMany).mockResolvedValue([
       makeSurveyRow({ id: "survey_c", name: "Charlie" }),
     ] as never);
+    vi.mocked(prisma.response.groupBy).mockResolvedValue([
+      { surveyId: "survey_c", finished: true, _count: { _all: 3 } },
+    ] as never);
 
-    await getSurveyListPage(environmentId, {
+    await getSurveyListPage(workspaceId, {
       limit: 2,
       cursor,
       sortBy: "name",
@@ -130,7 +143,7 @@ describe("getSurveyListPage", () => {
 
     expect(prisma.survey.findMany).toHaveBeenCalledWith({
       where: {
-        environmentId,
+        workspaceId: workspaceId,
         AND: [],
         OR: [{ name: { gt: "Bravo" } }, { name: "Bravo", id: { gt: "survey_b" } }],
       },
@@ -161,8 +174,12 @@ describe("getSurveyListPage", () => {
           updatedAt: new Date("2025-01-01T00:00:00.000Z"),
         }),
       ] as never);
+    vi.mocked(prisma.response.groupBy).mockResolvedValue([
+      { surveyId: "survey_in_progress", finished: true, _count: { _all: 3 } },
+      { surveyId: "survey_other_1", finished: true, _count: { _all: 2 } },
+    ] as never);
 
-    const page = await getSurveyListPage(environmentId, {
+    const page = await getSurveyListPage(workspaceId, {
       limit: 2,
       cursor: null,
       sortBy: "relevance",
@@ -170,7 +187,7 @@ describe("getSurveyListPage", () => {
 
     expect(prisma.survey.findMany).toHaveBeenNthCalledWith(1, {
       where: {
-        environmentId,
+        workspaceId: workspaceId,
         AND: [],
         status: "inProgress",
       },
@@ -180,7 +197,7 @@ describe("getSurveyListPage", () => {
     });
     expect(prisma.survey.findMany).toHaveBeenNthCalledWith(2, {
       where: {
-        environmentId,
+        workspaceId: workspaceId,
         AND: [],
         status: { not: "inProgress" },
       },
@@ -214,8 +231,11 @@ describe("getSurveyListPage", () => {
           updatedAt: new Date("2025-01-02T00:00:00.000Z"),
         }),
       ] as never);
+    vi.mocked(prisma.response.groupBy).mockResolvedValue([
+      { surveyId: "survey_in_progress", finished: true, _count: { _all: 3 } },
+    ] as never);
 
-    const page = await getSurveyListPage(environmentId, {
+    const page = await getSurveyListPage(workspaceId, {
       limit: 1,
       cursor: null,
       sortBy: "relevance",
@@ -250,8 +270,11 @@ describe("getSurveyListPage", () => {
         updatedAt: new Date("2025-01-01T00:00:00.000Z"),
       }),
     ] as never);
+    vi.mocked(prisma.response.groupBy).mockResolvedValue([
+      { surveyId: "survey_other_2", finished: true, _count: { _all: 3 } },
+    ] as never);
 
-    const page = await getSurveyListPage(environmentId, {
+    const page = await getSurveyListPage(workspaceId, {
       limit: 2,
       cursor,
       sortBy: "relevance",
@@ -260,7 +283,7 @@ describe("getSurveyListPage", () => {
     expect(prisma.survey.findMany).toHaveBeenCalledOnce();
     expect(prisma.survey.findMany).toHaveBeenCalledWith({
       where: {
-        environmentId,
+        workspaceId: workspaceId,
         AND: [],
         status: { not: "inProgress" },
         OR: [
@@ -287,7 +310,7 @@ describe("getSurveyListPage", () => {
     vi.mocked(prisma.survey.findMany).mockRejectedValue(prismaError);
 
     await expect(
-      getSurveyListPage(environmentId, {
+      getSurveyListPage(workspaceId, {
         limit: 1,
         cursor: null,
         sortBy: "updatedAt",
@@ -301,7 +324,7 @@ describe("getSurveyListPage", () => {
     vi.mocked(prisma.survey.findMany).mockRejectedValue(invalidInputError);
 
     await expect(
-      getSurveyListPage(environmentId, {
+      getSurveyListPage(workspaceId, {
         limit: 1,
         cursor: null,
         sortBy: "updatedAt",
@@ -314,7 +337,7 @@ describe("getSurveyListPage", () => {
     vi.mocked(prisma.survey.findMany).mockRejectedValue(unexpectedError);
 
     await expect(
-      getSurveyListPage(environmentId, {
+      getSurveyListPage(workspaceId, {
         limit: 1,
         cursor: null,
         sortBy: "updatedAt",

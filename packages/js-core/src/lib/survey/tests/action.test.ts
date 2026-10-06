@@ -33,7 +33,6 @@ vi.mock("@/lib/common/logger", () => ({
 
 vi.mock("@/lib/common/utils", () => ({
   shouldDisplayBasedOnPercentage: vi.fn(),
-  handleHiddenFields: vi.fn(),
 }));
 
 vi.mock("@/lib/survey/widget", () => ({
@@ -107,6 +106,29 @@ describe("survey/action.ts", () => {
       expect(triggerSurvey).toHaveBeenCalledWith(mockSurvey, "testAction", undefined);
     });
 
+    test("emits formbricks_action_tracked for every tracked action, even without a matching survey", async () => {
+      // ENG-1846: funnel analytics wants the misses too — the emit sits on the shared trackAction
+      // path, above the survey-matching loop.
+      delete (window as { dataLayer?: unknown }).dataLayer;
+      mockConfig.get.mockReturnValue({ filteredSurveys: [] });
+
+      const result = await trackAction("testAction", "aliasedCode");
+
+      expect(result.ok).toBe(true);
+      expect(window.dataLayer).toEqual([
+        {
+          event: "formbricks_action_tracked",
+          formbricks: {
+            workspaceId: null,
+            surveyId: null,
+            responseId: null,
+            finished: null,
+            action: "aliasedCode",
+          },
+        },
+      ]);
+    });
+
     test("handles multiple matching surveys", async () => {
       const mockSurveys = [
         {
@@ -142,7 +164,7 @@ describe("survey/action.ts", () => {
   describe("trackCodeAction", () => {
     test("returns error for unknown action code", async () => {
       mockConfig.get.mockReturnValue({
-        environment: {
+        workspace: {
           data: {
             actionClasses: [{ type: "code", key: "known_code", name: "Known Action" }],
           },
@@ -163,7 +185,7 @@ describe("survey/action.ts", () => {
       const actionClass = { type: "code", key: "valid_code", name: "Valid Action" };
 
       mockConfig.get.mockReturnValue({
-        environment: {
+        workspace: {
           data: {
             actionClasses: [actionClass],
           },
@@ -171,7 +193,7 @@ describe("survey/action.ts", () => {
       });
 
       mockConfig.get.mockReturnValue({
-        environment: {
+        workspace: {
           data: {
             actionClasses: [actionClass],
           },

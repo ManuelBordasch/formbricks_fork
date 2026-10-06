@@ -1,5 +1,5 @@
-import { ContactAttributeDataType, type ContactAttributeKey, ContactAttributeType } from "@prisma/client";
 import { z } from "zod";
+import { ContactAttributeDataType, type ContactAttributeKey, ContactAttributeType } from "../src/prisma";
 
 export const ZContactAttributeKey = z.object({
   id: z.cuid2().describe("The ID of the contact attribute key"),
@@ -21,6 +21,11 @@ export const ZContactAttributeKey = z.object({
       example: false,
     })
     .describe("Whether the attribute must have unique values across contacts"),
+  // Deliberately not refined with `isSafeIdentifier`. This is the read/serialize schema for rows
+  // that already exist, and the default attribute keys are still camelCase (`userId`, `firstName`,
+  // `lastName`) until the v5.1 migration moves them to safe identifiers — see
+  // `apps/web/modules/ee/contacts/lib/attribute-key-policy.ts`. Refining here would break reads for
+  // every existing workspace. The strict rule is enforced on the write path in `apps/web` instead.
   key: z
     .string()
     .meta({
@@ -53,7 +58,7 @@ export const ZContactAttributeKey = z.object({
       example: "string",
     })
     .describe("The data type of the attribute (string, number, date)"),
-  environmentId: z.cuid2().describe("The ID of the environment this attribute belongs to"),
+  workspaceId: z.cuid2().describe("The ID of the workspace this attribute belongs to"),
 }) satisfies z.ZodType<ContactAttributeKey>;
 
 ZContactAttributeKey.meta({

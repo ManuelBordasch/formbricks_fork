@@ -1,6 +1,23 @@
 import { z } from "zod";
 import { ZStorageUrl } from "./common";
 
+export const STORAGE_ERROR_CODES = {
+  S3_CREDENTIALS_ERROR: "s3_credentials_error",
+  S3_CLIENT_ERROR: "s3_client_error",
+} as const;
+
+export const STORAGE_CONFIGURATION_ERROR_CODES = new Set<string>([
+  STORAGE_ERROR_CODES.S3_CREDENTIALS_ERROR,
+  STORAGE_ERROR_CODES.S3_CLIENT_ERROR,
+]);
+
+export type TStorageConfigurationErrorCode = (typeof STORAGE_ERROR_CODES)[keyof typeof STORAGE_ERROR_CODES];
+
+export interface TStorageApiErrorDetails {
+  fileName?: string;
+  storage_error_code?: string;
+}
+
 // Single source of truth for allowed file extensions
 const ALLOWED_FILE_EXTENSIONS_TUPLE = [
   "heic",
@@ -38,6 +55,23 @@ export type TAllowedFileExtension = z.infer<typeof ZAllowedFileExtension>;
 
 // Export the array derived from the tuple
 export const ALLOWED_FILE_EXTENSIONS: TAllowedFileExtension[] = [...ALLOWED_FILE_EXTENSIONS_TUPLE];
+
+/**
+ * Image extensions accepted for survey media (question/element/choice `imageUrl`) and offered by the
+ * editor's image pickers. Single source of truth so URL validation, uploads, and the picker can't
+ * drift apart.
+ *
+ * Kept a strict subset of the upload allowlist — `satisfies` enforces this at compile time — so any
+ * URL that passes image validation is always something the user can actually upload to Formbricks.
+ * `svg` is deliberately excluded: we don't sanitize SVGs, so allowing them would be an XSS vector.
+ */
+export const IMAGE_FILE_EXTENSIONS = [
+  "png",
+  "jpeg",
+  "jpg",
+  "webp",
+  "heic",
+] as const satisfies readonly TAllowedFileExtension[];
 
 export const mimeTypes: Record<TAllowedFileExtension, string> = {
   heic: "image/heic",
@@ -89,7 +123,6 @@ export const ZDownloadFileRequest = z.object({
         error: "File name must have an extension",
       }
     ),
-  environmentId: z.cuid2(),
   accessType: ZAccessType,
 });
 
@@ -98,6 +131,7 @@ export const ZDeleteFileRequest = ZDownloadFileRequest;
 export const ZUploadFileConfig = z.object({
   allowedFileExtensions: z.array(z.string()).optional(),
   surveyId: z.string().optional(),
+  elementId: z.string().optional(),
 });
 
 export type TUploadFileConfig = z.infer<typeof ZUploadFileConfig>;
@@ -108,7 +142,15 @@ export const ZUploadPrivateFileRequest = z
     fileType: z.string().trim().min(1),
     allowedFileExtensions: z.array(ZAllowedFileExtension).optional(),
     surveyId: z.cuid2(),
-    environmentId: z.cuid2(),
+    elementId: z
+      .string()
+      .trim()
+      .min(1)
+      .regex(
+        /^[a-zA-Z0-9_-]+$/,
+        "Element id must contain only alphanumeric characters, hyphens, or underscores"
+      ),
+    workspaceId: z.cuid2(),
   })
   .superRefine((data, ctx) => {
     refineFileUploadInput({
@@ -145,7 +187,7 @@ export const ZUploadPublicFileRequest = z
   .object({
     fileName: z.string().trim().min(1),
     fileType: z.string().trim().min(1),
-    environmentId: z.cuid2(),
+    workspaceId: z.cuid2(),
     allowedFileExtensions: z.array(ZAllowedFileExtension).optional(),
   })
   .superRefine((data, ctx) => {

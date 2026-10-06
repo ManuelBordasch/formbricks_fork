@@ -1,10 +1,13 @@
 import { type Mock, type MockInstance, afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { Config } from "@/lib/common/config";
+import { onFormbricksEvent, resetFormbricksEventSubscribers } from "@/lib/common/events";
 import { Logger } from "@/lib/common/logger";
+import type * as CommonUtils from "@/lib/common/utils";
 import { filterSurveys, getLanguageCode, shouldDisplayBasedOnPercentage } from "@/lib/common/utils";
+import { EmbeddedDataStore } from "@/lib/survey/embedded-data";
 import { mockSurvey } from "@/lib/survey/tests/__mocks__/widget.mock";
 import * as widget from "@/lib/survey/widget";
-import { type TEnvironmentStateSurvey } from "@/types/config";
+import { type TWorkspaceStateSurvey } from "@/types/config";
 
 vi.mock("@/lib/common/config", () => ({
   Config: {
@@ -34,18 +37,23 @@ vi.mock("@/lib/common/timeout-stack", () => ({
   },
 }));
 
-vi.mock("@/lib/common/utils", () => ({
-  filterSurveys: vi.fn(),
-  getLanguageCode: vi.fn(),
-  getStyling: vi.fn(),
-  shouldDisplayBasedOnPercentage: vi.fn(),
-  wrapThrowsAsync: vi.fn(),
-  handleHiddenFields: vi.fn(),
-}));
+vi.mock("@/lib/common/utils", async (importOriginal) => {
+  const actual = await importOriginal<typeof CommonUtils>();
+  return {
+    ...actual,
+    filterSurveys: vi.fn(),
+    getLanguageCode: vi.fn(),
+    getStyling: vi.fn(),
+    shouldDisplayBasedOnPercentage: vi.fn(),
+    wrapThrowsAsync: vi.fn(),
+  };
+});
 
 const mockUpdateQueue = {
   hasPendingWork: vi.fn().mockReturnValue(false),
   waitForPendingWork: vi.fn().mockResolvedValue(true),
+  updateUserId: vi.fn(),
+  processUpdates: vi.fn().mockResolvedValue(undefined),
 };
 
 vi.mock("@/lib/user/update-queue", () => ({
@@ -64,10 +72,23 @@ describe("widget-file", () => {
     configure: vi.fn(),
   };
 
+  const createMockFormbricksSurveys = (): NonNullable<Window["formbricksSurveys"]> => ({
+    renderSurvey: vi.fn(),
+    setNonce: vi.fn(),
+  });
+
+  const getFormbricksSurveys = (): NonNullable<Window["formbricksSurveys"]> => {
+    const formbricksSurveys = window.formbricksSurveys;
+    if (!formbricksSurveys) {
+      throw new Error("window.formbricksSurveys is not set");
+    }
+
+    return formbricksSurveys;
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
     document.body.innerHTML = "";
-    // @ts-expect-error -- cleaning up mock
     delete window.formbricksSurveys;
 
     getInstanceConfigMock = vi.spyOn(Config, "getInstance");
@@ -78,8 +99,13 @@ describe("widget-file", () => {
     vi.restoreAllMocks();
   });
 
-  test("setIsSurveyRunning toggles internal state (covered by usage in other tests)", () => {
-    widget.setIsSurveyRunning(true);
+  test("setIsSurveyRunning toggles internal state without throwing", () => {
+    expect(() => {
+      widget.setIsSurveyRunning(true);
+    }).not.toThrow();
+    expect(() => {
+      widget.setIsSurveyRunning(false);
+    }).not.toThrow();
   });
 
   test("triggerSurvey skips if shouldDisplayBasedOnPercentage returns false", async () => {
@@ -89,11 +115,12 @@ describe("widget-file", () => {
     await widget.triggerSurvey(mockSurvey);
 
     expect(mockLogger.debug).toHaveBeenCalledWith(
-      `Survey display of "${mockSurvey.name}" skipped based on displayPercentage.`
+      `Survey display of "${mockSurvey.id}" skipped based on displayPercentage.`
     );
   });
 
-  test("triggerSurvey calls renderWidget if displayPercentage is not an issue", async () => {
+  test("triggerSurvey short-circuits via renderWidget when a survey is already running", async () => {
+    widget.setIsSurveyRunning(true);
     (shouldDisplayBasedOnPercentage as Mock).mockReturnValueOnce(true);
 
     await widget.triggerSurvey(mockSurvey);
@@ -105,10 +132,10 @@ describe("widget-file", () => {
     const mockConfigValue = {
       get: vi.fn().mockReturnValue({
         appUrl: "https://fake.app",
-        environmentId: "env_123",
-        environment: {
+        workspaceId: "env_123",
+        workspace: {
           data: {
-            project: {
+            settings: {
               clickOutsideClose: true,
               overlay: "none",
               placement: "bottomRight",
@@ -135,26 +162,23 @@ describe("widget-file", () => {
     (filterSurveys as Mock).mockReturnValue([]);
     widget.setIsSurveyRunning(false);
 
-    // @ts-expect-error -- mock window.formbricksSurveys
-    window.formbricksSurveys = {
-      renderSurvey: vi.fn(),
-    };
+    window.formbricksSurveys = createMockFormbricksSurveys();
 
     vi.useFakeTimers();
 
     await widget.renderWidget(mockSurvey);
 
     expect(mockLogger.debug).toHaveBeenCalledWith(
-      `Delaying survey "${mockSurvey.name}" by ${mockSurvey.delay.toString()} seconds.`
+      `Delaying survey "${mockSurvey.id}" by ${mockSurvey.delay.toString()} seconds.`
     );
 
     vi.advanceTimersByTime(mockSurvey.delay * 1000);
 
-    expect(window.formbricksSurveys.renderSurvey).toHaveBeenCalledWith(
+    expect(getFormbricksSurveys().renderSurvey).toHaveBeenCalledWith(
       expect.objectContaining({
         survey: mockSurvey,
         appUrl: "https://fake.app",
-        environmentId: "env_123",
+        workspaceId: "env_123",
         contactId: "contact_abc",
       })
     );
@@ -171,10 +195,10 @@ describe("widget-file", () => {
     const mockConfigValue = {
       get: vi.fn().mockReturnValue({
         appUrl: "https://fake.app",
-        environmentId: "env_123",
-        environment: {
+        workspaceId: "env_123",
+        workspace: {
           data: {
-            project: {
+            settings: {
               clickOutsideClose: true,
               overlay: "none",
               placement: "bottomRight",
@@ -206,10 +230,10 @@ describe("widget-file", () => {
     widget.setIsSurveyRunning(false);
     (getLanguageCode as Mock).mockReturnValueOnce(undefined); // means "not available"
 
-    await widget.renderWidget(mockSurveyNoDelay as unknown as TEnvironmentStateSurvey);
+    await widget.renderWidget(mockSurveyNoDelay as unknown as TWorkspaceStateSurvey);
 
     expect(mockLogger.debug).toHaveBeenCalledWith(
-      `Survey "${mockSurvey.name}" is not available in specified language.`
+      `Survey "${mockSurvey.id}" is not available in specified language.`
     );
   });
 
@@ -217,10 +241,10 @@ describe("widget-file", () => {
     const mockConfigValue = {
       get: vi.fn().mockReturnValue({
         appUrl: "https://fake.app",
-        environmentId: "env_123",
-        environment: {
+        workspaceId: "env_123",
+        workspace: {
           data: {
-            project: {
+            settings: {
               clickOutsideClose: true,
               overlay: "none",
               placement: "bottomRight",
@@ -257,6 +281,40 @@ describe("widget-file", () => {
     expect(el).not.toBeNull();
   });
 
+  test("addLiveRegionContainer creates an accessible visually hidden status region", () => {
+    widget.addLiveRegionContainer();
+
+    expect(document.createElement).toHaveBeenCalledWith("div");
+    expect(document.body.appendChild).toHaveBeenCalledTimes(1);
+
+    const liveRegion = vi.mocked(document.body.appendChild).mock.calls[0][0] as HTMLElement;
+    expect(liveRegion.id).toBe("formbricks-live-region");
+    expect(liveRegion.setAttribute).toHaveBeenCalledWith("role", "status");
+    expect(liveRegion.setAttribute).toHaveBeenCalledWith("aria-live", "polite");
+    expect(liveRegion.setAttribute).toHaveBeenCalledWith("aria-atomic", "true");
+    expect(liveRegion.style.cssText).toContain("position:absolute");
+  });
+
+  test("addLiveRegionContainer reuses an existing region", () => {
+    vi.mocked(document.getElementById).mockReturnValueOnce({} as HTMLElement);
+
+    widget.addLiveRegionContainer();
+
+    expect(document.createElement).not.toHaveBeenCalled();
+    expect(document.body.appendChild).not.toHaveBeenCalled();
+  });
+
+  test("addLiveRegionContainer is safe during server-side rendering", () => {
+    const browserDocument = globalThis.document;
+    vi.stubGlobal("document", undefined);
+
+    try {
+      expect(() => widget.addLiveRegionContainer()).not.toThrow();
+    } finally {
+      vi.stubGlobal("document", browserDocument);
+    }
+  });
+
   test("removeWidgetContainer removes #formbricks-container if it exists", () => {
     document.body.innerHTML = `<div id="formbricks-container"></div>`;
     widget.removeWidgetContainer();
@@ -270,10 +328,10 @@ describe("widget-file", () => {
     const mockConfigValue = {
       get: vi.fn().mockReturnValue({
         appUrl: "https://fake.app",
-        environmentId: "env_123",
-        environment: {
+        workspaceId: "env_123",
+        workspace: {
           data: {
-            project: {
+            settings: {
               clickOutsideClose: true,
               overlay: "none",
               placement: "bottomRight",
@@ -298,29 +356,146 @@ describe("widget-file", () => {
     getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
     widget.setIsSurveyRunning(false);
 
-    // @ts-expect-error -- mock window.formbricksSurveys
-    window.formbricksSurveys = {
-      renderSurvey: vi.fn(),
-    };
+    window.formbricksSurveys = createMockFormbricksSurveys();
 
     vi.useFakeTimers();
 
     await widget.renderWidget({
       ...mockSurvey,
       delay: 0,
-    } as unknown as TEnvironmentStateSurvey);
+    });
 
     expect(mockUpdateQueue.hasPendingWork).toHaveBeenCalled();
     expect(mockUpdateQueue.waitForPendingWork).toHaveBeenCalled();
 
     vi.advanceTimersByTime(0);
 
-    expect(window.formbricksSurveys.renderSurvey).toHaveBeenCalledWith(
+    expect(getFormbricksSurveys().renderSurvey).toHaveBeenCalledWith(
       expect.objectContaining({
         contactId: "contact_abc",
       })
     );
 
+    vi.useRealTimers();
+  });
+
+  test("forwards the hidden-field bag to the renderer verbatim, filtering nothing itself", async () => {
+    // Pins ENG-2472: the SDK is a dumb pipe. `handleHiddenFields` used to filter this bag here, which
+    // meant every SDK shipped its own copy of the rules; the ingest contract now owns them in the
+    // renderer and re-runs on the server. Without this, someone re-adding a filter in the SDK — or
+    // deleting the pass-through — breaks nothing any test can see.
+    mockUpdateQueue.hasPendingWork.mockReturnValue(false);
+
+    const mockConfigValue = {
+      get: vi.fn().mockReturnValue({
+        appUrl: "https://fake.app",
+        workspaceId: "env_123",
+        workspace: {
+          data: {
+            settings: {
+              clickOutsideClose: true,
+              overlay: "none",
+              placement: "bottomRight",
+              inAppSurveyBranding: true,
+            },
+          },
+        },
+        user: {
+          data: {
+            userId: "user_abc",
+            contactId: "contact_abc",
+            displays: [],
+            responses: [],
+            lastDisplayAt: null,
+            language: "en",
+          },
+        },
+      }),
+      update: vi.fn(),
+    };
+
+    getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
+    widget.setIsSurveyRunning(false);
+    window.formbricksSurveys = createMockFormbricksSurveys();
+    vi.useFakeTimers();
+
+    // A key the survey declares, one it does not, and one the old filter would have stripped.
+    const hiddenFields = { plan: "gold", rogue: "injected", "": "blank" };
+
+    // Through `triggerSurvey`, not `renderWidget`: the deleted filter sat on that hop, so entering
+    // lower down would leave the regression this test exists for invisible.
+    await widget.triggerSurvey({ ...mockSurvey, delay: 0, displayPercentage: null }, "testAction", {
+      hiddenFields,
+    });
+
+    vi.advanceTimersByTime(0);
+
+    expect(getFormbricksSurveys().renderSurvey).toHaveBeenCalledWith(
+      expect.objectContaining({ hiddenFieldsRecord: hiddenFields })
+    );
+
+    vi.useRealTimers();
+  });
+
+  test("merges the Embedded Data bag under the per-trigger hidden fields, snapshotted at display", async () => {
+    // ENG-1844: the ambient bag rides along on every display, an explicit `track({ hiddenFields })`
+    // value wins a shared key, and the record is frozen at render — a later `setEmbeddedData` must
+    // not reach a survey already on screen.
+    mockUpdateQueue.hasPendingWork.mockReturnValue(false);
+
+    const mockConfigValue = {
+      get: vi.fn().mockReturnValue({
+        appUrl: "https://fake.app",
+        workspaceId: "env_123",
+        workspace: {
+          data: {
+            settings: {
+              clickOutsideClose: true,
+              overlay: "none",
+              placement: "bottomRight",
+              inAppSurveyBranding: true,
+            },
+          },
+        },
+        user: {
+          data: {
+            userId: "user_abc",
+            contactId: "contact_abc",
+            displays: [],
+            responses: [],
+            lastDisplayAt: null,
+            language: "en",
+          },
+        },
+      }),
+      update: vi.fn(),
+    };
+
+    getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
+    widget.setIsSurveyRunning(false);
+    window.formbricksSurveys = createMockFormbricksSurveys();
+    vi.useFakeTimers();
+
+    const store = EmbeddedDataStore.getInstance();
+    store.clearEmbeddedData();
+    store.setEmbeddedData({ pageType: "product", plan: "from-bag" });
+
+    await widget.triggerSurvey({ ...mockSurvey, delay: 0, displayPercentage: null }, "testAction", {
+      hiddenFields: { plan: "from-track" },
+    });
+
+    vi.advanceTimersByTime(0);
+
+    // A write after render: must not appear on the record already handed to the renderer.
+    store.setEmbeddedData({ pageType: "changed-later" });
+
+    expect(getFormbricksSurveys().renderSurvey).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hiddenFieldsRecord: { pageType: "product", plan: "from-track" },
+      })
+    );
+
+    store.clearEmbeddedData();
     vi.useRealTimers();
   });
 
@@ -330,10 +505,10 @@ describe("widget-file", () => {
     const mockConfigValue = {
       get: vi.fn().mockReturnValue({
         appUrl: "https://fake.app",
-        environmentId: "env_123",
-        environment: {
+        workspaceId: "env_123",
+        workspace: {
           data: {
-            project: {
+            settings: {
               clickOutsideClose: true,
               overlay: "none",
               placement: "bottomRight",
@@ -358,23 +533,20 @@ describe("widget-file", () => {
     getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
     widget.setIsSurveyRunning(false);
 
-    // @ts-expect-error -- mock window.formbricksSurveys
-    window.formbricksSurveys = {
-      renderSurvey: vi.fn(),
-    };
+    window.formbricksSurveys = createMockFormbricksSurveys();
 
     vi.useFakeTimers();
 
     await widget.renderWidget({
       ...mockSurvey,
       delay: 0,
-    } as unknown as TEnvironmentStateSurvey);
+    });
 
     expect(mockUpdateQueue.hasPendingWork).toHaveBeenCalled();
     expect(mockUpdateQueue.waitForPendingWork).not.toHaveBeenCalled();
 
     vi.advanceTimersByTime(0);
-    expect(window.formbricksSurveys.renderSurvey).toHaveBeenCalled();
+    expect(getFormbricksSurveys().renderSurvey).toHaveBeenCalled();
 
     vi.useRealTimers();
   });
@@ -386,10 +558,10 @@ describe("widget-file", () => {
         callCount++;
         return {
           appUrl: "https://fake.app",
-          environmentId: "env_123",
-          environment: {
+          workspaceId: "env_123",
+          workspace: {
             data: {
-              project: {
+              settings: {
                 clickOutsideClose: true,
                 overlay: "none",
                 placement: "bottomRight",
@@ -418,22 +590,19 @@ describe("widget-file", () => {
     mockUpdateQueue.waitForPendingWork.mockResolvedValue(true);
     widget.setIsSurveyRunning(false);
 
-    // @ts-expect-error -- mock window.formbricksSurveys
-    window.formbricksSurveys = {
-      renderSurvey: vi.fn(),
-    };
+    window.formbricksSurveys = createMockFormbricksSurveys();
 
     vi.useFakeTimers();
 
     await widget.renderWidget({
       ...mockSurvey,
       delay: 0,
-    } as unknown as TEnvironmentStateSurvey);
+    });
 
     vi.advanceTimersByTime(0);
 
     // The contactId passed to renderSurvey should be read after the wait
-    expect(window.formbricksSurveys.renderSurvey).toHaveBeenCalledWith(
+    expect(getFormbricksSurveys().renderSurvey).toHaveBeenCalledWith(
       expect.objectContaining({
         contactId: "contact_after_identification",
       })
@@ -448,32 +617,29 @@ describe("widget-file", () => {
 
     widget.setIsSurveyRunning(false);
 
-    // @ts-expect-error -- mock window.formbricksSurveys
-    window.formbricksSurveys = {
-      renderSurvey: vi.fn(),
-    };
+    window.formbricksSurveys = createMockFormbricksSurveys();
 
     await widget.renderWidget({
       ...mockSurvey,
       delay: 0,
       segment: { id: "seg_1", filters: [{ type: "attribute", value: "plan" }] },
-    } as unknown as TEnvironmentStateSurvey);
+    } as unknown as TWorkspaceStateSurvey);
 
     expect(mockUpdateQueue.waitForPendingWork).toHaveBeenCalled();
     expect(mockLogger.debug).toHaveBeenCalledWith(
       "User identification failed. Skipping survey with segment filters."
     );
-    expect(window.formbricksSurveys.renderSurvey).not.toHaveBeenCalled();
+    expect(getFormbricksSurveys().renderSurvey).not.toHaveBeenCalled();
   });
 
   describe("loadFormbricksSurveysExternally and waitForSurveysGlobal", () => {
     const scriptLoadMockConfig = {
       get: vi.fn().mockReturnValue({
         appUrl: "https://fake.app",
-        environmentId: "env_123",
-        environment: {
+        workspaceId: "env_123",
+        workspace: {
           data: {
-            project: {
+            settings: {
               clickOutsideClose: true,
               overlay: "none",
               placement: "bottomRight",
@@ -497,7 +663,6 @@ describe("widget-file", () => {
 
     // Helper to get the script element passed to document.head.appendChild
     const getAppendedScript = (): Record<string, unknown> => {
-      // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing mock for test assertions
       const appendChildMock = vi.mocked(document.head.appendChild);
       for (const call of appendChildMock.mock.calls) {
         const el = call[0] as unknown as Record<string, unknown>;
@@ -519,13 +684,12 @@ describe("widget-file", () => {
       getInstanceConfigMock.mockReturnValue(scriptLoadMockConfig as unknown as Config);
       widget.setIsSurveyRunning(false);
 
-      // eslint-disable-next-line @typescript-eslint/no-empty-function -- suppress console.error in test
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
       const renderPromise = widget.renderWidget({
         ...mockSurvey,
         delay: 0,
-      } as unknown as TEnvironmentStateSurvey);
+      });
 
       const scriptEl = getAppendedScript();
 
@@ -546,14 +710,13 @@ describe("widget-file", () => {
       getInstanceConfigMock.mockReturnValue(scriptLoadMockConfig as unknown as Config);
       widget.setIsSurveyRunning(false);
 
-      // eslint-disable-next-line @typescript-eslint/no-empty-function -- suppress console.error in test
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       vi.useFakeTimers();
 
       const renderPromise = widget.renderWidget({
         ...mockSurvey,
         delay: 0,
-      } as unknown as TEnvironmentStateSurvey);
+      });
 
       const scriptEl = getAppendedScript();
 
@@ -586,7 +749,7 @@ describe("widget-file", () => {
       const renderPromise = widget.renderWidget({
         ...mockSurvey,
         delay: 0,
-      } as unknown as TEnvironmentStateSurvey);
+      });
 
       const scriptEl = getAppendedScript();
 
@@ -594,8 +757,7 @@ describe("widget-file", () => {
       (scriptEl.onload as () => void)();
 
       // Set the global after script "loads" — simulates browser finishing execution
-      // @ts-expect-error -- mock window.formbricksSurveys
-      window.formbricksSurveys = { renderSurvey: vi.fn(), setNonce: vi.fn() };
+      window.formbricksSurveys = createMockFormbricksSurveys();
 
       // Advance one polling interval for waitForSurveysGlobal to find it
       await vi.advanceTimersByTimeAsync(200);
@@ -605,11 +767,11 @@ describe("widget-file", () => {
       // Run remaining timers for survey.delay setTimeout
       vi.runAllTimers();
 
-      expect(window.formbricksSurveys.setNonce).toHaveBeenCalledWith("test-nonce-123");
-      expect(window.formbricksSurveys.renderSurvey).toHaveBeenCalledWith(
+      expect(getFormbricksSurveys().setNonce).toHaveBeenCalledWith("test-nonce-123");
+      expect(getFormbricksSurveys().renderSurvey).toHaveBeenCalledWith(
         expect.objectContaining({
           appUrl: "https://fake.app",
-          environmentId: "env_123",
+          workspaceId: "env_123",
           contactId: "contact_abc",
         })
       );
@@ -625,20 +787,18 @@ describe("widget-file", () => {
       // After the previous successful test, surveysLoadPromise holds a resolved promise.
       // Calling renderWidget again (without formbricksSurveys on window, but with cached promise)
       // should reuse the cached promise rather than creating a new script element.
-      // @ts-expect-error -- cleaning up mock to force dedup path
       delete window.formbricksSurveys;
 
       const appendChildSpy = vi.spyOn(document.head, "appendChild");
 
-      // @ts-expect-error -- mock window.formbricksSurveys
-      window.formbricksSurveys = { renderSurvey: vi.fn(), setNonce: vi.fn() };
+      window.formbricksSurveys = createMockFormbricksSurveys();
 
       vi.useFakeTimers();
 
       await widget.renderWidget({
         ...mockSurvey,
         delay: 0,
-      } as unknown as TEnvironmentStateSurvey);
+      });
 
       vi.advanceTimersByTime(0);
 
@@ -649,28 +809,28 @@ describe("widget-file", () => {
       });
       expect(scriptAppendCalls.length).toBe(0);
 
-      expect(window.formbricksSurveys.renderSurvey).toHaveBeenCalled();
+      expect(getFormbricksSurveys().renderSurvey).toHaveBeenCalled();
 
       vi.useRealTimers();
     });
   });
 
-  test("preloadSurveysScript adds a preload link and deduplicates subsequent calls", () => {
+  test("prefetchSurveysScript adds a prefetch link and deduplicates subsequent calls", () => {
     const createElementSpy = vi.spyOn(document, "createElement");
     const appendChildSpy = vi.spyOn(document.head, "appendChild");
 
-    widget.preloadSurveysScript("https://fake.app");
+    widget.prefetchSurveysScript("https://fake.app");
 
     expect(createElementSpy).toHaveBeenCalledWith("link");
     expect(appendChildSpy).toHaveBeenCalledTimes(1);
 
     const linkEl = createElementSpy.mock.results[0].value as Record<string, string>;
-    expect(linkEl.rel).toBe("preload");
-    expect(linkEl.as).toBe("script");
+    expect(linkEl.rel).toBe("prefetch");
+    expect(linkEl.as).toBeUndefined();
     expect(linkEl.href).toBe("https://fake.app/js/surveys.umd.cjs");
 
     // Second call should be a no-op (deduplication)
-    widget.preloadSurveysScript("https://fake.app");
+    widget.prefetchSurveysScript("https://fake.app");
     expect(appendChildSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -681,10 +841,10 @@ describe("widget-file", () => {
     const mockConfigValue = {
       get: vi.fn().mockReturnValue({
         appUrl: "https://fake.app",
-        environmentId: "env_123",
-        environment: {
+        workspaceId: "env_123",
+        workspace: {
           data: {
-            project: {
+            settings: {
               clickOutsideClose: true,
               overlay: "none",
               placement: "bottomRight",
@@ -709,10 +869,7 @@ describe("widget-file", () => {
     getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
     widget.setIsSurveyRunning(false);
 
-    // @ts-expect-error -- mock window.formbricksSurveys
-    window.formbricksSurveys = {
-      renderSurvey: vi.fn(),
-    };
+    window.formbricksSurveys = createMockFormbricksSurveys();
 
     vi.useFakeTimers();
 
@@ -720,15 +877,394 @@ describe("widget-file", () => {
       ...mockSurvey,
       delay: 0,
       segment: undefined,
-    } as unknown as TEnvironmentStateSurvey);
+    });
 
     expect(mockLogger.debug).toHaveBeenCalledWith(
       "User identification failed but survey has no segment filters. Proceeding."
     );
 
     vi.advanceTimersByTime(0);
-    expect(window.formbricksSurveys.renderSurvey).toHaveBeenCalled();
+    expect(getFormbricksSurveys().renderSurvey).toHaveBeenCalled();
 
     vi.useRealTimers();
+  });
+
+  describe("lifecycle events to the host page (ENG-1846)", () => {
+    const renderAndGetEventCallbacks = async (): Promise<{
+      onDisplayCreated: () => void;
+      onResponseCreated: (responseId?: string) => void;
+      onFinished: (responseId?: string) => void;
+    }> => {
+      const mockConfigValue = {
+        get: vi.fn().mockReturnValue({
+          appUrl: "https://fake.app",
+          workspaceId: "env_123",
+          workspace: {
+            data: {
+              settings: { clickOutsideClose: true, overlay: "none", placement: "bottomRight" },
+            },
+          },
+          user: {
+            data: {
+              userId: null,
+              contactId: "contact_abc",
+              displays: [],
+              responses: [],
+              lastDisplayAt: null,
+            },
+          },
+        }),
+        update: vi.fn(),
+      };
+
+      getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
+      (filterSurveys as Mock).mockReturnValue([]);
+      widget.setIsSurveyRunning(false);
+      window.formbricksSurveys = createMockFormbricksSurveys();
+
+      vi.useFakeTimers();
+      await widget.renderWidget({ ...mockSurvey, delay: 0 });
+      vi.advanceTimersByTime(0);
+      vi.useRealTimers();
+
+      return (getFormbricksSurveys().renderSurvey as Mock).mock.calls[0][0] as {
+        onDisplayCreated: () => void;
+        onResponseCreated: (responseId?: string) => void;
+        onFinished: (responseId?: string) => void;
+      };
+    };
+
+    test("survey_shown on render; response_submitted with the acked responseId on create and finish", async () => {
+      delete (window as { dataLayer?: unknown }).dataLayer;
+      const callbacks = await renderAndGetEventCallbacks();
+
+      callbacks.onDisplayCreated();
+      callbacks.onResponseCreated("resp_123");
+      callbacks.onFinished("resp_123");
+
+      const base = { workspaceId: null, surveyId: null, responseId: null, finished: null, action: null };
+      expect(window.dataLayer).toEqual([
+        { event: "formbricks_survey_shown", formbricks: { ...base, surveyId: mockSurvey.id } },
+        {
+          event: "formbricks_response_submitted",
+          formbricks: { ...base, surveyId: mockSurvey.id, responseId: "resp_123", finished: false },
+        },
+        {
+          event: "formbricks_response_submitted",
+          formbricks: { ...base, surveyId: mockSurvey.id, responseId: "resp_123", finished: true },
+        },
+      ]);
+    });
+  });
+
+  describe("survey lifecycle via formbricks.on (ENG-1814)", () => {
+    // The subscription surface over the same emits as the dataLayer transport: which renderer
+    // callback maps to which event, the survey id it names, and the closed-once guard.
+    const renderAndGetLifecycleCallbacks = async (): Promise<{
+      onDisplayCreated: () => void;
+      onResponseCreated: (responseId?: string) => void;
+      onClose: () => void;
+    }> => {
+      const mockConfigValue = {
+        get: vi.fn().mockReturnValue({
+          appUrl: "https://fake.app",
+          workspaceId: "env_123",
+          workspace: {
+            data: {
+              settings: { clickOutsideClose: true, overlay: "none", placement: "bottomRight" },
+            },
+          },
+          user: {
+            data: {
+              userId: null,
+              contactId: "contact_abc",
+              displays: [],
+              responses: [],
+              lastDisplayAt: null,
+            },
+          },
+        }),
+        update: vi.fn(),
+      };
+
+      getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
+      (filterSurveys as Mock).mockReturnValue([]);
+      widget.setIsSurveyRunning(false);
+      window.formbricksSurveys = createMockFormbricksSurveys();
+
+      vi.useFakeTimers();
+      await widget.renderWidget({ ...mockSurvey, delay: 0 });
+      vi.advanceTimersByTime(0);
+      vi.useRealTimers();
+
+      return (getFormbricksSurveys().renderSurvey as Mock).mock.calls[0][0] as {
+        onDisplayCreated: () => void;
+        onResponseCreated: (responseId?: string) => void;
+        onClose: () => void;
+      };
+    };
+
+    beforeEach(() => {
+      // Drop any survey an earlier test left on screen, then start from a subscriber-free registry.
+      widget.closeSurvey();
+      resetFormbricksEventSubscribers();
+      delete (window as { dataLayer?: unknown }).dataLayer;
+    });
+
+    test("notifies formbricks_survey_shown subscribers when the survey renders, not when the display acks", async () => {
+      const handler = vi.fn();
+      onFormbricksEvent("formbricks_survey_shown", handler);
+
+      const callbacks = await renderAndGetLifecycleCallbacks();
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler).toHaveBeenCalledWith({ surveyId: mockSurvey.id });
+
+      // The display ack does its own bookkeeping; it must not report a second appearance.
+      callbacks.onDisplayCreated();
+      expect(handler).toHaveBeenCalledTimes(1);
+    });
+
+    test("notifies formbricks_response_submitted subscribers with the server-acked responseId", async () => {
+      const handler = vi.fn();
+      onFormbricksEvent("formbricks_response_submitted", handler);
+
+      const callbacks = await renderAndGetLifecycleCallbacks();
+      callbacks.onResponseCreated("resp_123");
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler).toHaveBeenCalledWith({
+        surveyId: mockSurvey.id,
+        responseId: "resp_123",
+        finished: false,
+      });
+    });
+
+    test("emits formbricks_survey_closed once — to subscribers AND the dataLayer — and not again on a repeated close", async () => {
+      const handler = vi.fn();
+      onFormbricksEvent("formbricks_survey_closed", handler);
+
+      const callbacks = await renderAndGetLifecycleCallbacks();
+      callbacks.onClose();
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler).toHaveBeenCalledWith({ surveyId: mockSurvey.id });
+      // The same moment reaches GTM through the dataLayer transport, paired with the render's shown.
+      const base = { workspaceId: null, surveyId: null, responseId: null, finished: null, action: null };
+      expect(window.dataLayer).toEqual([
+        { event: "formbricks_survey_shown", formbricks: { ...base, surveyId: mockSurvey.id } },
+        { event: "formbricks_survey_closed", formbricks: { ...base, surveyId: mockSurvey.id } },
+      ]);
+
+      widget.closeSurvey();
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(window.dataLayer).toHaveLength(2);
+    });
+
+    test("each close names its own survey when a second one renders over the first", async () => {
+      const handler = vi.fn();
+      onFormbricksEvent("formbricks_survey_closed", handler);
+
+      const surveyA = await renderAndGetLifecycleCallbacks();
+
+      // What no-code-action.ts does when the SPA navigates away from a still-open pageView survey: a
+      // fired timeout entry is never pruned, so the guard is released while A is still on screen and
+      // the renderer appends a second container rather than replacing A's.
+      widget.setIsSurveyRunning(false);
+      vi.useFakeTimers();
+      await widget.renderWidget({
+        ...mockSurvey,
+        id: "survey_B",
+        delay: 0,
+      });
+      vi.advanceTimersByTime(0);
+      vi.useRealTimers();
+
+      const renderCalls = (getFormbricksSurveys().renderSurvey as Mock).mock.calls;
+      const surveyB = renderCalls[renderCalls.length - 1][0] as { onClose: () => void };
+
+      // Each close reports only its own survey: A's must not carry B's id, nor close B on its behalf.
+      surveyA.onClose();
+      expect(handler.mock.calls).toEqual([[{ surveyId: mockSurvey.id }]]);
+
+      surveyB.onClose();
+      expect(handler.mock.calls).toEqual([[{ surveyId: mockSurvey.id }], [{ surveyId: "survey_B" }]]);
+    });
+
+    test("a close landing after logout already tore the survey down still emits once", async () => {
+      const handler = vi.fn();
+      onFormbricksEvent("formbricks_survey_closed", handler);
+
+      const callbacks = await renderAndGetLifecycleCallbacks();
+
+      // tearDown on logout closes whatever is on screen without knowing which survey that is; the
+      // renderer's own onClose still fires as the modal unmounts.
+      widget.closeSurvey();
+      callbacks.onClose();
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler).toHaveBeenCalledWith({ surveyId: mockSurvey.id });
+    });
+
+    test("emits nothing when closeSurvey runs with no survey on screen", () => {
+      const handler = vi.fn();
+      onFormbricksEvent("formbricks_survey_closed", handler);
+
+      widget.closeSurvey();
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(window.dataLayer).toBeUndefined();
+    });
+
+    test("renders and closes normally when no host has subscribed", async () => {
+      const callbacks = await renderAndGetLifecycleCallbacks();
+
+      expect(() => {
+        callbacks.onDisplayCreated();
+        callbacks.onResponseCreated("resp_123");
+        callbacks.onClose();
+      }).not.toThrow();
+    });
+
+    test("a throwing host handler does not break the survey it is reporting on", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      onFormbricksEvent("formbricks_survey_shown", () => {
+        throw new Error("host blew up");
+      });
+
+      const callbacks = await renderAndGetLifecycleCallbacks();
+
+      // The throw now lands while the widget is rendering, so the survey still has to reach the screen.
+      expect(getFormbricksSurveys().renderSurvey).toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalled();
+
+      expect(() => {
+        callbacks.onDisplayCreated();
+        callbacks.onClose();
+      }).not.toThrow();
+    });
+  });
+
+  describe("post-interaction segment refresh", () => {
+    // Renders the widget and returns the interaction callbacks handed to renderSurvey, so each test can
+    // trigger onDisplayCreated / onResponseCreated / onFinished directly and assert whether a refresh
+    // (updateUserId + processUpdates through the UpdateQueue) was enqueued.
+    const renderAndGetCallbacks = async ({
+      userId,
+      interactionRefresh,
+    }: {
+      userId: string | null;
+      interactionRefresh?: { onDisplay: boolean; onResponse: boolean; onFinished: boolean };
+    }): Promise<{
+      onDisplayCreated: () => void;
+      onResponseCreated: () => void;
+      onFinished: () => void;
+    }> => {
+      const mockConfigValue = {
+        get: vi.fn().mockReturnValue({
+          appUrl: "https://fake.app",
+          workspaceId: "env_123",
+          workspace: {
+            data: {
+              settings: { clickOutsideClose: true, overlay: "none", placement: "bottomRight" },
+            },
+          },
+          user: {
+            data: { userId, contactId: "contact_abc", displays: [], responses: [], lastDisplayAt: null },
+          },
+        }),
+        update: vi.fn(),
+      };
+
+      getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
+      (filterSurveys as Mock).mockReturnValue([]);
+      widget.setIsSurveyRunning(false);
+      window.formbricksSurveys = createMockFormbricksSurveys();
+
+      vi.useFakeTimers();
+      await widget.renderWidget({
+        ...mockSurvey,
+        delay: 0,
+        ...(interactionRefresh ? { interactionRefresh } : {}),
+      });
+      vi.advanceTimersByTime(0);
+      vi.useRealTimers();
+
+      return (getFormbricksSurveys().renderSurvey as Mock).mock.calls[0][0] as {
+        onDisplayCreated: () => void;
+        onResponseCreated: () => void;
+        onFinished: () => void;
+      };
+    };
+
+    test("refreshes on each interaction the survey's interactionRefresh enables", async () => {
+      const callbacks = await renderAndGetCallbacks({
+        userId: "user_abc",
+        interactionRefresh: { onDisplay: true, onResponse: true, onFinished: true },
+      });
+
+      callbacks.onDisplayCreated();
+      callbacks.onResponseCreated();
+      callbacks.onFinished();
+
+      expect(mockUpdateQueue.updateUserId).toHaveBeenCalledTimes(3);
+      expect(mockUpdateQueue.updateUserId).toHaveBeenCalledWith("user_abc");
+      expect(mockUpdateQueue.processUpdates).toHaveBeenCalledTimes(3);
+    });
+
+    test("skips every interaction when the survey has no interactionRefresh", async () => {
+      const callbacks = await renderAndGetCallbacks({ userId: "user_abc" });
+
+      callbacks.onDisplayCreated();
+      callbacks.onResponseCreated();
+      callbacks.onFinished();
+
+      expect(mockUpdateQueue.updateUserId).not.toHaveBeenCalled();
+      expect(mockUpdateQueue.processUpdates).not.toHaveBeenCalled();
+    });
+
+    test("skips the refresh for anonymous users even when interactionRefresh is enabled", async () => {
+      const callbacks = await renderAndGetCallbacks({
+        userId: null,
+        interactionRefresh: { onDisplay: true, onResponse: true, onFinished: true },
+      });
+
+      callbacks.onDisplayCreated();
+      callbacks.onResponseCreated();
+      callbacks.onFinished();
+
+      expect(mockUpdateQueue.updateUserId).not.toHaveBeenCalled();
+      expect(mockUpdateQueue.processUpdates).not.toHaveBeenCalled();
+    });
+
+    test("interactionRefresh gates each event independently (seen-only → display only)", async () => {
+      // Referenced only by a "have seen" filter, so only its display can change membership;
+      // response/finish must not trigger a refresh.
+      const callbacks = await renderAndGetCallbacks({
+        userId: "user_abc",
+        interactionRefresh: { onDisplay: true, onResponse: false, onFinished: false },
+      });
+
+      callbacks.onDisplayCreated();
+      callbacks.onResponseCreated();
+      callbacks.onFinished();
+
+      expect(mockUpdateQueue.updateUserId).toHaveBeenCalledTimes(1);
+      expect(mockUpdateQueue.processUpdates).toHaveBeenCalledTimes(1);
+    });
+
+    test("all-false interactionRefresh skips every event (survey referenced by nobody)", async () => {
+      const callbacks = await renderAndGetCallbacks({
+        userId: "user_abc",
+        interactionRefresh: { onDisplay: false, onResponse: false, onFinished: false },
+      });
+
+      callbacks.onDisplayCreated();
+      callbacks.onResponseCreated();
+      callbacks.onFinished();
+
+      expect(mockUpdateQueue.updateUserId).not.toHaveBeenCalled();
+      expect(mockUpdateQueue.processUpdates).not.toHaveBeenCalled();
+    });
   });
 });

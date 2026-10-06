@@ -1,6 +1,7 @@
-import { Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
+import { z } from "zod";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { logger } from "@formbricks/logger";
 import { ZId, ZString } from "@formbricks/types/common";
 import {
@@ -24,6 +25,7 @@ import {
   TSegmentFilterValue,
   TSegmentPersonFilter,
   TSegmentSegmentFilter,
+  TSegmentSurveyInteractionFilter,
   TSegmentUpdateInput,
   TSegmentWithSurveyRefs,
   ZRelativeDateValue,
@@ -33,8 +35,13 @@ import {
 } from "@formbricks/types/segment";
 import { getSurvey } from "@/lib/survey/service";
 import { validateInputs } from "@/lib/utils/validate";
-import { isResourceFilter, searchForAttributeKeyInSegment } from "@/modules/ee/contacts/segments/lib/utils";
+import {
+  SURVEY_WORKSPACE_LOOKUP_BATCH_SIZE,
+  isResourceFilter,
+  searchForAttributeKeyInSegment,
+} from "@/modules/ee/contacts/segments/lib/utils";
 import { isSameDay, subtractTimeUnit } from "./date-utils";
+import { combineFilterResults, evaluateSurveyInteractionFilterInMemory } from "./filter/survey-interaction";
 
 export type PrismaSegment = Prisma.SegmentGetPayload<{
   include: {
@@ -54,7 +61,7 @@ export const selectSegment = {
   updatedAt: true,
   title: true,
   description: true,
-  environmentId: true,
+  workspaceId: true,
   filters: true,
   isPrivate: true,
   surveys: {
@@ -107,12 +114,12 @@ export const getSegment = reactCache(async (segmentId: string): Promise<TSegment
   }
 });
 
-export const getSegments = reactCache(async (environmentId: string): Promise<TSegmentWithSurveyRefs[]> => {
-  validateInputs([environmentId, ZId]);
+export const getSegments = reactCache(async (workspaceId: string): Promise<TSegmentWithSurveyRefs[]> => {
+  validateInputs([workspaceId, ZId]);
   try {
     const segments = await prisma.segment.findMany({
       where: {
-        environmentId,
+        workspaceId,
       },
       select: selectSegment,
     });
@@ -131,27 +138,101 @@ export const getSegments = reactCache(async (environmentId: string): Promise<TSe
   }
 });
 
+export interface TSurveyFilterRef {
+  id: string;
+  name: string;
+  status: string;
+}
+
+/**
+ * Upper bound on surveys returned for the picker. Keeps the query and client payload from growing
+ * unboundedly with the workspace's survey count; the picker searches client-side over this set. A
+ * workspace exceeding this many surveys would need server-side search (tracked as a follow-up), which
+ * is far beyond any realistic count today.
+ */
+export const SURVEY_FILTER_REF_LIMIT = 1000;
+
+/**
+ * Minimal survey list for the segment survey-interaction filter picker: id + name + status,
+ * scoped to the workspace. Survey has a direct workspaceId column so no environment/project join
+ * is needed. Bounded by {@link SURVEY_FILTER_REF_LIMIT}, most-recently-updated first.
+ */
+export const getSurveyRefsForWorkspace = reactCache(
+  async (workspaceId: string): Promise<TSurveyFilterRef[]> => {
+    validateInputs([workspaceId, ZId]);
+    try {
+      return await prisma.survey.findMany({
+        where: { workspaceId },
+        select: { id: true, name: true, status: true },
+        orderBy: { updatedAt: "desc" },
+        take: SURVEY_FILTER_REF_LIMIT,
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError) {
+        throw new DatabaseError(error.message);
+      }
+      throw error;
+    }
+  }
+);
+
+/**
+ * Returns the subset of `surveyIds` that actually belong to `workspaceId`. Unlike
+ * {@link getSurveyRefsForWorkspace} (which caps at {@link SURVEY_FILTER_REF_LIMIT} for the picker),
+ * this queries by the exact ids being validated, so it stays correct for workspaces with more than
+ * that many surveys — a referenced-but-valid survey outside the picker's recent window is no longer
+ * wrongly rejected. Ids are deduplicated and looked up in bounded sequential batches (ENG-2305),
+ * mirroring {@link getSurveyWorkspaceIdMap}. Returns an empty set for an empty input without
+ * hitting the DB.
+ */
+export const getExistingWorkspaceSurveyIds = reactCache(
+  async (workspaceId: string, surveyIds: string[]): Promise<Set<string>> => {
+    validateInputs([workspaceId, ZId], [surveyIds, z.array(ZId)]);
+    const uniqueSurveyIds = Array.from(new Set(surveyIds));
+    const existingSurveyIds = new Set<string>();
+    if (uniqueSurveyIds.length === 0) return existingSurveyIds;
+    try {
+      for (let i = 0; i < uniqueSurveyIds.length; i += SURVEY_WORKSPACE_LOOKUP_BATCH_SIZE) {
+        const batch = uniqueSurveyIds.slice(i, i + SURVEY_WORKSPACE_LOOKUP_BATCH_SIZE);
+        const surveys = await prisma.survey.findMany({
+          where: { workspaceId, id: { in: batch } },
+          select: { id: true },
+        });
+        for (const survey of surveys) {
+          existingSurveyIds.add(survey.id);
+        }
+      }
+      return existingSurveyIds;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError) {
+        throw new DatabaseError(error.message);
+      }
+      throw error;
+    }
+  }
+);
+
 export const createSegment = async (segmentCreateInput: TSegmentCreateInput): Promise<TSegment> => {
   validateInputs([segmentCreateInput, ZSegmentCreateInput]);
 
-  const { description, environmentId, filters, isPrivate, surveyId, title } = segmentCreateInput;
+  const { description, filters, isPrivate, surveyId, title, workspaceId } = segmentCreateInput;
 
   const surveyConnect = surveyId ? { surveys: { connect: { id: surveyId } } } : {};
 
   try {
     // Private segments use upsert because auto-save may have already created a
     // default (empty-filter) segment via connectOrCreate before the user publishes.
-    // Without upsert the second create hits the (environmentId, title) unique constraint.
+    // Without upsert the second create hits the (workspaceId, title) unique constraint.
     if (isPrivate) {
       const segment = await prisma.segment.upsert({
         where: {
-          environmentId_title: {
-            environmentId,
+          workspaceId_title: {
+            workspaceId,
             title,
           },
         },
         create: {
-          environmentId,
+          workspaceId,
           title,
           description,
           isPrivate,
@@ -171,7 +252,7 @@ export const createSegment = async (segmentCreateInput: TSegmentCreateInput): Pr
 
     const segment = await prisma.segment.create({
       data: {
-        environmentId,
+        workspaceId,
         title,
         description,
         isPrivate,
@@ -200,7 +281,11 @@ export const cloneSegment = async (segmentId: string, surveyId: string): Promise
       throw new ResourceNotFoundError("segment", segmentId);
     }
 
-    const allSegments = await getSegments(segment.environmentId);
+    if (!segment.workspaceId) {
+      throw new DatabaseError("Segment is not associated with a workspace");
+    }
+
+    const allSegments = await getSegments(segment.workspaceId);
 
     // Find the last "Copy of" title and extract the number from it
     const lastCopyTitle = allSegments
@@ -231,7 +316,7 @@ export const cloneSegment = async (segmentId: string, surveyId: string): Promise
         title: clonedTitle,
         description: segment.description,
         isPrivate: segment.isPrivate,
-        environmentId: segment.environmentId,
+        workspaceId: segment.workspaceId,
         filters: segment.filters,
         surveys: {
           connect: {
@@ -327,7 +412,7 @@ export const resetSegmentInSurvey = async (surveyId: string): Promise<TSegment> 
             isPrivate: true,
             filters: [],
             surveys: { connect: { id: surveyId } },
-            environment: { connect: { id: survey?.environmentId } },
+            workspaceId: survey.workspaceId,
           },
           select: selectSegment,
         });
@@ -343,6 +428,46 @@ export const resetSegmentInSurvey = async (surveyId: string): Promise<TSegment> 
     throw error;
   }
 };
+
+/**
+ * Batched lookup of the owning workspace for a set of surveys, used to keep segment↔survey links
+ * within one workspace (ENG-1920). Ids are deduplicated and queried in bounded batches — one query
+ * per batch rather than one per id, so the non-N+1 shape is preserved without letting a
+ * caller-controlled array size the SQL parameter payload (ENG-2004). Batches run sequentially: the
+ * point is to cap concurrent database work, not to fan it out. Missing ids are simply absent from
+ * the returned map.
+ */
+export const getSurveyWorkspaceIdMap = reactCache(
+  async (surveyIds: string[]): Promise<Map<string, string>> => {
+    const uniqueSurveyIds = Array.from(new Set(surveyIds));
+    const workspaceIdBySurveyId = new Map<string, string>();
+
+    if (uniqueSurveyIds.length === 0) {
+      return workspaceIdBySurveyId;
+    }
+
+    try {
+      for (let i = 0; i < uniqueSurveyIds.length; i += SURVEY_WORKSPACE_LOOKUP_BATCH_SIZE) {
+        const batch = uniqueSurveyIds.slice(i, i + SURVEY_WORKSPACE_LOOKUP_BATCH_SIZE);
+        const surveys = await prisma.survey.findMany({
+          where: { id: { in: batch } },
+          select: { id: true, workspaceId: true },
+        });
+
+        for (const survey of surveys) {
+          workspaceIdBySurveyId.set(survey.id, survey.workspaceId);
+        }
+      }
+
+      return workspaceIdBySurveyId;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError) {
+        throw new DatabaseError(error.message);
+      }
+      throw error;
+    }
+  }
+);
 
 export const updateSegment = async (segmentId: string, data: TSegmentUpdateInput): Promise<TSegment> => {
   validateInputs([segmentId, ZId], [data, ZSegmentUpdateInput]);
@@ -385,13 +510,13 @@ export const updateSegment = async (segmentId: string, data: TSegmentUpdateInput
   }
 };
 
-export const getSegmentsByAttributeKey = reactCache(async (environmentId: string, attributeKey: string) => {
-  validateInputs([environmentId, ZId], [attributeKey, ZString]);
+export const getSegmentsByAttributeKey = reactCache(async (workspaceId: string, attributeKey: string) => {
+  validateInputs([workspaceId, ZId], [attributeKey, ZString]);
 
   try {
     const segments = await prisma.segment.findMany({
       where: {
-        environmentId,
+        workspaceId,
       },
       select: selectSegment,
     });
@@ -605,6 +730,7 @@ export const evaluateSegment = async (
   }
 
   let resultPairs: ResultConnectorPair[] = [];
+  const now = new Date();
 
   try {
     for (let filterItem of filters) {
@@ -613,82 +739,57 @@ export const evaluateSegment = async (
       let result: boolean;
 
       if (isResourceFilter(resource)) {
-        const { root } = resource;
-        const { type } = root;
+        const { type } = resource.root;
 
-        if (type === "attribute") {
-          result = evaluateAttributeFilter(userData.attributes, resource as TSegmentAttributeFilter);
-          resultPairs.push({
-            result,
-            connector: filterItem.connector,
-          });
-        }
-
-        if (type === "person") {
-          result = evaluatePersonFilter(userData.userId, resource as TSegmentPersonFilter);
-          resultPairs.push({
-            result,
-            connector: filterItem.connector,
-          });
-        }
-
-        if (type === "segment") {
-          result = await evaluateSegmentFilter(userData, resource as TSegmentSegmentFilter);
-          resultPairs.push({
-            result,
-            connector: filterItem.connector,
-          });
-        }
-
-        if (type === "device") {
-          result = evaluateDeviceFilter(userData.deviceType, resource as TSegmentDeviceFilter);
-          resultPairs.push({
-            result,
-            connector: filterItem.connector,
-          });
+        // Exhaustive switch: a new filter root type must be handled here or the `default` throws —
+        // this replaces an if-chain that silently dropped unhandled types (e.g. surveyInteraction),
+        // leaving `result` unassigned and corrupting segment membership.
+        switch (type) {
+          case "attribute":
+            result = evaluateAttributeFilter(userData.attributes, resource as TSegmentAttributeFilter);
+            break;
+          case "person":
+            result = evaluatePersonFilter(userData.userId, resource as TSegmentPersonFilter);
+            break;
+          case "segment":
+            result = await evaluateSegmentFilter(userData, resource as TSegmentSegmentFilter);
+            break;
+          case "device":
+            result = evaluateDeviceFilter(userData.deviceType, resource as TSegmentDeviceFilter);
+            break;
+          case "surveyInteraction":
+            // This in-process evaluator can only resolve interaction filters when the caller supplies
+            // the contact's interaction history. Throwing (rather than silently skipping) guarantees a
+            // surveyInteraction filter can never be dropped here; the contact-sync and Prisma paths
+            // evaluate these filters without needing this branch.
+            if (!userData.interactionData) {
+              throw new Error(
+                "Cannot evaluate a surveyInteraction filter without interactionData on userData; evaluate via the contact-sync in-memory path or the Prisma query path instead."
+              );
+            }
+            result = evaluateSurveyInteractionFilterInMemory(
+              resource as TSegmentSurveyInteractionFilter,
+              userData.interactionData,
+              now
+            );
+            break;
+          default:
+            throw new Error(`Unsupported segment filter root type: ${type as string}`);
         }
       } else {
-        result = await evaluateSegment(userData, resource);
-
         // this is a sub-group and we need to evaluate the sub-group
-        resultPairs.push({
-          result,
-          connector: filterItem.connector,
-        });
+        result = await evaluateSegment(userData, resource);
       }
+
+      resultPairs.push({
+        result,
+        connector: filterItem.connector,
+      });
     }
 
-    if (!resultPairs.length) {
-      return false;
-    }
-
-    // We first evaluate all `and` conditions consecutively
-    let intermediateResults: boolean[] = [];
-
-    // Given that the first filter in every group/sub-group always has a connector value of "null",
-    // we initialize the finalResult with the result of the first filter.
-    let currentAndGroupResult = resultPairs[0].result;
-
-    for (let i = 1; i < resultPairs.length; i++) {
-      const { result, connector } = resultPairs[i];
-
-      if (connector === "and") {
-        currentAndGroupResult = currentAndGroupResult && result;
-      } else if (connector === "or") {
-        intermediateResults.push(currentAndGroupResult);
-        currentAndGroupResult = result;
-      }
-    }
-    // Push the final `and` group result
-    intermediateResults.push(currentAndGroupResult);
-
-    // Now we can evaluate the `or` conditions
-    let finalResult = intermediateResults[0];
-    for (let i = 1; i < intermediateResults.length; i++) {
-      finalResult = finalResult || intermediateResults[i];
-    }
-
-    return finalResult;
+    // Combine the per-filter results with AND-before-OR precedence (shared with the in-memory
+    // survey-interaction evaluator so both paths agree on connector semantics).
+    return combineFilterResults(resultPairs);
   } catch (error) {
     logger.error(error instanceof Error ? error : new Error(String(error)), "Error evaluating segment");
 

@@ -1,5 +1,5 @@
-import { Prisma } from "@prisma/client";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { ResourceNotFoundError } from "@formbricks/types/errors";
 import { type TInviteUpdateInput } from "@/modules/ee/role-management/types/invites";
@@ -19,7 +19,7 @@ export const updateInvite = async (inviteId: string, data: TInviteUpdateInput): 
   } catch (error) {
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
-      error.code === PrismaErrorType.RecordDoesNotExist
+      error.code === PrismaErrorType.RecordNotFound
     ) {
       throw new ResourceNotFoundError("Invite", inviteId);
     } else {

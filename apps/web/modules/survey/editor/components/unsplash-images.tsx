@@ -1,12 +1,13 @@
 "use client";
 
-import { debounce } from "lodash";
 import { SearchIcon } from "lucide-react";
 import UnsplashImage from "next/image";
 import { useEffect, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { TSurveyBackgroundBgType } from "@formbricks/types/surveys/types";
+import { isExternalImageSrc } from "@/lib/image-hosts";
+import { debounce } from "@/lib/utils/debounce";
 import { Button } from "@/modules/ui/components/button";
 import { Input } from "@/modules/ui/components/input";
 import { LoadingSpinner } from "@/modules/ui/components/loading-spinner";
@@ -192,14 +193,14 @@ export const ImageFromUnsplashSurveyBg = ({ handleBgChange }: ImageFromUnsplashS
   return (
     <div className="relative mt-2 w-full">
       <div className="relative">
-        <SearchIcon className="absolute left-2 top-1/2 h-6 w-4 -translate-y-1/2 text-slate-500" />
+        <SearchIcon className="absolute top-1/2 left-2 h-6 w-4 -translate-y-1/2 text-slate-500" />
         <Input
           value={query}
           onChange={handleChange}
-          placeholder={t("environments.surveys.edit.try_lollipop_or_mountain")}
+          placeholder={t("workspace.surveys.edit.try_lollipop_or_mountain")}
           className="pl-8"
           ref={inputFocus}
-          aria-label={t("environments.surveys.edit.search_for_images")}
+          aria-label={t("workspace.surveys.edit.search_for_images")}
         />
       </div>
       <div className="relative mt-4 grid grid-cols-3 gap-1">
@@ -213,9 +214,10 @@ export const ImageFromUnsplashSurveyBg = ({ handleBgChange }: ImageFromUnsplashS
                 alt={image.alt_description}
                 onClick={() => handleImageSelected(image.urls.regularWithAttribution, image.urls.download)}
                 className="h-full cursor-pointer rounded-lg object-cover"
+                unoptimized={isExternalImageSrc(image.urls.regularWithAttribution)}
               />
               {image.authorName && (
-                <span className="absolute bottom-1 right-1 hidden rounded bg-black bg-opacity-75 px-2 py-1 text-xs text-white group-hover:block">
+                <span className="absolute right-1 bottom-1 hidden rounded-sm bg-black/75 px-2 py-1 text-xs text-white group-hover:block">
                   {image.authorName}
                 </span>
               )}
@@ -239,7 +241,7 @@ export const ImageFromUnsplashSurveyBg = ({ handleBgChange }: ImageFromUnsplashS
         )}
         {!isLoading && images.length === 0 && query.trim() !== "" && (
           <div className="col-span-3 flex items-center justify-center text-sm text-slate-500">
-            {t("environments.surveys.edit.no_images_found_for", { query: query })}
+            {t("workspace.surveys.edit.no_images_found_for", { query: query })}
           </div>
         )}
       </div>

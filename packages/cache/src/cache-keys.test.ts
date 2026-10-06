@@ -6,31 +6,29 @@ describe("@formbricks/cache cacheKeys", () => {
   describe("createCacheKey", () => {
     describe("environment namespace", () => {
       test("should create environment state key", () => {
-        const key = createCacheKey.environment.state("env-123");
+        const key = createCacheKey.workspace.state("env-123");
         expect(key).toBe("fb:env:env-123:state");
         // Verify it returns branded CacheKey type
         expect(typeof key).toBe("string");
       });
 
       test("should create environment config key", () => {
-        const key = createCacheKey.environment.config("env-abc");
+        const key = createCacheKey.workspace.config("env-abc");
         expect(key).toBe("fb:env:env-abc:config");
       });
 
       test("should create environment segments key", () => {
-        const key = createCacheKey.environment.segments("env-def");
+        const key = createCacheKey.workspace.segments("env-def");
         expect(key).toBe("fb:env:env-def:segments");
       });
 
       test("should handle special characters in environment IDs", () => {
-        const key = createCacheKey.environment.state("env-test_123-special");
+        const key = createCacheKey.workspace.state("env-test_123-special");
         expect(key).toBe("fb:env:env-test_123-special:state");
       });
 
       test("should throw error for empty environment ID", () => {
-        expect(() => createCacheKey.environment.state("")).toThrow(
-          "Invalid Cache key: Parts cannot be empty"
-        );
+        expect(() => createCacheKey.workspace.state("")).toThrow("Invalid Cache key: Parts cannot be empty");
       });
     });
 
@@ -38,6 +36,11 @@ describe("@formbricks/cache cacheKeys", () => {
       test("should create organization billing key", () => {
         const key = createCacheKey.organization.billing("org-123");
         expect(key).toBe("fb:org:org-123:billing");
+      });
+
+      test("should create organization billing-sync-lock key scoped to the org", () => {
+        const key = createCacheKey.organization.billingSyncLock("org-123");
+        expect(key).toBe("fb:org:org-123:billing-sync-lock");
       });
 
       test("should handle complex organization IDs", () => {
@@ -105,6 +108,19 @@ describe("@formbricks/cache cacheKeys", () => {
       });
     });
 
+    describe("hub namespace", () => {
+      test("should create feedback record tenant key", () => {
+        const key = createCacheKey.hub.feedbackRecordTenant("0194d8a0-3d55-7ff4-9f62-8d02c3fbcfe8");
+        expect(key).toBe("fb:hub:0194d8a0-3d55-7ff4-9f62-8d02c3fbcfe8:feedback_record_tenant");
+      });
+
+      test("should throw error for empty feedback record id", () => {
+        expect(() => createCacheKey.hub.feedbackRecordTenant("")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+      });
+    });
+
     describe("custom namespace", () => {
       test("should create custom key with subResource", () => {
         const key = createCacheKey.custom("analytics", "user-456", "daily-stats");
@@ -144,7 +160,7 @@ describe("@formbricks/cache cacheKeys", () => {
 
   describe("CacheKey type safety", () => {
     test("should return CacheKey branded type", () => {
-      const key = createCacheKey.environment.state("test-env");
+      const key = createCacheKey.workspace.state("test-env");
 
       // This function would only accept CacheKey, not raw string
       const acceptsCacheKey = (cacheKey: CacheKey): string => cacheKey;
@@ -158,12 +174,13 @@ describe("@formbricks/cache cacheKeys", () => {
 
     test("should work with all namespace keys", () => {
       const keys = [
-        createCacheKey.environment.state("env-1"),
-        createCacheKey.environment.config("env-1"),
-        createCacheKey.environment.segments("env-1"),
+        createCacheKey.workspace.state("env-1"),
+        createCacheKey.workspace.config("env-1"),
+        createCacheKey.workspace.segments("env-1"),
         createCacheKey.organization.billing("org-1"),
         createCacheKey.license.status("org-1"),
         createCacheKey.license.previous_result("org-1"),
+        createCacheKey.hub.feedbackRecordTenant("record-1"),
         createCacheKey.rateLimit.core("api", "user-1", 123456),
         createCacheKey.custom("analytics", "temp-1"),
         createCacheKey.custom("analytics", "temp-1", "sub"),
@@ -180,9 +197,10 @@ describe("@formbricks/cache cacheKeys", () => {
     test("should validate all cache key structures", () => {
       // All generated keys should follow the fb:resource:identifier[:subresource] pattern
       const keys = [
-        createCacheKey.environment.state("env-123"),
+        createCacheKey.workspace.state("env-123"),
         createCacheKey.organization.billing("org-456"),
         createCacheKey.license.status("license-789"),
+        createCacheKey.hub.feedbackRecordTenant("record-321"),
         createCacheKey.rateLimit.core("api", "user-101", 1640995200),
         createCacheKey.custom("analytics", "analytics-102", "daily"),
       ];
@@ -197,16 +215,17 @@ describe("@formbricks/cache cacheKeys", () => {
     test("should throw consistent error messages for empty parts", () => {
       const errorMessage = "Invalid Cache key: Parts cannot be empty";
 
-      expect(() => createCacheKey.environment.state("")).toThrow(errorMessage);
+      expect(() => createCacheKey.workspace.state("")).toThrow(errorMessage);
       expect(() => createCacheKey.organization.billing("")).toThrow(errorMessage);
       expect(() => createCacheKey.license.status("")).toThrow(errorMessage);
+      expect(() => createCacheKey.hub.feedbackRecordTenant("")).toThrow(errorMessage);
       expect(() => createCacheKey.rateLimit.core("", "user", 123)).toThrow(errorMessage);
       expect(() => createCacheKey.custom("analytics", "")).toThrow(errorMessage);
     });
 
     test("should handle edge case values safely", () => {
       // Test with realistic edge case values
-      const specialChars = createCacheKey.environment.state("env_test-123.special");
+      const specialChars = createCacheKey.workspace.state("env_test-123.special");
       expect(specialChars).toBe("fb:env:env_test-123.special:state");
 
       const numeric = createCacheKey.organization.billing("12345");

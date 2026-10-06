@@ -1,8 +1,10 @@
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
 import { getOrganizationIdFromSurveyId } from "@/lib/utils/helper";
 import { authenticatedApiClient } from "@/modules/api/v2/auth/authenticated-api-client";
 import { responses } from "@/modules/api/v2/lib/response";
 import { handleApiError } from "@/modules/api/v2/lib/utils";
-import { getEnvironmentId } from "@/modules/api/v2/management/lib/helper";
+import { getWorkspaceId } from "@/modules/api/v2/management/lib/helper";
 import { getContact } from "@/modules/api/v2/management/surveys/[surveyId]/contact-links/contacts/[contactId]/lib/contacts";
 import { getResponse } from "@/modules/api/v2/management/surveys/[surveyId]/contact-links/contacts/[contactId]/lib/response";
 import { getSurvey } from "@/modules/api/v2/management/surveys/[surveyId]/contact-links/contacts/[contactId]/lib/surveys";
@@ -15,7 +17,6 @@ import { calculateExpirationDate } from "@/modules/api/v2/management/surveys/[su
 import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
 import { getContactSurveyLink } from "@/modules/ee/contacts/lib/contact-survey-link";
 import { getIsContactsEnabled } from "@/modules/ee/license-check/lib/utils";
-import { hasPermission } from "@/modules/organization/settings/api-keys/lib/utils";
 
 export const GET = async (request: Request, props: { params: Promise<TContactLinkParams> }) =>
   authenticatedApiClient({
@@ -35,15 +36,21 @@ export const GET = async (request: Request, props: { params: Promise<TContactLin
         });
       }
 
-      const environmentIdResult = await getEnvironmentId(params.surveyId, false);
+      const workspaceIdResult = await getWorkspaceId(params.surveyId, false);
 
-      if (!environmentIdResult.ok) {
-        return handleApiError(request, environmentIdResult.error);
+      if (!workspaceIdResult.ok) {
+        return handleApiError(request, workspaceIdResult.error);
       }
 
-      const environmentId = environmentIdResult.data;
+      const { workspaceId } = workspaceIdResult.data;
 
-      if (!hasPermission(authentication.environmentPermissions, environmentId, "GET")) {
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("GET"),
+          { type: "workspace", id: workspaceId }
+        ))
+      ) {
         return handleApiError(request, {
           type: "unauthorized",
         });
@@ -83,7 +90,7 @@ export const GET = async (request: Request, props: { params: Promise<TContactLin
       }
 
       // Check if contact exists and belongs to the environment
-      const contactResult = await getContact(params.contactId, environmentId);
+      const contactResult = await getContact(params.contactId, workspaceId);
 
       if (!contactResult.ok) {
         return handleApiError(request, contactResult.error as ApiErrorResponseV2);

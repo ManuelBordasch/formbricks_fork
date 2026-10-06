@@ -3,6 +3,7 @@ import { toast } from "react-hot-toast";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { TI18nString } from "@formbricks/types/i18n";
 import { ZSegmentFilters } from "@formbricks/types/segment";
+import { TSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
 import {
   TSurveyAddressElement,
   TSurveyCTAElement,
@@ -16,6 +17,7 @@ import {
   TSurveyPictureSelectionElement,
   TSurveyRatingElement,
 } from "@formbricks/types/surveys/elements";
+import { validateElementLabels } from "@formbricks/types/surveys/elements-validation";
 import {
   TSurvey,
   TSurveyEndScreenCard,
@@ -23,6 +25,12 @@ import {
   TSurveyRedirectUrlCard,
   TSurveyWelcomeCard,
 } from "@formbricks/types/surveys/types";
+import {
+  TValidateIdErrorCode,
+  validateCardFieldsForAllLanguages,
+  validateQuestionLabels,
+} from "@formbricks/types/surveys/validation";
+import { isAppSurveyMissingTriggersToPublish } from "@/lib/survey/utils";
 import { checkForEmptyFallBackValue } from "@/lib/utils/recall";
 import * as validation from "./validation";
 
@@ -47,7 +55,7 @@ const surveyLanguagesEnabled: TSurveyLanguage[] = [
       alias: null,
       createdAt: new Date(),
       updatedAt: new Date(),
-      projectId: "proj1",
+      workspaceId: "proj1",
     },
     default: true,
     enabled: true,
@@ -59,7 +67,7 @@ const surveyLanguagesEnabled: TSurveyLanguage[] = [
       alias: null,
       createdAt: new Date(),
       updatedAt: new Date(),
-      projectId: "proj1",
+      workspaceId: "proj1",
     },
     default: false,
     enabled: true,
@@ -74,7 +82,7 @@ const surveyLanguagesOnlyDefault: TSurveyLanguage[] = [
       alias: null,
       createdAt: new Date(),
       updatedAt: new Date(),
-      projectId: "proj1",
+      workspaceId: "proj1",
     },
     default: true,
     enabled: true,
@@ -89,7 +97,7 @@ const surveyLanguagesWithDisabled: TSurveyLanguage[] = [
       alias: null,
       createdAt: new Date(),
       updatedAt: new Date(),
-      projectId: "proj1",
+      workspaceId: "proj1",
     },
     default: true,
     enabled: true,
@@ -101,7 +109,7 @@ const surveyLanguagesWithDisabled: TSurveyLanguage[] = [
       alias: null,
       createdAt: new Date(),
       updatedAt: new Date(),
-      projectId: "proj1",
+      workspaceId: "proj1",
     },
     default: false,
     enabled: true,
@@ -113,12 +121,179 @@ const surveyLanguagesWithDisabled: TSurveyLanguage[] = [
       alias: null,
       createdAt: new Date(),
       updatedAt: new Date(),
-      projectId: "proj1",
+      workspaceId: "proj1",
     },
     default: false,
     enabled: false,
   },
 ];
+
+const surveyLanguagesMultipleEnabled: TSurveyLanguage[] = [
+  {
+    language: {
+      id: "1",
+      code: "en",
+      alias: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      workspaceId: "proj1",
+    },
+    default: true,
+    enabled: true,
+  },
+  {
+    language: {
+      id: "2",
+      code: "de",
+      alias: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      workspaceId: "proj1",
+    },
+    default: false,
+    enabled: true,
+  },
+  {
+    language: {
+      id: "3",
+      code: "fr",
+      alias: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      workspaceId: "proj1",
+    },
+    default: false,
+    enabled: true,
+  },
+  {
+    language: {
+      id: "4",
+      code: "es",
+      alias: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      workspaceId: "proj1",
+    },
+    default: false,
+    enabled: true,
+  },
+];
+
+describe("survey schema multilingual label validation", () => {
+  test("returns a card issue when the welcome card default headline is missing but translations are present", () => {
+    const issue = validateCardFieldsForAllLanguages(
+      "cardHeadline",
+      { default: "", en: "Welcome", de: "Willkommen" },
+      surveyLanguagesEnabled,
+      "welcome"
+    );
+
+    expect(issue).toMatchObject({
+      code: "custom",
+      message: "The note on the Welcome card is missing",
+      path: ["welcomeCard", "cardHeadline"],
+    });
+    expect(issue?.params).toBeUndefined();
+  });
+
+  test("returns language params when only a translated welcome card headline is missing", () => {
+    const issue = validateCardFieldsForAllLanguages(
+      "cardHeadline",
+      { default: "Welcome", en: "Welcome", de: "" },
+      surveyLanguagesEnabled,
+      "welcome"
+    );
+
+    expect(issue).toMatchObject({
+      code: "custom",
+      message: "The note on the Welcome card is missing for the following languages:  -fLang- de",
+      path: ["welcomeCard", "cardHeadline"],
+      params: { invalidLanguageCodes: ["de"] },
+    });
+  });
+
+  test("returns a card issue without params when the ending card default headline and translations are missing", () => {
+    const issue = validateCardFieldsForAllLanguages(
+      "cardHeadline",
+      { default: "", en: "", de: "" },
+      surveyLanguagesEnabled,
+      "end",
+      2
+    );
+
+    expect(issue).toMatchObject({
+      code: "custom",
+      message: "The note on the Ending card 3 is missing",
+      path: ["endings", 2, "cardHeadline"],
+    });
+    expect(issue?.params).toBeUndefined();
+  });
+
+  test("returns all invalid language params for mixed valid and invalid ending card translations", () => {
+    const issue = validateCardFieldsForAllLanguages(
+      "endingCardButtonLabel",
+      { default: "Done", en: "Done", de: "", fr: " ", es: "Listo" },
+      surveyLanguagesMultipleEnabled,
+      "end",
+      1
+    );
+
+    expect(issue).toMatchObject({
+      code: "custom",
+      message:
+        "The button label on the Ending card 2 is missing for the following languages:  -fLang- de, fr",
+      path: ["endings", 1, "endingCardButtonLabel"],
+      params: { invalidLanguageCodes: ["de", "fr"] },
+    });
+  });
+
+  test("returns a block-editor issue when a block element default headline is missing", () => {
+    const issue = validateElementLabels(
+      "headline",
+      { default: "", en: "", de: "" },
+      surveyLanguagesEnabled,
+      1,
+      0
+    );
+
+    expect(issue).toMatchObject({
+      message: "The question in question 1 of block 2 is missing",
+      path: ["blocks", 1, "elements", 0, "headline"],
+    });
+    expect(issue?.params).toBeUndefined();
+  });
+
+  test("returns a block-editor issue when a question default headline is missing", () => {
+    const issue = validateQuestionLabels(
+      "headline",
+      { default: "", en: "", de: "" },
+      surveyLanguagesEnabled,
+      0
+    );
+
+    expect(issue).toMatchObject({
+      message: "The question in question 1 is missing",
+      path: ["questions", 0, "headline"],
+    });
+    expect(issue?.params).toBeUndefined();
+  });
+
+  test("returns language params when only a translated block element headline is missing", () => {
+    const issue = validateElementLabels(
+      "headline",
+      { default: "Question", en: "Question", de: "" },
+      surveyLanguagesEnabled,
+      1,
+      0
+    );
+
+    expect(issue).toMatchObject({
+      message: "The question in question 1 of block 2 is missing for the following languages:  -fLang- de",
+      path: ["blocks", 1, "elements", 0, "headline"],
+      params: { invalidLanguageCodes: ["de"] },
+    });
+  });
+});
 
 describe("validation.isLabelValidForAllLanguages", () => {
   test("should return true if all enabled languages have non-empty labels", () => {
@@ -166,7 +341,7 @@ describe("validation.isLabelValidForAllLanguages", () => {
           alias: null,
           createdAt: new Date(),
           updatedAt: new Date(),
-          projectId: "proj1",
+          workspaceId: "proj1",
         },
         default: true,
         enabled: true,
@@ -910,7 +1085,6 @@ describe("validation.isSurveyValid", () => {
       id: "survey1",
       name: "Test Survey",
       type: "web",
-      environmentId: "env1",
       status: "draft",
       questions: [],
       blocks: [
@@ -967,7 +1141,7 @@ describe("validation.isSurveyValid", () => {
       required: false,
     });
     expect(validation.isSurveyValid(baseSurvey, "de", mockT)).toBe(false);
-    expect(toast.error).toHaveBeenCalledWith("environments.surveys.edit.fallback_missing");
+    expect(toast.error).toHaveBeenCalledWith("workspace.surveys.edit.fallback_missing");
   });
 
   test("should return false and toast error if response limit is 0", () => {
@@ -976,7 +1150,7 @@ describe("validation.isSurveyValid", () => {
       autoComplete: 0,
     };
     expect(validation.isSurveyValid(surveyWithZeroLimit, "en", mockT, 5)).toBe(false);
-    expect(toast.error).toHaveBeenCalledWith("environments.surveys.edit.response_limit_can_t_be_set_to_0");
+    expect(toast.error).toHaveBeenCalledWith("workspace.surveys.edit.response_limit_can_t_be_set_to_0");
   });
 
   test("should return false and toast error if response limit is less than or equal to response count", () => {
@@ -986,7 +1160,7 @@ describe("validation.isSurveyValid", () => {
     };
     expect(validation.isSurveyValid(surveyWithLowLimit, "en", mockT, 5)).toBe(false);
     expect(toast.error).toHaveBeenCalledWith(
-      "environments.surveys.edit.response_limit_needs_to_exceed_number_of_received_responses",
+      "workspace.surveys.edit.response_limit_needs_to_exceed_number_of_received_responses",
       {
         id: "response-limit-error",
       }
@@ -1000,7 +1174,7 @@ describe("validation.isSurveyValid", () => {
     };
     expect(validation.isSurveyValid(surveyWithLowLimit, "en", mockT, 5)).toBe(false);
     expect(toast.error).toHaveBeenCalledWith(
-      "environments.surveys.edit.response_limit_needs_to_exceed_number_of_received_responses",
+      "workspace.surveys.edit.response_limit_needs_to_exceed_number_of_received_responses",
       {
         id: "response-limit-error",
       }
@@ -1036,9 +1210,7 @@ describe("validation.isSurveyValid", () => {
     } as unknown as TSurvey;
 
     expect(validation.isSurveyValid(surveyWithEmptyClosedMessageHeading, "en", mockT)).toBe(false);
-    expect(toast.error).toHaveBeenCalledWith(
-      "environments.surveys.edit.survey_closed_message_heading_required"
-    );
+    expect(toast.error).toHaveBeenCalledWith("workspace.surveys.edit.survey_closed_message_heading_required");
   });
 
   test("should return false and toast error if a link survey has a whitespace-only custom survey closed message heading", () => {
@@ -1052,9 +1224,7 @@ describe("validation.isSurveyValid", () => {
     } as unknown as TSurvey;
 
     expect(validation.isSurveyValid(surveyWithWhitespaceClosedMessageHeading, "en", mockT)).toBe(false);
-    expect(toast.error).toHaveBeenCalledWith(
-      "environments.surveys.edit.survey_closed_message_heading_required"
-    );
+    expect(toast.error).toHaveBeenCalledWith("workspace.surveys.edit.survey_closed_message_heading_required");
   });
 
   test("should return true if a link survey has a custom survey closed message heading and no subheading", () => {
@@ -1097,12 +1267,11 @@ describe("validation.isSurveyValid", () => {
           title: "temp segment",
           description: "",
           surveyId: "survey1",
-          environmentId: "env1",
         },
       } as unknown as TSurvey;
 
       expect(validation.isSurveyValid(surveyWithInvalidSegment, "en", mockT)).toBe(false); // Zod parse will fail
-      expect(toast.error).toHaveBeenCalledWith("environments.surveys.edit.invalid_targeting");
+      expect(toast.error).toHaveBeenCalledWith("workspace.surveys.edit.invalid_targeting");
     });
 
     test("should return true for app survey with valid segment filters", () => {
@@ -1122,7 +1291,6 @@ describe("validation.isSurveyValid", () => {
           title: "temp segment",
           description: "",
           surveyId: "survey1",
-          environmentId: "env1",
         },
       } as unknown as TSurvey;
       const mockSafeParse = vi.spyOn(ZSegmentFilters, "safeParse");
@@ -1132,5 +1300,220 @@ describe("validation.isSurveyValid", () => {
       expect(toast.error).not.toHaveBeenCalled();
       mockSafeParse.mockRestore();
     });
+  });
+});
+
+describe("validation.getValidateIdErrorMessage", () => {
+  const mockT: TFunction = ((key: string, params?: Record<string, string>) => {
+    // Simulate localized entity labels
+    if (key === "common.hidden_field") return "Hidden field";
+    if (key === "workspace.surveys.edit.question") return "Question";
+    if (!params) return key;
+    return Object.entries(params).reduce((str, [k, v]) => str.replace(`{${k}}`, v), key);
+  }) as TFunction;
+
+  test("returns translated message for Empty error code", () => {
+    const result = validation.getValidateIdErrorMessage(
+      { code: TValidateIdErrorCode.Empty, field: "" },
+      "hiddenField",
+      mockT
+    );
+    expect(result).toContain("validate_id_empty");
+  });
+
+  test("returns translated message for Duplicate error code", () => {
+    const result = validation.getValidateIdErrorMessage(
+      { code: TValidateIdErrorCode.Duplicate, field: "test" },
+      "question",
+      mockT
+    );
+    expect(result).toContain("validate_id_duplicate");
+  });
+
+  test("returns translated message for Reserved error code with field name", () => {
+    const result = validation.getValidateIdErrorMessage(
+      { code: TValidateIdErrorCode.Reserved, field: "userId" },
+      "hiddenField",
+      mockT
+    );
+    expect(result).toContain("validate_id_reserved");
+  });
+
+  test("returns translated message for HasSpaces error code", () => {
+    const result = validation.getValidateIdErrorMessage(
+      { code: TValidateIdErrorCode.HasSpaces, field: "my field" },
+      "hiddenField",
+      mockT
+    );
+    expect(result).toContain("validate_id_no_spaces");
+  });
+
+  test("returns translated message for InvalidChars error code", () => {
+    const result = validation.getValidateIdErrorMessage(
+      { code: TValidateIdErrorCode.InvalidChars, field: "field!" },
+      "question",
+      mockT
+    );
+    expect(result).toContain("validate_id_invalid_chars");
+  });
+
+  test("returns a distinct message for NotSafeIdentifier error code", () => {
+    const result = validation.getValidateIdErrorMessage(
+      { code: TValidateIdErrorCode.NotSafeIdentifier, field: "Legacy-Field" },
+      "hiddenField",
+      mockT
+    );
+    expect(result).toContain("validate_id_not_safe_identifier");
+    expect(result).not.toContain("validate_id_invalid_chars");
+  });
+
+  test("localizes type before passing to translation function", () => {
+    const spyT = vi.fn().mockImplementation((key: string) => {
+      if (key === "common.hidden_field") return "Hidden field";
+      return "translated";
+    });
+    const result = validation.getValidateIdErrorMessage(
+      { code: TValidateIdErrorCode.Empty, field: "" },
+      "hiddenField",
+      spyT as unknown as TFunction
+    );
+    expect(spyT).toHaveBeenCalledWith("common.hidden_field");
+    expect(spyT).toHaveBeenCalledWith("workspace.surveys.edit.validate_id_empty", {
+      type: "Hidden field",
+    });
+    expect(result).toBe("translated");
+  });
+
+  test("localizes question type and passes field for Reserved error code", () => {
+    const spyT = vi.fn().mockImplementation((key: string) => {
+      if (key === "workspace.surveys.edit.question") return "Question";
+      return "translated";
+    });
+    validation.getValidateIdErrorMessage(
+      { code: TValidateIdErrorCode.Reserved, field: "userId" },
+      "question",
+      spyT as unknown as TFunction
+    );
+    expect(spyT).toHaveBeenCalledWith("workspace.surveys.edit.question");
+    expect(spyT).toHaveBeenCalledWith("workspace.surveys.edit.validate_id_reserved", {
+      type: "Question",
+      field: "userId",
+    });
+  });
+});
+
+describe("validation.isBlockLogicItemValid", () => {
+  // A fully schema-valid rule: a real cuid id, an "and" condition group and a
+  // jumpToBlock action pointing at a valid block id.
+  const validLogicItem: TSurveyBlockLogic = {
+    id: "cs8fnvm1v9d8x1234567890ab",
+    conditions: {
+      id: "n1x8fq7z9v2c3b4m5k6j7h8g",
+      connector: "and",
+      conditions: [],
+    },
+    actions: [
+      {
+        id: "aq7z9v2c3b4m5k6j7h8g1x8f",
+        objective: "jumpToBlock",
+        target: "bx8fq7z9v2c3b4m5k6j7h8ga",
+      },
+    ],
+  };
+
+  test("returns true for a schema-valid conditional-logic rule", () => {
+    expect(validation.isBlockLogicItemValid(validLogicItem)).toBe(true);
+  });
+
+  test("returns false when a jumpToBlock action has an empty target", () => {
+    const emptyJumpTarget: TSurveyBlockLogic = {
+      ...validLogicItem,
+      actions: [{ id: "aq7z9v2c3b4m5k6j7h8g1x8f", objective: "jumpToBlock", target: "" }],
+    };
+
+    expect(validation.isBlockLogicItemValid(emptyJumpTarget)).toBe(false);
+  });
+
+  test("returns false when a condition is missing its required right operand", () => {
+    const missingRightOperand: TSurveyBlockLogic = {
+      ...validLogicItem,
+      conditions: {
+        id: "n1x8fq7z9v2c3b4m5k6j7h8g",
+        connector: "and",
+        conditions: [
+          {
+            id: "cx8fq7z9v2c3b4m5k6j7h8ga",
+            leftOperand: { type: "element", value: "element-1" },
+            // "equals" requires a right operand, which is intentionally omitted.
+            operator: "equals",
+          },
+        ],
+      },
+    };
+
+    expect(validation.isBlockLogicItemValid(missingRightOperand)).toBe(false);
+  });
+
+  test("returns false when the rule id is not a valid cuid", () => {
+    expect(validation.isBlockLogicItemValid({ ...validLogicItem, id: "logic-1" })).toBe(false);
+  });
+});
+
+// ENG-2581: the editor stopped disabling Save / Save & Close / Publish for a missing trigger and
+// now blocks the click instead, so this predicate is what decides whether the click is refused.
+describe("validation.isMissingRequiredTrigger", () => {
+  const appSurveyWithoutTriggers = { type: "app", triggers: [] } as unknown as TSurvey;
+
+  test.each(["inProgress", "paused", "completed"] as const)(
+    "refuses an app survey with no trigger heading for %s",
+    (targetStatus) => {
+      expect(validation.isMissingRequiredTrigger(appSurveyWithoutTriggers, targetStatus)).toBe(true);
+    }
+  );
+
+  test("lets an app survey with no trigger be saved as a draft", () => {
+    expect(validation.isMissingRequiredTrigger(appSurveyWithoutTriggers, "draft")).toBe(false);
+  });
+
+  test("lets a link survey publish with no trigger", () => {
+    expect(
+      validation.isMissingRequiredTrigger({ type: "link", triggers: [] } as unknown as TSurvey, "inProgress")
+    ).toBe(false);
+  });
+
+  test("lets an app survey with a trigger publish", () => {
+    const withTrigger = {
+      type: "app",
+      triggers: [{ actionClass: { id: "action1", name: "Click" } }],
+    } as unknown as TSurvey;
+
+    expect(validation.isMissingRequiredTrigger(withTrigger, "inProgress")).toBe(false);
+  });
+
+  test.each([
+    ["a null triggers array", null],
+    ["an undefined triggers array", undefined],
+    ["a hole left by a removed trigger", [undefined]],
+  ])("treats %s as no trigger", (_case, triggers) => {
+    expect(
+      validation.isMissingRequiredTrigger({ type: "app", triggers } as unknown as TSurvey, "inProgress")
+    ).toBe(true);
+  });
+
+  // The client cannot import the server-only module that owns the same rule, so the two are separate
+  // code. This is what keeps them from drifting: the client must refuse exactly what the server
+  // rejects, or the editor promises a save the API then fails.
+  test("agrees with the server-side rule on every type/status/trigger combination", () => {
+    for (const type of ["app", "link"] as const) {
+      for (const status of ["draft", "inProgress", "paused", "completed"] as const) {
+        for (const triggers of [[], [{ actionClass: { id: "action1" } }]]) {
+          const survey = { type, triggers } as unknown as TSurvey;
+
+          expect(validation.isMissingRequiredTrigger(survey, status)).toBe(
+            isAppSurveyMissingTriggersToPublish(type, status, triggers)
+          );
+        }
+      }
+    }
   });
 });

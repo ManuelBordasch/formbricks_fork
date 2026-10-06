@@ -30,7 +30,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          node-version-file: ".nvmrc"
 
       - name: Install pnpm
         uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
@@ -49,7 +49,7 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Install dependencies
-        run: pnpm install --config.platform=linux --config.architecture=x64
+        run: pnpm install --frozen-lockfile --config.platform=linux --config.architecture=x64
 
       - name: Run Chromatic
         uses: chromaui/action@4c20b95e9d3209ecfdf9cd6aace6bbde71ba1694 # v13.3.4

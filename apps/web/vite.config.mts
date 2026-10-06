@@ -6,16 +6,72 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    environment: "node",
-    environmentMatchGlobs: [["**/*.test.tsx", "jsdom"]],
-    exclude: ["playwright/**", "node_modules/**", ".next/**"],
+    // Integration tests run only via `pnpm test:integration` (vitest.integration.config.mts) against a
+    // real Postgres + Redis; the unit config mocks the DB, so they must be excluded here (ENG-1054).
+    exclude: ["playwright/**", "node_modules/**", ".next/**", "**/*.integration.test.ts"],
     setupFiles: ["./vitestSetup.ts"],
     env: loadEnv("", process.cwd(), ""),
+    // Environment selection (ENG-1680): Vitest 4 removed `environmentMatchGlobs`, so environments
+    // are assigned via projects. *.test.ts run in node; *.test.tsx (component tests) run in jsdom
+    // automatically - no `@vitest-environment` pragma needed.
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: "unit",
+          environment: "node",
+          exclude: [
+            "playwright/**",
+            "node_modules/**",
+            ".next/**",
+            "**/*.integration.test.ts",
+            "**/*.test.tsx",
+            "**/*.rsc.test.ts",
+          ],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "components",
+          environment: "jsdom",
+          include: ["**/*.test.tsx"],
+        },
+      },
+      {
+        // ENG-2444: the `page` authorization surface lives in a React `cache()` slot, and `cache` only
+        // does anything in the react-server build — the default build ships it as a permanent no-op,
+        // and the shared vitestSetup mocks it to identity on top of that. So the `unit` project cannot
+        // exercise this surface at all. Here React resolves the way Next.js resolves it for RSC, so
+        // the real implementation runs. `ssr.resolve.conditions` is the knob that works: Vitest loads
+        // test modules through the SSR environment, so a top-level `resolve.conditions` is ignored.
+        //
+        // Deliberately NOT `extends: true`: that merges the root `setupFiles`, which import
+        // react-dom/client (forbidden under the react-server condition) and mock `cache` away.
+        plugins: [tsconfigPaths()],
+        ssr: { resolve: { conditions: ["react-server", "node", "import", "default"] } },
+        test: {
+          name: "rsc",
+          environment: "node",
+          include: ["**/*.rsc.test.ts"],
+          env: loadEnv("", process.cwd(), ""),
+          setupFiles: ["./vitestSetup.rsc.ts"],
+        },
+      },
+    ],
     coverage: {
       provider: "v8", // Use V8 as the coverage provider
       reporter: ["text", "html", "lcov"], // Generate text summary and HTML reports
       reportsDirectory: "./coverage", // Output coverage reports to the coverage/ directory
-      include: ["app/**/*.ts", "modules/**/*.ts", "lib/**/*.ts", "lingodotdev/**/*.ts", "proxy.ts"],
+      include: [
+        "app/**/*.ts",
+        "modules/**/*.ts",
+        "lib/**/*.ts",
+        "lingodotdev/**/*.ts",
+        "instrumentation-node-config.ts",
+        "instrumentation-jobs.ts",
+        "proxy.ts",
+      ],
       exclude: [
         // Build and configuration files
         "**/.next/**", // Next.js build output
@@ -57,12 +113,13 @@ export default defineConfig({
         "**/actions.ts", // Server actions (plural)
         "**/action.ts", // Server actions (singular)
         "lib/env.ts", // Environment configuration
+        "lib/env-client.ts", // Environment configuration (client-safe)
         "**/cache.ts", // Cache files
         "**/cache/**", // Cache directories
 
         // UI Components and Templates
         "**/stories.*", // Storybook files
-        "**/templates.ts", // Project-specific template files
+        "**/templates.ts", // Workspace-specific template files
         "modules/ui/components/icons/*", // Icon components
         "modules/ui/components/icons/**", // Icon components (nested)
 
@@ -88,12 +145,29 @@ export default defineConfig({
 
         // Specific components
         "modules/auth/lib/mock-data.ts", // Mock data for authentication
+        // Better Auth instance + wiring — exercised by the integration suite (real Postgres), not unit
+        // tests, so they are excluded from the unit-coverage gate below (ENG-1054).
+        "modules/auth/lib/auth.ts",
+        "modules/auth/lib/auth-client.ts",
+        "modules/auth/lib/better-auth-email-verification.ts",
         "packages/js-core/src/index.ts", // JS Core index file
 
         // Other
         "**/scripts/**", // Utility scripts
+        "modules/auth/lib/cutover/**", // One-time ENG-1054 cutover migration scripts (run once, not app runtime)
         "**/*.mjs", // ES modules
       ],
+      thresholds: {
+        // ENG-1054: keep the new Better Auth code well-tested. Glob aggregate (not perFile) so a single
+        // thin file can't trip the gate; the integration-only BA instance/wiring is excluded above.
+        "modules/auth/lib/**": { statements: 80, branches: 80, functions: 80, lines: 80 },
+        // ENG-1718: keep the AuthZed client, projections, and backfill/repair tooling well-tested —
+        // this code rewrites the authorization graph. Glob aggregate (not perFile) so a single thin
+        // file can't trip the gate. `**/scripts/**` is excluded above, so every decision the tooling
+        // makes (argv parsing, scoping, classification, prune guards, exit codes) lives under
+        // lib/authzed and is covered here; apps/web/scripts/authzed-*.ts stay thin argv shims.
+        "lib/authzed/**": { statements: 80, branches: 80, functions: 80, lines: 80 },
+      },
     },
   },
   plugins: [tsconfigPaths(), react() as PluginOption],

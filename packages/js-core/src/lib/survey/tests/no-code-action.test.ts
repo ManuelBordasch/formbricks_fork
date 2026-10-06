@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/unbound-method -- mock functions are unbound */
 import { type Mock, type MockInstance, afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { Config } from "@/lib/common/config";
 import { checkSetup } from "@/lib/common/status";
@@ -51,7 +50,6 @@ vi.mock("@/lib/common/timeout-stack", () => ({
 }));
 
 vi.mock("@/lib/common/utils", async (importOriginal) => {
-  // eslint-disable-next-line @typescript-eslint/consistent-type-imports -- We need this only for type inference
   const actual = await importOriginal<typeof import("@/lib/common/utils")>();
   return {
     ...actual,
@@ -130,7 +128,7 @@ describe("no-code-event-listeners file", () => {
 
     const mockConfigValue = {
       get: vi.fn().mockReturnValue({
-        environment: {
+        workspace: {
           data: {
             actionClasses: [
               {
@@ -161,7 +159,7 @@ describe("no-code-event-listeners file", () => {
 
     const mockConfigValue = {
       get: vi.fn().mockReturnValue({
-        environment: {
+        workspace: {
           data: {
             actionClasses: [
               {
@@ -360,8 +358,11 @@ describe("no-code-event-listeners file", () => {
 
     test("addExitIntentListener does not add if document is undefined", () => {
       vi.stubGlobal("document", undefined);
-      addExitIntentListener();
-      // No explicit expect, passes if no error. querySelector would not be called.
+      expect(() => {
+        addExitIntentListener();
+      }).not.toThrow();
+      expect(querySelectorMock).not.toHaveBeenCalled();
+      expect(addEventListenerMock).not.toHaveBeenCalled();
     });
 
     test("addExitIntentListener does not add if body is not found", () => {
@@ -378,7 +379,7 @@ describe("no-code-event-listeners file", () => {
       };
       const mockConfigValue = {
         get: vi.fn().mockReturnValue({
-          environment: { data: { actionClasses: [mockAction] } },
+          workspace: { data: { actionClasses: [mockAction] } },
         }),
       };
       getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
@@ -426,8 +427,9 @@ describe("no-code-event-listeners file", () => {
 
     test("addScrollDepthListener does not add if window is undefined", () => {
       vi.stubGlobal("window", undefined);
-      addScrollDepthListener();
-      // No explicit expect. Passes if no error.
+      expect(() => {
+        addScrollDepthListener();
+      }).not.toThrow();
     });
 
     test("addScrollDepthListener does not re-add listener if already added", () => {
@@ -442,7 +444,7 @@ describe("no-code-event-listeners file", () => {
     test("checkScrollDepth does nothing if no fiftyPercentScroll actions", async () => {
       const mockConfigValue = {
         get: vi.fn().mockReturnValue({
-          environment: { data: { actionClasses: [] } },
+          workspace: { data: { actionClasses: [] } },
         }),
       };
       getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
@@ -465,7 +467,7 @@ describe("no-code-event-listeners file", () => {
       };
       const mockConfigValue = {
         get: vi.fn().mockReturnValue({
-          environment: { data: { actionClasses: [mockAction] } },
+          workspace: { data: { actionClasses: [mockAction] } },
         }),
       };
       getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
@@ -499,7 +501,7 @@ describe("no-code-event-listeners file", () => {
       };
       const mockConfigValue = {
         get: vi.fn().mockReturnValue({
-          environment: { data: { actionClasses: [mockActionValid, mockActionInvalid] } },
+          workspace: { data: { actionClasses: [mockActionValid, mockActionInvalid] } },
         }),
       };
       getInstanceConfigMock.mockReturnValue(mockConfigValue as unknown as Config);
@@ -531,7 +533,7 @@ describe("checkPageUrl additional cases", () => {
 
     const mockConfigValue = {
       get: vi.fn().mockReturnValue({
-        environment: {
+        workspace: {
           data: {
             actionClasses: [
               {
@@ -558,7 +560,7 @@ describe("checkPageUrl additional cases", () => {
     (handleUrlFilters as Mock).mockReturnValue(false); // Invalid URL
     const mockConfigValue = {
       get: vi.fn().mockReturnValue({
-        environment: {
+        workspace: {
           data: {
             actionClasses: [
               {
@@ -593,11 +595,9 @@ describe("checkPageUrl additional cases", () => {
 describe("addPageUrlEventListeners additional cases", () => {
   test("addPageUrlEventListeners does not add listeners if window is undefined", () => {
     vi.stubGlobal("window", undefined);
-    addPageUrlEventListeners(); // Call the function
-    // No explicit expect needed, the test passes if no error is thrown
-    // and no listeners were attempted to be added to an undefined window.
-    // We can also assert that isHistoryPatched remains false if it's exported and settable for testing.
-    // For now, we assume it's an internal detail not directly testable without more mocks.
+    expect(() => {
+      addPageUrlEventListeners();
+    }).not.toThrow();
   });
 
   test("addPageUrlEventListeners does not re-add listeners if already added", () => {
@@ -670,15 +670,18 @@ describe("addPageUrlEventListeners additional cases", () => {
 describe("removePageUrlEventListeners additional cases", () => {
   test("removePageUrlEventListeners does nothing if window is undefined", () => {
     vi.stubGlobal("window", undefined);
-    removePageUrlEventListeners();
-    // No explicit expect. Passes if no error.
+    expect(() => {
+      removePageUrlEventListeners();
+    }).not.toThrow();
   });
 
   test("removePageUrlEventListeners does nothing if listeners were not added", () => {
     const removeEventListenerMock = vi.fn();
     vi.stubGlobal("window", { removeEventListener: removeEventListenerMock });
     // Assuming listeners are not added yet (arePageUrlEventListenersAdded is false)
-    removePageUrlEventListeners();
+    expect(() => {
+      removePageUrlEventListeners();
+    }).not.toThrow();
     (window.removeEventListener as Mock).mockRestore();
   });
 });
@@ -709,9 +712,12 @@ describe("time on page action handling", () => {
     clearTimeOnPageTimers();
   });
 
-  const createConfigWithTimeOnPageAction = (actionName: string, timeInSeconds: number) => ({
+  const createConfigWithTimeOnPageAction = (
+    actionName: string,
+    timeInSeconds: number
+  ): { get: Mock; update: Mock } => ({
     get: vi.fn().mockReturnValue({
-      environment: {
+      workspace: {
         data: {
           actionClasses: [
             {

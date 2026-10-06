@@ -1,7 +1,13 @@
 "use client";
 
 import { createId } from "@paralleldrive/cuid2";
-import { FingerprintIcon, MonitorSmartphoneIcon, TagIcon, Users2Icon } from "lucide-react";
+import {
+  FingerprintIcon,
+  MonitorSmartphoneIcon,
+  MousePointerClickIcon,
+  TagIcon,
+  Users2Icon,
+} from "lucide-react";
 import React, { type JSX, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TContactAttributeDataType, TContactAttributeKey } from "@formbricks/types/contact-attribute-key";
@@ -10,6 +16,7 @@ import type {
   TSegment,
   TSegmentAttributeFilter,
   TSegmentPersonFilter,
+  TSegmentSurveyInteractionFilter,
 } from "@formbricks/types/segment";
 import { cn } from "@/lib/cn";
 import { getContactAttributeDataTypeIcon } from "@/modules/ee/contacts/utils";
@@ -27,7 +34,7 @@ interface TAddFilterModalProps {
   segments: TSegment[];
 }
 
-type TFilterType = "attribute" | "segment" | "device" | "person";
+type TFilterType = "attribute" | "segment" | "device" | "person" | "surveyInteraction";
 
 export const handleAddFilter = ({
   type,
@@ -144,6 +151,21 @@ export const handleAddFilter = ({
     onAddFilter(newFilter);
     setOpen(false);
   }
+
+  if (type === "surveyInteraction") {
+    // Created fully valid and pre-filled (operator "haveSeen", any survey, within 1 month) — the
+    // schema requires a valid operator, so an empty "Select…" intermediate state cannot be
+    // persisted. Matches how every other filter type is created pre-filled.
+    const newFilterResource: TSegmentSurveyInteractionFilter = {
+      id: createId(),
+      root: { type: "surveyInteraction" },
+      qualifier: { operator: "haveSeen" },
+      value: { surveyScope: "any", surveyIds: [], within: { amount: 1, unit: "months" } },
+    };
+
+    onAddFilter({ id: createId(), connector: "and", resource: newFilterResource });
+    setOpen(false);
+  }
 };
 
 export function AddFilterModal({
@@ -165,41 +187,52 @@ export function AddFilterModal({
     { id: "all", label: t("common.all") },
     {
       id: "attributes",
-      label: t("environments.segments.person_and_attributes"),
-      icon: <TagIcon className="h-4 w-4" />,
+      label: t("workspace.segments.person_and_attributes"),
+      icon: <TagIcon className="size-4" />,
     },
-    { id: "segments", label: t("common.segments"), icon: <Users2Icon className="h-4 w-4" /> },
+    { id: "segments", label: t("common.segments"), icon: <Users2Icon className="size-4" /> },
     {
       id: "devices",
-      label: t("environments.segments.devices"),
-      icon: <MonitorSmartphoneIcon className="h-4 w-4" />,
+      label: t("workspace.segments.devices"),
+      icon: <MonitorSmartphoneIcon className="size-4" />,
     },
   ];
 
   const devices = useMemo(
     () => [
-      { id: "phone", name: t("environments.segments.phone") },
-      { id: "desktop", name: t("environments.segments.desktop") },
+      { id: "phone", name: t("workspace.segments.phone") },
+      { id: "desktop", name: t("workspace.segments.desktop") },
     ],
     [t]
   );
 
+  const contactAttributeKeysForPicker = useMemo(() => {
+    // `userId` is represented by the person filter (fingerprint icon), so hide it from attribute entries.
+    return contactAttributeKeys.filter((attributeKey) => attributeKey.key !== "userId");
+  }, [contactAttributeKeys]);
+
   const contactAttributeKeysFiltered = useMemo(() => {
-    if (!contactAttributeKeys) return [];
+    if (!contactAttributeKeysForPicker) return [];
 
-    if (!searchValue) return contactAttributeKeys;
+    if (!searchValue) return contactAttributeKeysForPicker;
 
-    return contactAttributeKeys.filter((attributeKey) => {
+    return contactAttributeKeysForPicker.filter((attributeKey) => {
       const attributeValueToSeach = attributeKey.name ?? attributeKey.key;
       return attributeValueToSeach.toLowerCase().includes(searchValue.toLowerCase());
     });
-  }, [contactAttributeKeys, searchValue]);
+  }, [contactAttributeKeysForPicker, searchValue]);
 
   const contactAttributeFiltered = useMemo(() => {
-    const contactAttributes = [{ name: "userId" }];
+    const personIdentifiers = [{ id: "userId", label: t("common.user_id") }];
 
-    return contactAttributes.filter((ca) => ca.name.toLowerCase().includes(searchValue.toLowerCase()));
-  }, [searchValue]);
+    return personIdentifiers.filter((personIdentifier) => {
+      const query = searchValue.toLowerCase();
+      return (
+        personIdentifier.id.toLowerCase().includes(query) ||
+        personIdentifier.label.toLowerCase().includes(query)
+      );
+    });
+  }, [searchValue, t]);
 
   const segmentsFiltered = useMemo(() => {
     if (!segments) return [];
@@ -217,6 +250,12 @@ export function AddFilterModal({
     return devices.filter((deviceType) => deviceType.name.toLowerCase().includes(searchValue.toLowerCase()));
   }, [devices, searchValue]);
 
+  const surveyInteractionLabel = t("workspace.segments.survey_interaction");
+  const showSurveyInteraction = useMemo(() => {
+    if (!searchValue) return true;
+    return surveyInteractionLabel.toLowerCase().includes(searchValue.toLowerCase());
+  }, [searchValue, surveyInteractionLabel]);
+
   const allFiltersFiltered = useMemo(
     () => [
       {
@@ -224,9 +263,16 @@ export function AddFilterModal({
         contactAttributeFiltered,
         segments: segmentsFiltered,
         devices: deviceTypesFiltered,
+        surveyInteraction: showSurveyInteraction,
       },
     ],
-    [contactAttributeKeysFiltered, deviceTypesFiltered, contactAttributeFiltered, segmentsFiltered]
+    [
+      contactAttributeKeysFiltered,
+      deviceTypesFiltered,
+      contactAttributeFiltered,
+      segmentsFiltered,
+      showSurveyInteraction,
+    ]
   );
 
   const getAllTabContent = () => {
@@ -237,11 +283,12 @@ export function AddFilterModal({
             filterArr.attributes.length === 0 &&
             filterArr.segments.length === 0 &&
             filterArr.devices.length === 0 &&
-            filterArr.contactAttributeFiltered.length === 0
+            filterArr.contactAttributeFiltered.length === 0 &&
+            !filterArr.surveyInteraction
           );
         }) ? (
           <div className="flex w-full items-center justify-center gap-4 rounded-lg px-2 py-1 text-sm">
-            <p>{t("environments.segments.no_filters_yet")}</p>
+            <p>{t("workspace.segments.no_filters_yet")}</p>
           </div>
         ) : null}
 
@@ -283,10 +330,10 @@ export function AddFilterModal({
 
             {filters.contactAttributeFiltered.map((personAttribute) => (
               <FilterButton
-                key={personAttribute.name}
-                data-testid={`filter-btn-person-${personAttribute.name}`}
-                icon={<FingerprintIcon className="h-4 w-4" />}
-                label={personAttribute.name}
+                key={personAttribute.id}
+                data-testid={`filter-btn-person-${personAttribute.id}`}
+                icon={<FingerprintIcon className="size-4" />}
+                label={personAttribute.label}
                 onClick={() => {
                   handleAddFilter({
                     type: "person",
@@ -307,11 +354,28 @@ export function AddFilterModal({
               />
             ))}
 
+            {filters.surveyInteraction ? (
+              <FilterButton
+                data-testid="filter-btn-survey-interaction"
+                icon={<MousePointerClickIcon className="size-4" />}
+                label={surveyInteractionLabel}
+                onClick={() => {
+                  handleAddFilter({ type: "surveyInteraction", onAddFilter, setOpen });
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    handleAddFilter({ type: "surveyInteraction", onAddFilter, setOpen });
+                  }
+                }}
+              />
+            ) : null}
+
             {filters.segments.map((segment) => (
               <FilterButton
                 key={segment.id}
                 data-testid={`filter-btn-segment-${segment.id}`}
-                icon={<Users2Icon className="h-4 w-4" />}
+                icon={<Users2Icon className="size-4" />}
                 label={segment.title}
                 onClick={() => {
                   handleAddFilter({
@@ -339,7 +403,7 @@ export function AddFilterModal({
               <FilterButton
                 key={deviceType.id}
                 data-testid={`filter-btn-device-${deviceType.id}`}
-                icon={<MonitorSmartphoneIcon className="h-4 w-4" />}
+                icon={<MonitorSmartphoneIcon className="size-4" />}
                 label={deviceType.name}
                 onClick={() => {
                   handleAddFilter({
@@ -384,7 +448,7 @@ export function AddFilterModal({
       <>
         {segmentsFiltered.length === 0 && (
           <div className="flex w-full items-center justify-center gap-4 rounded-lg px-2 py-1 text-sm">
-            <p>{t("environments.segments.no_segments_yet")}</p>
+            <p>{t("workspace.segments.no_segments_yet")}</p>
           </div>
         )}
         {segmentsFiltered
@@ -393,7 +457,7 @@ export function AddFilterModal({
             <FilterButton
               key={segment.id}
               data-testid={`filter-btn-segment-${segment.id}`}
-              icon={<Users2Icon className="h-4 w-4" />}
+              icon={<Users2Icon className="size-4" />}
               label={segment.title}
               onClick={() => {
                 handleAddFilter({
@@ -427,7 +491,7 @@ export function AddFilterModal({
           <FilterButton
             key={deviceType.id}
             data-testid={`filter-btn-device-${deviceType.id}`}
-            icon={<MonitorSmartphoneIcon className="h-4 w-4" />}
+            icon={<MonitorSmartphoneIcon className="size-4" />}
             label={deviceType.name}
             onClick={() => {
               handleAddFilter({
@@ -454,7 +518,7 @@ export function AddFilterModal({
     );
   };
 
-  const TabContent = (): JSX.Element => {
+  const getTabContent = (): JSX.Element => {
     switch (activeTabId) {
       case "all": {
         return getAllTabContent();
@@ -494,9 +558,7 @@ export function AddFilterModal({
               <TabBar activeId={activeTabId} className="bg-white" setActiveId={setActiveTabId} tabs={tabs} />
             </div>
 
-            <div className={cn("mt-2 flex flex-col gap-1 overflow-y-auto")}>
-              <TabContent />
-            </div>
+            <div className={cn("mt-2 flex flex-col gap-1 overflow-y-auto")}>{getTabContent()}</div>
           </div>
         </DialogBody>
       </DialogContent>

@@ -12,6 +12,10 @@ vi.mock("@/modules/api/v2/lib/utils", () => ({
   logApiRequest: vi.fn(),
 }));
 
+vi.mock("@/lib/posthog", () => ({
+  capturePostHogEvent: vi.fn(),
+}));
+
 describe("authenticatedApiClient", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -89,5 +93,33 @@ describe("authenticatedApiClient", () => {
       undefined,
       thrownError
     );
+  });
+
+  test("forwards allowOrganizationOnlyApiKey to apiWrapper", async () => {
+    const request = new Request("http://localhost", {
+      headers: { "x-api-key": "valid-api-key" },
+    });
+
+    vi.mocked(apiWrapper).mockResolvedValue(new Response("ok", { status: 200 }));
+    vi.mocked(logApiRequest).mockReturnValue();
+
+    const handler = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }));
+    await authenticatedApiClient({ request, handler, allowOrganizationOnlyApiKey: true });
+
+    expect(apiWrapper).toHaveBeenCalledWith(expect.objectContaining({ allowOrganizationOnlyApiKey: true }));
+  });
+
+  test("defaults allowOrganizationOnlyApiKey to false when omitted", async () => {
+    const request = new Request("http://localhost", {
+      headers: { "x-api-key": "valid-api-key" },
+    });
+
+    vi.mocked(apiWrapper).mockResolvedValue(new Response("ok", { status: 200 }));
+    vi.mocked(logApiRequest).mockReturnValue();
+
+    const handler = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }));
+    await authenticatedApiClient({ request, handler });
+
+    expect(apiWrapper).toHaveBeenCalledWith(expect.objectContaining({ allowOrganizationOnlyApiKey: false }));
   });
 });

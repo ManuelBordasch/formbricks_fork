@@ -1,21 +1,25 @@
 import { notFound } from "next/navigation";
-import { OrganizationSettingsNavbar } from "@/app/(app)/environments/[environmentId]/settings/(organization)/components/OrganizationSettingsNavbar";
 import { IS_FORMBRICKS_CLOUD } from "@/lib/constants";
-import { getMonthlyOrganizationResponseCount } from "@/lib/organization/service";
-import { getOrganizationProjectsCount } from "@/lib/project/service";
+import { env } from "@/lib/env";
+import {
+  getMonthlyOrganizationResponseCount,
+  getMonthlyOrganizationWorkflowRunCount,
+} from "@/lib/organization/service";
+import { getPostHogFeatureFlag } from "@/lib/posthog/get-feature-flag";
+import { getOrganizationWorkspacesCount } from "@/lib/workspace/service";
 import { getTranslate } from "@/lingodotdev/server";
 import { getCloudBillingDisplayContext } from "@/modules/ee/billing/lib/cloud-billing-display";
 import { getStripeBillingCatalogDisplay } from "@/modules/ee/billing/lib/stripe-billing-catalog";
-import { getEnvironmentAuth } from "@/modules/environments/lib/utils";
+import { getOrganizationAuth } from "@/modules/organization/lib/utils";
 import { PageContentWrapper } from "@/modules/ui/components/page-content-wrapper";
 import { PageHeader } from "@/modules/ui/components/page-header";
 import { PricingTable } from "./components/pricing-table";
 
-export const PricingPage = async (props: { params: Promise<{ environmentId: string }> }) => {
+export const PricingPage = async (props: { params: Promise<{ organizationId: string }> }) => {
   const params = await props.params;
   const t = await getTranslate();
 
-  const { organization, isMember, currentUserMembership } = await getEnvironmentAuth(params.environmentId);
+  const { organization, isMember, session } = await getOrganizationAuth(params.organizationId);
 
   if (!IS_FORMBRICKS_CLOUD) {
     notFound();
@@ -31,29 +35,26 @@ export const PricingPage = async (props: { params: Promise<{ environmentId: stri
     billing: cloudBillingDisplayContext.billing,
   };
 
-  const [responseCount, projectCount] = await Promise.all([
+  const [responseCount, workspaceCount, workflowRunCount, planComparisonFlag] = await Promise.all([
     getMonthlyOrganizationResponseCount(organization.id),
-    getOrganizationProjectsCount(organization.id),
+    getOrganizationWorkspacesCount(organization.id),
+    getMonthlyOrganizationWorkflowRunCount(organization.id),
+    getPostHogFeatureFlag(session.user.id, "a-b_billing_plan-comparison-table"),
   ]);
 
   const hasBillingRights = !isMember;
 
   return (
     <PageContentWrapper>
-      <PageHeader pageTitle={t("environments.settings.general.organization_settings")}>
-        <OrganizationSettingsNavbar
-          environmentId={params.environmentId}
-          isFormbricksCloud={IS_FORMBRICKS_CLOUD}
-          membershipRole={currentUserMembership?.role}
-          activeId="billing"
-        />
-      </PageHeader>
+      <PageHeader pageTitle={t("common.billing")} />
 
       <PricingTable
+        userId={session.user.id}
         organization={organizationWithSyncedBilling}
-        environmentId={params.environmentId}
         responseCount={responseCount}
-        projectCount={projectCount}
+        workspaceCount={workspaceCount}
+        workflowRunCount={workflowRunCount}
+        isPlanComparison={planComparisonFlag === "test"}
         hasBillingRights={hasBillingRights}
         currentCloudPlan={cloudBillingDisplayContext.currentCloudPlan}
         currentBillingInterval={cloudBillingDisplayContext.currentBillingInterval}
@@ -64,6 +65,7 @@ export const PricingPage = async (props: { params: Promise<{ environmentId: stri
         isStripeSetupIncomplete={!organizationWithSyncedBilling.billing.stripeCustomerId}
         trialDaysRemaining={cloudBillingDisplayContext.trialDaysRemaining}
         billingCatalog={billingCatalog}
+        stripePublishableKey={env.STRIPE_PUBLISHABLE_KEY ?? null}
       />
     </PageContentWrapper>
   );

@@ -129,6 +129,11 @@ export class RecallNode extends DecoratorNode<ReactNode> {
     writable.__fallbackValue = fallbackValue;
   }
 
+  setRecallItemLabel(label: string): void {
+    const writable = this.getWritable();
+    writable.__recallItem = { ...writable.__recallItem, label };
+  }
+
   getTextContent(): string {
     return `#recall:${this.__recallItem.id}/fallback:${this.__fallbackValue}#`;
   }
@@ -138,7 +143,7 @@ export class RecallNode extends DecoratorNode<ReactNode> {
 
     return (
       <span
-        className="recall-node z-30 inline-flex h-fit justify-center whitespace-nowrap rounded-md bg-slate-100 text-sm text-slate-700"
+        className="recall-node z-30 inline-flex h-fit justify-center rounded-md bg-slate-100 text-sm whitespace-nowrap text-slate-700"
         aria-label={`Recall: ${displayLabel}`}
         title={displayLabel}>
         @{displayLabel}

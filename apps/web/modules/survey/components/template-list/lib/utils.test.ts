@@ -8,16 +8,17 @@ import { replacePresetPlaceholders } from "@/lib/utils/templates";
 import { getChannelMapping, getIndustryMapping, getRoleMapping } from "./utils";
 
 vi.mock("@/lib/pollyfills/structuredClone", () => ({
-  structuredClone: vi.fn((val) => JSON.parse(JSON.stringify(val))),
+  structuredClone: vi.fn((val) => globalThis.structuredClone(val)),
 }));
 
 describe("Template utils", () => {
-  test("replacePresetPlaceholders replaces project name in template with blocks", () => {
+  test("replacePresetPlaceholders replaces workspace name in template with blocks", () => {
     const mockTemplate: TTemplate = {
+      id: "test-template",
       name: "Test Template",
       description: "Template description",
       preset: {
-        name: "$[projectName] Feedback",
+        name: "$[workspaceName] Feedback",
         welcomeCard: { enabled: false, timeToFinish: false, showResponseCount: false },
         blocks: [
           {
@@ -28,7 +29,7 @@ describe("Template utils", () => {
                 id: "elem1",
                 type: "openText",
                 headline: {
-                  default: "How would you rate $[projectName]?",
+                  default: "How would you rate $[workspaceName]?",
                 },
                 required: false,
                 inputType: "text",
@@ -41,15 +42,15 @@ describe("Template utils", () => {
       } as any,
     };
 
-    const mockProject = {
-      name: "TestProject",
+    const mockWorkspace = {
+      name: "TestWorkspace",
     };
 
-    const result = replacePresetPlaceholders(mockTemplate, mockProject);
+    const result = replacePresetPlaceholders(mockTemplate, mockWorkspace);
 
     expect(structuredClone).toHaveBeenCalledWith(mockTemplate.preset);
-    expect(result.preset.name).toBe("TestProject Feedback");
-    expect(result.preset.blocks[0].elements[0].headline?.default).toBe("How would you rate TestProject?");
+    expect(result.preset.name).toBe("TestWorkspace Feedback");
+    expect(result.preset.blocks[0].elements[0].headline?.default).toBe("How would you rate TestWorkspace?");
   });
 
   test("getChannelMapping returns correct channel mappings", () => {
@@ -89,10 +90,10 @@ describe("Template utils", () => {
 
     expect(result).toEqual([
       { value: "productManager", label: "common.product_manager" },
-      { value: "customerSuccess", label: "common.customer_success" },
       { value: "marketing", label: "common.marketing" },
-      { value: "sales", label: "common.sales" },
+      { value: "customerSuccess", label: "common.customer_success" },
       { value: "peopleManager", label: "common.people_manager" },
+      { value: "sales", label: "common.sales" },
     ]);
     expect(mockT).toHaveBeenCalledWith("common.product_manager");
     expect(mockT).toHaveBeenCalledWith("common.customer_success");

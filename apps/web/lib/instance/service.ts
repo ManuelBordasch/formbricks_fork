@@ -1,7 +1,7 @@
 import "server-only";
-import { Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { DatabaseError } from "@formbricks/types/errors";
 
 // Function to check if there are any users in the database
@@ -19,7 +19,7 @@ export const getIsFreshInstance = reactCache(async (): Promise<boolean> => {
 });
 
 // Function to check if there are any organizations in the database
-export const gethasNoOrganizations = reactCache(async (): Promise<boolean> => {
+export const getHasNoOrganizations = reactCache(async (): Promise<boolean> => {
   try {
     const organizationCount = await prisma.organization.count();
     return organizationCount === 0;

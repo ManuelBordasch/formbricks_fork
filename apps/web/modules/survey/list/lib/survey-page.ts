@@ -1,13 +1,18 @@
 import "server-only";
-import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { logger } from "@formbricks/logger";
 import { DatabaseError, InvalidInputError } from "@formbricks/types/errors";
 import type { TSurveyFilterCriteria } from "@formbricks/types/surveys/types";
 import { buildWhereClause } from "@/modules/survey/lib/utils";
 import type { TSurvey } from "../types/surveys";
-import { type TSurveyRow, mapSurveyRowsToSurveys, surveySelect } from "./survey-record";
+import {
+  type TSurveyRow,
+  getResponseCountsBySurveyIds,
+  mapSurveyRowsToSurveys,
+  surveySelect,
+} from "./survey-record";
 
 const SURVEY_LIST_CURSOR_VERSION = 1 as const;
 const IN_PROGRESS_BUCKET = "inProgress" as const;
@@ -148,12 +153,12 @@ function buildStandardCursorWhere(
 }
 
 function buildBaseWhere(
-  environmentId: string,
+  workspaceId: string,
   filterCriteria?: TSurveyFilterCriteria,
   extraWhere?: Prisma.SurveyWhereInput
 ): Prisma.SurveyWhereInput {
   return {
-    environmentId,
+    workspaceId,
     ...buildWhereClause(filterCriteria),
     ...extraWhere,
   };
@@ -197,7 +202,7 @@ function getRelevanceNextCursor(survey: TSurveyRow, bucket: TRelevanceBucket): T
 }
 
 async function findSurveyRows(
-  environmentId: string,
+  workspaceId: string,
   limit: number,
   sortBy: TStandardSurveyListSort,
   filterCriteria?: TSurveyFilterCriteria,
@@ -207,7 +212,7 @@ async function findSurveyRows(
   const cursorWhere = cursor ? buildStandardCursorWhere(sortBy, cursor) : undefined;
 
   return prisma.survey.findMany({
-    where: buildBaseWhere(environmentId, filterCriteria, {
+    where: buildBaseWhere(workspaceId, filterCriteria, {
       ...extraWhere,
       ...cursorWhere,
     }),
@@ -229,19 +234,24 @@ function getPageRows<T>(rows: T[], limit: number): { pageRows: T[]; hasMore: boo
   };
 }
 
-function buildSurveyListPage(rows: TSurveyRow[], cursor: TSurveyListPageCursor | null): TSurveyListPage {
+async function buildSurveyListPage(
+  rows: TSurveyRow[],
+  cursor: TSurveyListPageCursor | null
+): Promise<TSurveyListPage> {
+  const responseCountsBySurveyId = await getResponseCountsBySurveyIds(rows.map((survey) => survey.id));
+
   return {
-    surveys: mapSurveyRowsToSurveys(rows),
+    surveys: mapSurveyRowsToSurveys(rows, responseCountsBySurveyId),
     nextCursor: cursor ? encodeSurveyListPageCursor(cursor) : null,
   };
 }
 
 async function getStandardSurveyListPage(
-  environmentId: string,
+  workspaceId: string,
   options: TGetSurveyListPageOptions & { sortBy: TStandardSurveyListSort }
 ): Promise<TSurveyListPage> {
   const surveyRows = await findSurveyRows(
-    environmentId,
+    workspaceId,
     options.limit,
     options.sortBy,
     options.filterCriteria,
@@ -251,14 +261,14 @@ async function getStandardSurveyListPage(
   const { pageRows, hasMore } = getPageRows(surveyRows, options.limit);
   const lastRow = getLastSurveyRow(pageRows);
 
-  return buildSurveyListPage(
+  return await buildSurveyListPage(
     pageRows,
     hasMore && lastRow ? getStandardNextCursor(lastRow, options.sortBy) : null
   );
 }
 
 async function findRelevanceRows(
-  environmentId: string,
+  workspaceId: string,
   limit: number,
   filterCriteria: TSurveyFilterCriteria | undefined,
   bucket: TRelevanceBucket,
@@ -271,7 +281,7 @@ async function findRelevanceRows(
     : undefined;
 
   return prisma.survey.findMany({
-    where: buildBaseWhere(environmentId, filterCriteria, {
+    where: buildBaseWhere(workspaceId, filterCriteria, {
       ...statusWhere,
       ...cursorWhere,
     }),
@@ -282,10 +292,10 @@ async function findRelevanceRows(
 }
 
 async function hasMoreRelevanceRowsInOtherBucket(
-  environmentId: string,
+  workspaceId: string,
   filterCriteria?: TSurveyFilterCriteria
 ): Promise<boolean> {
-  const otherRows = await findRelevanceRows(environmentId, 1, filterCriteria, OTHER_BUCKET, null);
+  const otherRows = await findRelevanceRows(workspaceId, 1, filterCriteria, OTHER_BUCKET, null);
   return otherRows.length > 0;
 }
 
@@ -308,20 +318,23 @@ function shouldReadInProgressBucket(cursor: TRelevanceSurveyListCursor | null): 
   return !cursor || cursor.bucket === IN_PROGRESS_BUCKET;
 }
 
-function buildRelevancePage(rows: TSurveyRow[], bucket: TRelevanceBucket | null): TSurveyListPage {
+async function buildRelevancePage(
+  rows: TSurveyRow[],
+  bucket: TRelevanceBucket | null
+): Promise<TSurveyListPage> {
   const lastRow = getLastSurveyRow(rows);
 
-  return buildSurveyListPage(rows, bucket && lastRow ? getRelevanceNextCursor(lastRow, bucket) : null);
+  return await buildSurveyListPage(rows, bucket && lastRow ? getRelevanceNextCursor(lastRow, bucket) : null);
 }
 
 async function getInProgressRelevanceStep(
-  environmentId: string,
+  workspaceId: string,
   limit: number,
   filterCriteria: TSurveyFilterCriteria | undefined,
   cursor: TRelevanceSurveyListCursor | null
 ): Promise<{ pageRows: TSurveyRow[]; remaining: number; response: TSurveyListPage | null }> {
   const inProgressRows = await findRelevanceRows(
-    environmentId,
+    workspaceId,
     limit,
     filterCriteria,
     IN_PROGRESS_BUCKET,
@@ -332,12 +345,12 @@ async function getInProgressRelevanceStep(
   return {
     pageRows,
     remaining: limit - pageRows.length,
-    response: hasMore ? buildRelevancePage(pageRows, IN_PROGRESS_BUCKET) : null,
+    response: hasMore ? await buildRelevancePage(pageRows, IN_PROGRESS_BUCKET) : null,
   };
 }
 
 async function buildInProgressOnlyRelevancePage(
-  environmentId: string,
+  workspaceId: string,
   rows: TSurveyRow[],
   filterCriteria: TSurveyFilterCriteria | undefined,
   cursor: TRelevanceSurveyListCursor | null
@@ -345,13 +358,13 @@ async function buildInProgressOnlyRelevancePage(
   const hasOtherRows =
     rows.length > 0 &&
     shouldReadInProgressBucket(cursor) &&
-    (await hasMoreRelevanceRowsInOtherBucket(environmentId, filterCriteria));
+    (await hasMoreRelevanceRowsInOtherBucket(workspaceId, filterCriteria));
 
-  return buildRelevancePage(rows, hasOtherRows ? IN_PROGRESS_BUCKET : null);
+  return await buildRelevancePage(rows, hasOtherRows ? IN_PROGRESS_BUCKET : null);
 }
 
 async function getRelevanceSurveyListPage(
-  environmentId: string,
+  workspaceId: string,
   options: TGetSurveyListPageOptions & { sortBy: "relevance" }
 ): Promise<TSurveyListPage> {
   const relevanceCursor = getRelevanceCursor(options.cursor);
@@ -360,7 +373,7 @@ async function getRelevanceSurveyListPage(
 
   if (shouldReadInProgressBucket(relevanceCursor)) {
     const inProgressStep = await getInProgressRelevanceStep(
-      environmentId,
+      workspaceId,
       remaining,
       options.filterCriteria,
       relevanceCursor
@@ -376,7 +389,7 @@ async function getRelevanceSurveyListPage(
 
   if (remaining <= 0) {
     return await buildInProgressOnlyRelevancePage(
-      environmentId,
+      workspaceId,
       pageRows,
       options.filterCriteria,
       relevanceCursor
@@ -384,7 +397,7 @@ async function getRelevanceSurveyListPage(
   }
 
   const otherRows = await findRelevanceRows(
-    environmentId,
+    workspaceId,
     remaining,
     options.filterCriteria,
     OTHER_BUCKET,
@@ -393,22 +406,22 @@ async function getRelevanceSurveyListPage(
   const { pageRows: otherPageRows, hasMore: hasMoreOther } = getPageRows(otherRows, remaining);
   pageRows.push(...otherPageRows);
 
-  return buildRelevancePage(pageRows, hasMoreOther ? OTHER_BUCKET : null);
+  return await buildRelevancePage(pageRows, hasMoreOther ? OTHER_BUCKET : null);
 }
 
 export async function getSurveyListPage(
-  environmentId: string,
+  workspaceId: string,
   options: TGetSurveyListPageOptions
 ): Promise<TSurveyListPage> {
   try {
     if (options.sortBy === "relevance") {
-      return await getRelevanceSurveyListPage(environmentId, {
+      return await getRelevanceSurveyListPage(workspaceId, {
         ...options,
         sortBy: "relevance",
       });
     }
 
-    return await getStandardSurveyListPage(environmentId, {
+    return await getStandardSurveyListPage(workspaceId, {
       ...options,
       sortBy: options.sortBy,
     });

@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-empty-function -- required for singleton pattern */
 import { Config } from "@/lib/common/config";
 import { Logger } from "@/lib/common/logger";
 import { sendUpdates } from "@/lib/user/update";
@@ -184,7 +183,7 @@ export class UpdateQueue {
           logger.error(
             `Failed to process updates: ${error instanceof Error ? error.message : "Unknown error"}`
           );
-          reject(error as Error);
+          reject(error instanceof Error ? error : new Error(String(error)));
         }
       };
 

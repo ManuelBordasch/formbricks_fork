@@ -17,7 +17,6 @@
   color utility to any element that depends on these defaults.
 */
 @layer base {
-
   #fbjs *,
   #fbjs ::after,
   #fbjs ::before,
@@ -26,7 +25,6 @@
     border-color: var(--color-gray-200, currentcolor);
   }
 }
-
 
 /* Chrome, Edge, and Safari */
 #fbjs *::-webkit-scrollbar {
@@ -52,9 +50,27 @@
 
 /* this is for styling the HtmlBody component */
 #fbjs .htmlbody {
-  @apply block text-sm font-normal leading-6;
+  @apply block text-sm leading-6 font-normal;
   /* need to use !important because in packages/survey-ui/components/editor/styles-editor-frontend.css the color is defined for some classes */
   color: var(--fb-subheading-color) !important;
+}
+
+/*
+ * Keep bold (<strong>/<b>) inside rich text actually bold. The headline /
+ * description font-weight rules injected by styles.ts target every descendant
+ * (`.label-headline *`), which would otherwise flatten bold spans to the base
+ * weight and erase the contrast between bold and non-bold text. Higher
+ * specificity + !important wins over those runtime rules.
+ */
+#fbjs .label-headline strong,
+#fbjs .label-headline b,
+#fbjs .label-description strong,
+#fbjs .label-description b,
+#fbjs .text-subheading strong,
+#fbjs .text-subheading b,
+#fbjs .htmlbody strong,
+#fbjs .htmlbody b {
+  font-weight: 700 !important;
 }
 
 /*
@@ -69,7 +85,7 @@
 #fbjs [data-variant="description"] ol {
   list-style-position: outside;
   margin: 0.5em 0;
-  padding-left: 1.5em;
+  padding-inline-start: 1.5em;
 }
 #fbjs .htmlbody ul,
 #fbjs [data-variant="headline"] ul,
@@ -86,6 +102,14 @@
 #fbjs [data-variant="description"] li {
   margin: 0.25em 0;
 }
+/*
+ * The rules above are the fallback for list markup without the editor's theme classes. Rich text
+ * authored in the app carries them, and its geometry (1.5em per level, no item margins, no marker
+ * on the .fb-editor-nested-listitem wrapper Lexical puts around a nested list) comes from the
+ * editor stylesheet that lib/styles.ts injects right after this file — one definition shared with
+ * the editor itself. Source of truth for those class names:
+ * apps/web/modules/ui/components/editor/lib/example-theme.ts
+ */
 
 /* without this, it wont override the color */
 #fbjs p.editor-paragraph {
@@ -95,7 +119,7 @@
 /* theming */
 #fbjs {
   font-size: 16px;
-  --brand-default: #64748b;
+  --brand-default: #1e40af;
   --slate-50: rgb(248, 250, 252);
   --slate-100: rgb(241 245 249);
   --slate-200: rgb(226 232 240);
@@ -122,8 +146,10 @@
   --fb-subheading-color: var(--slate-700);
   --fb-placeholder-color: var(--slate-300);
   --fb-info-text-color: var(--slate-500);
-  --fb-signature-text-color: var(--slate-500);
-  --fb-branding-text-color: var(--slate-500);
+  /* slate-600, not slate-500: the branding line is 12px text and slate-500 on a white
+     card is 4.42:1 — just under the WCAG 1.4.3 AA 4.5:1 threshold (axe color-contrast). */
+  --fb-signature-text-color: var(--slate-600);
+  --fb-branding-text-color: var(--slate-600);
   --fb-survey-background-color: white;
   --fb-survey-border-color: var(--slate-50);
   --fb-accent-background-color: var(--slate-200);

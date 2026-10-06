@@ -8,7 +8,9 @@ import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { TSurveyQuota } from "@formbricks/types/quota";
 import { TSurvey, TSurveyVariable } from "@formbricks/types/surveys/types";
+import { validateId } from "@formbricks/types/surveys/validation";
 import { findVariableUsedInLogic, isUsedInQuota, isUsedInRecall } from "@/modules/survey/editor/lib/utils";
+import { getValidateIdErrorMessage } from "@/modules/survey/editor/lib/validation";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
 import { Button } from "@/modules/ui/components/button";
 import { FormControl, FormField, FormItem, FormProvider } from "@/modules/ui/components/form";
@@ -83,27 +85,24 @@ export const SurveyVariablesCardItem = ({
 
     if (elementIdx !== -1) {
       toast.error(
-        t(
-          "environments.surveys.edit.variable_is_used_in_logic_of_question_please_remove_it_from_logic_first",
-          {
-            variable: variableToDelete.name,
-            questionIndex: elementIdx + 1,
-          }
-        )
+        t("workspace.surveys.edit.variable_is_used_in_logic_of_question_please_remove_it_from_logic_first", {
+          variable: variableToDelete.name,
+          questionIndex: elementIdx + 1,
+        })
       );
       return;
     }
     const recallElementIdx = isUsedInRecall(localSurvey, variableToDelete.id);
     if (recallElementIdx === -2) {
       toast.error(
-        t("environments.surveys.edit.variable_used_in_recall_welcome", { variable: variableToDelete.name })
+        t("workspace.surveys.edit.variable_used_in_recall_welcome", { variable: variableToDelete.name })
       );
       return;
     }
 
     if (recallElementIdx === elements.length) {
       toast.error(
-        t("environments.surveys.edit.variable_used_in_recall_ending_card", {
+        t("workspace.surveys.edit.variable_used_in_recall_ending_card", {
           variable: variableToDelete.name,
         })
       );
@@ -112,7 +111,7 @@ export const SurveyVariablesCardItem = ({
 
     if (recallElementIdx !== -1) {
       toast.error(
-        t("environments.surveys.edit.variable_used_in_recall", {
+        t("workspace.surveys.edit.variable_used_in_recall", {
           variable: variableToDelete.name,
           questionIndex: recallElementIdx + 1,
         })
@@ -124,7 +123,7 @@ export const SurveyVariablesCardItem = ({
 
     if (quotaIdx !== -1) {
       toast.error(
-        t("environments.surveys.edit.variable_is_used_in_quota_please_remove_it_from_quota_first", {
+        t("workspace.surveys.edit.variable_is_used_in_quota_please_remove_it_from_quota_first", {
           variableName: variableToDelete.name,
           quotaName: quotas[quotaIdx].name,
         })
@@ -154,9 +153,7 @@ export const SurveyVariablesCardItem = ({
               editSurveyVariable(data);
             }
           })}>
-          {mode === "create" && (
-            <Label htmlFor="headline">{t("environments.surveys.edit.add_variable")}</Label>
-          )}
+          {mode === "create" && <Label htmlFor="headline">{t("workspace.surveys.edit.add_variable")}</Label>}
 
           <div className="mt-2 flex w-full items-center gap-2">
             {/* Name field: update on blur */}
@@ -164,31 +161,45 @@ export const SurveyVariablesCardItem = ({
               control={form.control}
               name="name"
               rules={{
-                pattern: {
-                  value: /^[a-z0-9_]+$/,
-                  message: t(
-                    "environments.surveys.edit.only_lower_case_letters_numbers_and_underscores_are_allowed"
-                  ),
-                },
                 validate: (value) => {
+                  /*
+                   * The same strict gate the server applies (ENG-1839), so an author learns here rather
+                   * than from an untranslated save error. `isSafeIdentifier` alone was not enough:
+                   * `country` satisfies it, so a variable named after an auto-captured system field was
+                   * accepted by the editor and only refused by `validateNewDeclaredFieldNames` at save
+                   * time. Same call shape as `hidden-fields-card.tsx`, so the two cards cannot drift.
+                   *
+                   * Empty id lists on purpose: `validateId`'s duplicate check would pre-empt this
+                   * card's own duplicate messages, which are more specific ("already taken",
+                   * "conflicts with a hidden field") and are applied just below.
+                   *
+                   * Skipped when an edit leaves the name untouched — that is the grandfather rule in
+                   * the editor. A survey that already declares a variable called `country` must stay
+                   * editable, or the author could no longer change its type or value.
+                   */
+                  const isUnchangedName =
+                    mode === "edit" && variable?.name.toLowerCase() === value.toLowerCase();
+
+                  if (!isUnchangedName) {
+                    const validateIdError = validateId(value, [], [], [], [], {
+                      requireSafeIdentifier: true,
+                    });
+
+                    if (validateIdError) {
+                      return getValidateIdErrorMessage(validateIdError, "variable", t);
+                    }
+                  }
                   if (mode === "create" && localSurvey.variables.find((v) => v.name === value)) {
-                    return t(
-                      "environments.surveys.edit.variable_name_is_already_taken_please_choose_another"
-                    );
+                    return t("workspace.surveys.edit.variable_name_is_already_taken_please_choose_another");
                   }
                   if (mode === "edit" && variable && variable.name !== value) {
                     if (localSurvey.variables.find((v) => v.name === value)) {
-                      return t(
-                        "environments.surveys.edit.variable_name_is_already_taken_please_choose_another"
-                      );
+                      return t("workspace.surveys.edit.variable_name_is_already_taken_please_choose_another");
                     }
-                  }
-                  if (!/^[a-z]/.test(value)) {
-                    return t("environments.surveys.edit.variable_name_must_start_with_a_letter");
                   }
                   const hiddenFieldIds = localSurvey.hiddenFields?.fieldIds ?? [];
                   if (hiddenFieldIds.some((id) => id.toLowerCase() === value.toLowerCase())) {
-                    return t("environments.surveys.edit.variable_name_conflicts_with_hidden_field");
+                    return t("workspace.surveys.edit.variable_name_conflicts_with_hidden_field");
                   }
                 },
               }}
@@ -198,7 +209,7 @@ export const SurveyVariablesCardItem = ({
                     <Input
                       {...field}
                       isInvalid={isNameError}
-                      placeholder={t("environments.surveys.edit.field_name_eg_score_price")}
+                      placeholder={t("workspace.surveys.edit.field_name_eg_score_price")}
                       onBlur={mode === "edit" ? () => form.handleSubmit(editSurveyVariable)() : undefined}
                     />
                   </FormControl>
@@ -211,6 +222,7 @@ export const SurveyVariablesCardItem = ({
               name="type"
               render={({ field }) => (
                 <FormItem
+                  className="space-y-0"
                   onBlur={mode === "edit" ? () => form.handleSubmit(editSurveyVariable)() : undefined}>
                   <Select
                     {...field}
@@ -219,7 +231,7 @@ export const SurveyVariablesCardItem = ({
                       field.onChange(value);
                     }}>
                     <SelectTrigger className="h-10 w-24">
-                      <SelectValue placeholder={t("environments.surveys.edit.select_type")} />
+                      <SelectValue placeholder={t("workspace.surveys.edit.select_type")} />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="number">{t("common.number")}</SelectItem>
@@ -244,7 +256,7 @@ export const SurveyVariablesCardItem = ({
                       onChange={(e) =>
                         field.onChange(variableType === "number" ? Number(e.target.value) : e.target.value)
                       }
-                      placeholder={t("environments.surveys.edit.initial_value")}
+                      placeholder={t("workspace.surveys.edit.initial_value")}
                       type={variableType === "number" ? "number" : "text"}
                       onBlur={mode === "edit" ? () => form.handleSubmit(editSurveyVariable)() : undefined}
                     />
@@ -256,7 +268,7 @@ export const SurveyVariablesCardItem = ({
             {/* Create / Delete buttons */}
             {mode === "create" && (
               <Button variant="secondary" type="submit" className="h-10 whitespace-nowrap">
-                {t("environments.surveys.edit.add_variable")}
+                {t("workspace.surveys.edit.add_variable")}
               </Button>
             )}
             {mode === "edit" && variable && (
@@ -266,7 +278,7 @@ export const SurveyVariablesCardItem = ({
                 size="sm"
                 className="whitespace-nowrap"
                 onClick={() => onVariableDelete(variable)}>
-                <TrashIcon className="h-4 w-4" />
+                <TrashIcon className="size-4" />
               </Button>
             )}
           </div>

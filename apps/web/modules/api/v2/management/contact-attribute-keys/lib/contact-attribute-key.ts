@@ -1,20 +1,25 @@
-import { ContactAttributeKey, Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
 import { prisma } from "@formbricks/database";
+import { ContactAttributeKey, Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { Result, err, ok } from "@formbricks/types/error-handlers";
-import { formatSnakeCaseToTitleCase } from "@/lib/utils/safe-identifier";
+import { formatSnakeCaseToTitleCase } from "@formbricks/types/safe-identifier";
+import { isPrismaKnownRequestError, isUniqueConstraintError } from "@/lib/utils/prisma-error";
 import { getContactAttributeKeysQuery } from "@/modules/api/v2/management/contact-attribute-keys/lib/utils";
 import {
   TContactAttributeKeyInput,
   TGetContactAttributeKeysFilter,
 } from "@/modules/api/v2/management/contact-attribute-keys/types/contact-attribute-keys";
 import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
+import {
+  getReservedFutureDefaultAttributeKeyIssue,
+  isReservedFutureDefaultAttributeKey,
+} from "@/modules/ee/contacts/lib/attribute-key-policy";
 
 export const getContactAttributeKeys = reactCache(
-  async (environmentIds: string[], params: TGetContactAttributeKeysFilter) => {
+  async (workspaceIds: string[], params: TGetContactAttributeKeysFilter) => {
     try {
-      const query = getContactAttributeKeysQuery(environmentIds, params);
+      const query = getContactAttributeKeysQuery(workspaceIds, params);
 
       const [keys, count] = await prisma.$transaction([
         prisma.contactAttributeKey.findMany({
@@ -43,13 +48,20 @@ export const getContactAttributeKeys = reactCache(
 export const createContactAttributeKey = async (
   contactAttributeKey: TContactAttributeKeyInput
 ): Promise<Result<ContactAttributeKey, ApiErrorResponseV2>> => {
-  const { environmentId, name, description, key, dataType } = contactAttributeKey;
+  const { workspaceId, name, description, key, dataType } = contactAttributeKey;
+
+  if (isReservedFutureDefaultAttributeKey(key)) {
+    return err({
+      type: "bad_request",
+      details: [{ field: "key", issue: getReservedFutureDefaultAttributeKeyIssue([key]) }],
+    });
+  }
 
   try {
     const prismaData: Prisma.ContactAttributeKeyCreateInput = {
-      environment: {
+      workspace: {
         connect: {
-          id: environmentId,
+          id: workspaceId,
         },
       },
       name: name ?? formatSnakeCaseToTitleCase(key),
@@ -64,27 +76,25 @@ export const createContactAttributeKey = async (
 
     return ok(createdContactAttributeKey);
   } catch (error) {
-    if (error instanceof Prisma.PrismaClientKnownRequestError) {
-      if (
-        error.code === PrismaErrorType.RecordDoesNotExist ||
-        error.code === PrismaErrorType.RelatedRecordDoesNotExist
-      ) {
-        return err({
-          type: "not_found",
-          details: [{ field: "contactAttributeKey", issue: "not found" }],
-        });
-      }
-      if (error.code === PrismaErrorType.UniqueConstraintViolation) {
-        return err({
-          type: "conflict",
-          details: [
-            {
-              field: "contactAttributeKey",
-              issue: `Contact attribute key with "${contactAttributeKey.key}" already exists`,
-            },
-          ],
-        });
-      }
+    if (
+      isPrismaKnownRequestError(error, PrismaErrorType.RelatedRecordNotFound) ||
+      isPrismaKnownRequestError(error, PrismaErrorType.RecordNotFound)
+    ) {
+      return err({
+        type: "not_found",
+        details: [{ field: "contactAttributeKey", issue: "not found" }],
+      });
+    }
+    if (isUniqueConstraintError(error)) {
+      return err({
+        type: "conflict",
+        details: [
+          {
+            field: "contactAttributeKey",
+            issue: `Contact attribute key with "${contactAttributeKey.key}" already exists`,
+          },
+        ],
+      });
     }
     return err({
       type: "internal_server_error",

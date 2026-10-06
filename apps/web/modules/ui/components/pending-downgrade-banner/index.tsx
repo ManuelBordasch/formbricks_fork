@@ -7,31 +7,32 @@ import { useTranslation } from "react-i18next";
 import { TUserLocale } from "@formbricks/types/user";
 import { formatDateForDisplay } from "@/lib/utils/datetime";
 import type { TLicenseStatus } from "@/modules/ee/license-check/types/enterprise-license";
+import { organizationSettingsPath } from "@/modules/settings/lib/routes";
 
 interface PendingDowngradeBannerProps {
-  lastChecked: Date;
+  organizationId: string;
+  // Both derived on the server from the license's `lastChecked` and the grace period, rather than
+  // from `Date.now()` here: reading the clock during render is impure, so the banner's copy would
+  // differ between the server pass and hydration (ENG-2366).
+  isWithinGracePeriod: boolean;
+  scheduledDowngradeDate: Date;
   active: boolean;
   isPendingDowngrade: boolean;
-  environmentId: string;
   locale: TUserLocale;
   status: TLicenseStatus;
 }
 
 export const PendingDowngradeBanner = ({
-  lastChecked,
+  organizationId,
+  isWithinGracePeriod,
+  scheduledDowngradeDate,
   active,
   isPendingDowngrade,
-  environmentId,
   locale,
   status,
-}: PendingDowngradeBannerProps) => {
-  const threeDaysInMillis = 3 * 24 * 60 * 60 * 1000;
+}: Readonly<PendingDowngradeBannerProps>) => {
   const { t } = useTranslation();
-  const isLastCheckedWithin72Hours = lastChecked
-    ? Date.now() - lastChecked.getTime() < threeDaysInMillis
-    : false;
 
-  const scheduledDowngradeDate = new Date(lastChecked.getTime() + threeDaysInMillis);
   const formattedDate = formatDateForDisplay(scheduledDowngradeDate, locale, {
     year: "numeric",
     month: "long",
@@ -57,7 +58,7 @@ export const PendingDowngradeBanner = ({
       return `${unreachableMessage} ${t("common.you_are_downgraded_to_the_community_edition")}`;
     }
 
-    if (isLastCheckedWithin72Hours) {
+    if (isWithinGracePeriod) {
       const scheduledMessage = t("common.you_will_be_downgraded_to_the_community_edition_on_date", {
         date: formattedDate,
       });
@@ -71,14 +72,14 @@ export const PendingDowngradeBanner = ({
     return (
       <div
         aria-live="assertive"
-        className="pointer-events-none fixed inset-0 z-[100] flex min-w-80 items-end px-4 py-6 sm:items-start sm:p-6">
-        <div className="flex w-full flex-col items-center space-y-4 sm:items-end">
-          <div className="pointer-events-auto w-full max-w-sm overflow-hidden rounded-lg bg-white shadow-lg ring-1 ring-black ring-opacity-5 transition">
+        className="pointer-events-none fixed inset-0 z-100 flex min-w-80 items-end px-4 py-6 sm:items-start sm:p-6">
+        <div className="flex w-full flex-col items-center gap-y-4 sm:items-end">
+          <div className="pointer-events-auto w-full max-w-sm overflow-hidden rounded-lg bg-white shadow-lg ring-1 ring-black/5 transition">
             <div className="p-4">
               <div className="relative flex flex-col">
                 <div className="flex">
-                  <div className="flex-shrink-0">
-                    <TriangleAlertIcon className="h-6 w-6 text-error" aria-hidden="true" />
+                  <div className="shrink-0">
+                    <TriangleAlertIcon className="size-6 text-error" aria-hidden="true" />
                   </div>
                   <div className="ml-3 w-0 flex-1">
                     <p className="text-base font-medium text-slate-900">
@@ -86,19 +87,19 @@ export const PendingDowngradeBanner = ({
                     </p>
                     <p className="mt-1 text-sm text-slate-500">{getDescription()}</p>
 
-                    <Link href={`/environments/${environmentId}/settings/enterprise`}>
+                    <Link href={organizationSettingsPath(organizationId, "enterprise")}>
                       <span className="text-sm text-slate-900">{t("common.learn_more")}</span>
                     </Link>
                   </div>
                 </div>
 
-                <div className="absolute right-0 top-0 ml-4 flex flex-shrink-0">
+                <div className="absolute top-0 right-0 ml-4 flex shrink-0">
                   <button
                     type="button"
-                    className="inline-flex rounded-md bg-white text-slate-400 hover:text-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2"
+                    className="inline-flex rounded-md bg-white text-slate-400 hover:text-slate-500 focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:outline-hidden"
                     onClick={() => setShow(false)}>
                     <span className="sr-only">{t("common.close")}</span>
-                    <XIcon className="h-5 w-5" aria-hidden="true" />
+                    <XIcon className="size-5" aria-hidden="true" />
                   </button>
                 </div>
               </div>

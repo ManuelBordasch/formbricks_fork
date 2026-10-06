@@ -7,12 +7,14 @@ import { TUserNotificationSettings } from "@formbricks/types/user";
 import { IS_FORMBRICKS_CLOUD } from "@/lib/constants";
 import { createMembership } from "@/lib/membership/service";
 import { createOrganization } from "@/lib/organization/service";
+import { capturePostHogEvent, getEmailDomain, groupIdentifyPostHog } from "@/lib/posthog";
 import { updateUser } from "@/lib/user/service";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
+import { DEFAULT_WORKSPACE_NAME } from "@/lib/workspace/constants";
 import { withAuditLogging } from "@/modules/ee/audit-logs/lib/handler";
 import { ensureCloudStripeSetupForOrganization } from "@/modules/ee/billing/lib/organization-billing";
 import { getIsMultiOrgEnabled } from "@/modules/ee/license-check/lib/utils";
-import { createProject } from "@/modules/projects/settings/lib/project";
+import { createWorkspace } from "@/modules/workspaces/settings/lib/workspace";
 
 const ZCreateOrganizationAction = z.object({
   organizationName: z.string().min(1, "Organization name must be at least 1 character long"),
@@ -47,9 +49,36 @@ export const createOrganizationAction = authenticatedActionClient
         });
       }
 
-      await createProject(newOrganization.id, {
-        name: "My Project",
+      const newWorkspace = await createWorkspace(newOrganization.id, {
+        name: DEFAULT_WORKSPACE_NAME,
       });
+
+      groupIdentifyPostHog("organization", newOrganization.id, {
+        name: newOrganization.name,
+        email_domain: getEmailDomain(ctx.user.email),
+      });
+      groupIdentifyPostHog("workspace", newWorkspace.id, { name: newWorkspace.name });
+
+      capturePostHogEvent(
+        ctx.user.id,
+        "organization_created",
+        {
+          organization_id: newOrganization.id,
+          is_first_org: false,
+        },
+        { organizationId: newOrganization.id, workspaceId: newWorkspace.id }
+      );
+
+      capturePostHogEvent(
+        ctx.user.id,
+        "workspace_created",
+        {
+          organization_id: newOrganization.id,
+          workspace_id: newWorkspace.id,
+          name: newWorkspace.name,
+        },
+        { organizationId: newOrganization.id, workspaceId: newWorkspace.id }
+      );
 
       const updatedNotificationSettings: TUserNotificationSettings = {
         ...ctx.user.notificationSettings,

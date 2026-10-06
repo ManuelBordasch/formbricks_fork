@@ -4,6 +4,7 @@ import { toast } from "react-hot-toast";
 import { ZEndingCardUrl } from "@formbricks/types/common";
 import { TI18nString } from "@formbricks/types/i18n";
 import { ZSegmentFilters } from "@formbricks/types/segment";
+import { TSurveyBlockLogic, ZSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
 import {
   TInputFieldConfig,
   TSurveyAddressElement,
@@ -21,9 +22,15 @@ import {
   TSurveyEndScreenCard,
   TSurveyLanguage,
   TSurveyRedirectUrlCard,
+  TSurveyStatus,
   TSurveyWelcomeCard,
 } from "@formbricks/types/surveys/types";
-import { findLanguageCodesForDuplicateLabels, getTextContent } from "@formbricks/types/surveys/validation";
+import {
+  TValidateIdError,
+  TValidateIdErrorCode,
+  findLanguageCodesForDuplicateLabels,
+  getTextContent,
+} from "@formbricks/types/surveys/validation";
 import { extractLanguageCodes, getLocalizedValue } from "@/lib/i18n/utils";
 import { checkForEmptyFallBackValue } from "@/lib/utils/recall";
 
@@ -160,6 +167,11 @@ export const validationRules = {
   },
 };
 
+// Validate a single conditional-logic rule against its schema (catches e.g. a
+// missing right operand or empty jump target).
+export const isBlockLogicItemValid = (logicItem: TSurveyBlockLogic): boolean =>
+  ZSurveyBlockLogic.safeParse(logicItem).success;
+
 // Main validation function
 export const validateElement = (element: TSurveyElement, surveyLanguages: TSurveyLanguage[]): boolean => {
   const specificValidation = (
@@ -247,15 +259,32 @@ export const isEndingCardValid = (
   }
 };
 
+/**
+ * Whether saving `survey` at `targetStatus` would leave an app survey live with nothing that can
+ * ever display it. `ZSurveyType` is `"link" | "app"`, so this is the client-side twin of the
+ * server's `isAppSurveyMissingTriggersToPublish` — that module is `server-only`, hence the
+ * duplication rather than an import.
+ *
+ * `targetStatus` is the status the survey is heading for, not the one it has: publishing a draft
+ * ("inProgress") and scheduling one ("paused") both need a trigger, while saving it as a draft does
+ * not. Falsy entries are dropped because the editor's trigger array can hold holes.
+ */
+export const isMissingRequiredTrigger = (survey: TSurvey, targetStatus: TSurveyStatus): boolean =>
+  survey.type !== "link" && targetStatus !== "draft" && (survey.triggers ?? []).filter(Boolean).length === 0;
+
 export const isSurveyValid = (
   survey: TSurvey,
   selectedLanguageCode: string,
   t: TFunction,
-  responseCount?: number
+  /**
+   * Completed responses only — `survey.autoComplete` is a limit on completions, so partial
+   * starts must not count towards it.
+   */
+  finishedResponseCount?: number
 ) => {
   const questionWithEmptyFallback = checkForEmptyFallBackValue(survey, selectedLanguageCode);
   if (questionWithEmptyFallback) {
-    toast.error(t("environments.surveys.edit.fallback_missing"));
+    toast.error(t("workspace.surveys.edit.fallback_missing"));
     return false;
   }
 
@@ -266,23 +295,23 @@ export const isSurveyValid = (
     if (!parsedFilters.success) {
       const errMsg =
         parsedFilters.error.issues.find((issue) => issue.code === "custom")?.message ||
-        t("environments.surveys.edit.invalid_targeting");
+        t("workspace.surveys.edit.invalid_targeting");
       toast.error(errMsg);
       return false;
     }
   }
 
   // Response limit validation
-  if (survey.autoComplete !== null && responseCount !== undefined) {
+  if (survey.autoComplete !== null && finishedResponseCount !== undefined) {
     if (survey.autoComplete === 0) {
-      toast.error(t("environments.surveys.edit.response_limit_can_t_be_set_to_0"));
+      toast.error(t("workspace.surveys.edit.response_limit_can_t_be_set_to_0"));
       return false;
     }
 
-    if (survey.autoComplete <= responseCount) {
+    if (survey.autoComplete <= finishedResponseCount) {
       toast.error(
-        t("environments.surveys.edit.response_limit_needs_to_exceed_number_of_received_responses", {
-          responseCount,
+        t("workspace.surveys.edit.response_limit_needs_to_exceed_number_of_received_responses", {
+          responseCount: finishedResponseCount,
         }),
         {
           id: "response-limit-error",
@@ -293,9 +322,38 @@ export const isSurveyValid = (
   }
 
   if (!hasValidSurveyClosedMessageHeading(survey)) {
-    toast.error(t("environments.surveys.edit.survey_closed_message_heading_required"));
+    toast.error(t("workspace.surveys.edit.survey_closed_message_heading_required"));
     return false;
   }
 
   return true;
+};
+
+export const getValidateIdErrorMessage = (
+  error: TValidateIdError,
+  type: "hiddenField" | "question" | "variable",
+  t: TFunction
+): string => {
+  const localizedType = {
+    hiddenField: () => t("common.hidden_field"),
+    question: () => t("workspace.surveys.edit.question"),
+    variable: () => t("common.variable"),
+  }[type]();
+
+  switch (error.code) {
+    case TValidateIdErrorCode.Empty:
+      return t("workspace.surveys.edit.validate_id_empty", { type: localizedType });
+    case TValidateIdErrorCode.Duplicate:
+      return t("workspace.surveys.edit.validate_id_duplicate", { type: localizedType });
+    case TValidateIdErrorCode.Reserved:
+      return t("workspace.surveys.edit.validate_id_reserved", { type: localizedType, field: error.field });
+    case TValidateIdErrorCode.HasSpaces:
+      return t("workspace.surveys.edit.validate_id_no_spaces", { type: localizedType });
+    case TValidateIdErrorCode.InvalidChars:
+      return t("workspace.surveys.edit.validate_id_invalid_chars", { type: localizedType });
+    case TValidateIdErrorCode.NotSafeIdentifier:
+      return t("workspace.surveys.edit.validate_id_not_safe_identifier", { type: localizedType });
+    default:
+      return t("workspace.surveys.edit.validate_id_invalid_chars", { type: localizedType });
+  }
 };

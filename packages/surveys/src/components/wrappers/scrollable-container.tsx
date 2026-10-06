@@ -1,12 +1,13 @@
 import type { JSX, Ref } from "preact";
 import { forwardRef } from "preact/compat";
 import { useEffect, useImperativeHandle, useRef, useState } from "preact/hooks";
-import { ChevronDownIcon } from "@/components/icons/chevron-down-icon";
+import { ScrollToBottomButton } from "@/components/buttons/scroll-to-bottom-button";
 import { cn } from "@/lib/utils";
 
 interface ScrollableContainerProps {
   children: JSX.Element;
   fullSizeCards: boolean;
+  disableInternalScroll?: boolean;
 }
 
 export interface ScrollableContainerHandle {
@@ -14,7 +15,10 @@ export interface ScrollableContainerHandle {
 }
 
 export const ScrollableContainer = forwardRef<ScrollableContainerHandle, ScrollableContainerProps>(
-  ({ children, fullSizeCards = false }: ScrollableContainerProps, ref: Ref<ScrollableContainerHandle>) => {
+  (
+    { children, fullSizeCards = false, disableInternalScroll = false }: Readonly<ScrollableContainerProps>,
+    ref: Ref<ScrollableContainerHandle>
+  ) => {
     const [isAtBottom, setIsAtBottom] = useState(false);
     const [isAtTop, setIsAtTop] = useState(false);
     const containerRef = useRef<HTMLDivElement>(null);
@@ -63,8 +67,10 @@ export const ScrollableContainer = forwardRef<ScrollableContainerHandle, Scrolla
       checkScroll();
     }, [children]);
 
-    let maxHeight: string;
-    if (fullSizeCards) {
+    let maxHeight: string | undefined;
+    if (disableInternalScroll) {
+      maxHeight = undefined;
+    } else if (fullSizeCards) {
       maxHeight = "calc(100vh - 6rem)";
     } else if (isSurveyPreview) {
       maxHeight = "42dvh";
@@ -74,7 +80,7 @@ export const ScrollableContainer = forwardRef<ScrollableContainerHandle, Scrolla
 
     return (
       <div className="relative">
-        {!isAtTop && (
+        {!disableInternalScroll && !isAtTop && (
           <div className="from-survey-bg absolute top-0 right-2 left-0 z-10 h-4 bg-linear-to-b to-transparent" />
         )}
         <div
@@ -82,20 +88,13 @@ export const ScrollableContainer = forwardRef<ScrollableContainerHandle, Scrolla
           style={{
             maxHeight,
           }}
-          className={cn("bg-survey-bg overflow-auto px-4")}>
+          className={cn(disableInternalScroll ? "overflow-visible" : "bg-survey-bg overflow-auto px-4 pt-4")}>
           {children}
         </div>
-        {!isAtBottom && (
+        {!disableInternalScroll && !isAtBottom && (
           <>
             <div className="from-survey-bg absolute right-4 bottom-0 left-4 h-4 bg-linear-to-t to-transparent" />
-            <button
-              type="button"
-              onClick={scrollToBottom}
-              style={{ transform: "translateX(-50%)" }}
-              className="bg-survey-bg hover:border-border focus:ring-brand absolute bottom-2 left-1/2 z-20 flex h-8 w-8 items-center justify-center rounded-full border border-transparent shadow-lg transition-colors focus:ring-2 focus:ring-offset-2 focus:outline-hidden"
-              aria-label="Scroll to bottom">
-              <ChevronDownIcon className="text-heading h-5 w-5" />
-            </button>
+            <ScrollToBottomButton onClick={scrollToBottom} />
           </>
         )}
       </div>

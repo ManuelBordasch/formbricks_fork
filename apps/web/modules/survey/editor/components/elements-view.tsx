@@ -11,10 +11,10 @@ import {
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { useAutoAnimate } from "@formkit/auto-animate/react";
 import { createId } from "@paralleldrive/cuid2";
-import { Language, Project } from "@prisma/client";
 import React, { SetStateAction, useEffect, useMemo } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
+import { Workspace } from "@formbricks/database/prisma-browser";
 import { TI18nString } from "@formbricks/types/i18n";
 import { TSurveyQuota } from "@formbricks/types/quota";
 import { TSurveyBlock, TSurveyBlockLogic, TSurveyBlockLogicAction } from "@formbricks/types/surveys/blocks";
@@ -40,9 +40,10 @@ import {
   deleteElementFromBlock,
   duplicateBlock as duplicateBlockHelper,
   findElementLocation,
+  getAutoBlockName,
   moveBlock as moveBlockHelper,
   moveElementInBlock,
-  renumberBlocks,
+  renumberAutoNamedBlocks,
   updateElementInBlock,
 } from "@/modules/survey/editor/lib/blocks";
 import {
@@ -50,23 +51,26 @@ import {
   findElementUsedInLogic,
   isUsedInQuota,
   isUsedInRecall,
+  scrollElementCardIntoView,
 } from "@/modules/survey/editor/lib/utils";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
-import { MultiLanguageCard } from "@/modules/survey/multi-language-surveys/components/multi-language-card";
 import { ConfirmationModal } from "@/modules/ui/components/confirmation-modal";
-import { isEndingCardValid, isWelcomeCardValid, validateElement } from "../lib/validation";
+import {
+  isBlockLogicItemValid,
+  isEndingCardValid,
+  isWelcomeCardValid,
+  validateElement,
+} from "../lib/validation";
 
 interface ElementsViewProps {
   localSurvey: TSurvey;
   setLocalSurvey: React.Dispatch<SetStateAction<TSurvey>>;
   activeElementId: string | null;
   setActiveElementId: (elementId: string | null) => void;
-  project: Project;
-  projectLanguages: Language[];
+  workspace: Workspace;
   invalidElements: string[] | null;
   setInvalidElements: React.Dispatch<SetStateAction<string[] | null>>;
   selectedLanguageCode: string;
-  setSelectedLanguageCode: (languageCode: string) => void;
   isFormbricksCloud: boolean;
   isCxMode: boolean;
   locale: TUserLocale;
@@ -82,11 +86,9 @@ export const ElementsView = ({
   setActiveElementId,
   localSurvey,
   setLocalSurvey,
-  project,
-  projectLanguages,
+  workspace,
   invalidElements,
   setInvalidElements,
-  setSelectedLanguageCode,
   selectedLanguageCode,
   isFormbricksCloud,
   isCxMode,
@@ -119,10 +121,6 @@ export const ElementsView = ({
   }, [elements]);
 
   const surveyLanguages = localSurvey.languages;
-
-  const getBlockName = (index: number): string => {
-    return `Block ${index + 1}`;
-  };
 
   const handleElementLogicChange = (survey: TSurvey, compareId: string, updatedId: string): TSurvey => {
     const updateConditions = (conditions: TConditionGroup): TConditionGroup => {
@@ -338,6 +336,22 @@ export const ElementsView = ({
     });
   };
 
+  // Update block name (block-level property)
+  const updateBlockName = (blockIdx: number, name: string) => {
+    if (blockIdx < 0 || blockIdx >= localSurvey.blocks.length) return;
+
+    setLocalSurvey((prevSurvey) => {
+      const blocks = [...(prevSurvey.blocks ?? [])];
+      blocks[blockIdx] = {
+        // Written through verbatim, including empty: clearing the field must leave it cleared
+        // rather than snapping back to the auto name. isSurveyValid blocks the save instead.
+        ...blocks[blockIdx],
+        name,
+      };
+      return { ...prevSurvey, blocks };
+    });
+  };
+
   // Update block button label (block-level property)
   const updateBlockButtonLabel = (
     blockIndex: number,
@@ -364,12 +378,12 @@ export const ElementsView = ({
   const validateElementDeletion = (elementId: string, elementIdx: number): boolean => {
     const recallElementIdx = isUsedInRecall(localSurvey, elementId);
     if (recallElementIdx === elements.length) {
-      toast.error(t("environments.surveys.edit.question_used_in_recall_ending_card"));
+      toast.error(t("workspace.surveys.edit.question_used_in_recall_ending_card"));
       return false;
     }
     if (recallElementIdx !== -1) {
       toast.error(
-        t("environments.surveys.edit.question_used_in_recall", { questionIndex: recallElementIdx + 1 })
+        t("workspace.surveys.edit.question_used_in_recall", { questionIndex: recallElementIdx + 1 })
       );
       return false;
     }
@@ -377,7 +391,7 @@ export const ElementsView = ({
     const quotaIdx = quotas.findIndex((quota) => isUsedInQuota(quota, { elementId: elementId }));
     if (quotaIdx !== -1) {
       toast.error(
-        t("environments.surveys.edit.question_used_in_quota", {
+        t("workspace.surveys.edit.question_used_in_quota", {
           questionIndex: elementIdx + 1,
           quotaName: quotas[quotaIdx].name,
         })
@@ -434,7 +448,7 @@ export const ElementsView = ({
 
     handleActiveElementAfterDeletion(elementId, elementIdx, updatedSurvey, activeElementIdTemp);
 
-    toast.success(t("environments.surveys.edit.question_deleted"));
+    toast.success(t("workspace.surveys.edit.question_deleted"));
   };
 
   const deleteElement = (elementIdx: number) => {
@@ -478,7 +492,7 @@ export const ElementsView = ({
     internalElementIdMap[newElementId] = createId();
 
     setLocalSurvey(result.data);
-    toast.success(t("environments.surveys.edit.question_duplicated"));
+    toast.success(t("workspace.surveys.edit.question_duplicated"));
   };
 
   const addElement = (element: TSurveyElement, index?: number) => {
@@ -491,7 +505,7 @@ export const ElementsView = ({
 
       const newBlock = {
         id: newBlockId,
-        name: getBlockName(index ?? prevSurvey.blocks.length),
+        name: getAutoBlockName(index ?? prevSurvey.blocks.length),
         elements: [{ ...updatedElement, isDraft: true }],
         buttonLabel: createI18nString("", []),
         backButtonLabel: createI18nString("", []),
@@ -505,6 +519,7 @@ export const ElementsView = ({
 
     setActiveElementId(element.id);
     internalElementIdMap[element.id] = createId();
+    scrollElementCardIntoView(element.id);
   };
 
   const _addElementToBlock = (element: TSurveyElement, blockId: string, afterElementIdx: number) => {
@@ -530,6 +545,7 @@ export const ElementsView = ({
     setLocalSurvey(result.data);
     setActiveElementId(updatedElement.id);
     internalElementIdMap[updatedElement.id] = createId();
+    scrollElementCardIntoView(updatedElement.id);
   };
 
   const moveElementToBlock = (elementId: string, targetBlockId: string) => {
@@ -551,7 +567,7 @@ export const ElementsView = ({
     }
 
     if (!sourceBlock || !elementToMove) {
-      toast.error(t("environments.surveys.edit.element_not_found"));
+      toast.error(t("workspace.surveys.edit.element_not_found"));
       return;
     }
 
@@ -560,7 +576,7 @@ export const ElementsView = ({
 
     // If source block is now empty, delete it
     if (sourceBlock.elements.length === 0) {
-      const blockIdx = updatedSurvey.blocks.findIndex((b) => b.id === sourceBlock.id);
+      const blockIdx = updatedSurvey.blocks.findIndex((b) => b.id === sourceBlock?.id);
       if (blockIdx !== -1) {
         updatedSurvey.blocks.splice(blockIdx, 1);
       }
@@ -569,7 +585,7 @@ export const ElementsView = ({
     // Add element to target block at the end
     const targetBlock = updatedSurvey.blocks.find((b) => b.id === targetBlockId);
     if (!targetBlock) {
-      toast.error(t("environments.surveys.edit.target_block_not_found"));
+      toast.error(t("workspace.surveys.edit.target_block_not_found"));
       return;
     }
 
@@ -649,7 +665,7 @@ export const ElementsView = ({
     }
 
     setLocalSurvey(result.data);
-    toast.success(t("environments.surveys.edit.block_duplicated"));
+    toast.success(t("workspace.surveys.edit.block_duplicated"));
   };
 
   const executeBlockDeletion = (blockId: string) => {
@@ -724,76 +740,88 @@ export const ElementsView = ({
 
   // Validate survey when changes are made to languages or elements
   // using set for O(1) lookup
-  useEffect(
-    () => {
-      if (!invalidElements) return;
+  useEffect(() => {
+    if (!invalidElements) return;
 
-      const currentInvalidSet = new Set(invalidElements);
-      let hasChanges = false;
+    const currentInvalidSet = new Set(invalidElements);
+    let hasChanges = false;
 
-      // Validate each element
-      elements.forEach((element) => {
-        const isValid = validateElement(element, surveyLanguages);
-        if (isValid) {
-          if (currentInvalidSet.has(element.id)) {
-            currentInvalidSet.delete(element.id);
-            hasChanges = true;
-          }
-        } else if (!currentInvalidSet.has(element.id)) {
-          currentInvalidSet.add(element.id);
+    // Live re-validation: clear errors as elements become valid (including
+    // drafts), but don't flag freshly added drafts — save/publish does that.
+    elements.forEach((element) => {
+      const isValid = validateElement(element, surveyLanguages);
+      if (isValid) {
+        if (currentInvalidSet.has(element.id)) {
+          currentInvalidSet.delete(element.id);
           hasChanges = true;
         }
-      });
+      } else if (!element.isDraft && !currentInvalidSet.has(element.id)) {
+        currentInvalidSet.add(element.id);
+        hasChanges = true;
+      }
+    });
 
-      // Check welcome card
-      if (localSurvey.welcomeCard.enabled && !isWelcomeCardValid(localSurvey.welcomeCard, surveyLanguages)) {
-        if (!currentInvalidSet.has("start")) {
-          currentInvalidSet.add("start");
+    // Check welcome card
+    if (localSurvey.welcomeCard.enabled && !isWelcomeCardValid(localSurvey.welcomeCard, surveyLanguages)) {
+      if (!currentInvalidSet.has("start")) {
+        currentInvalidSet.add("start");
+        hasChanges = true;
+      }
+    } else if (currentInvalidSet.has("start")) {
+      currentInvalidSet.delete("start");
+      hasChanges = true;
+    }
+
+    // Check thank you card
+    localSurvey.endings.forEach((ending) => {
+      if (!isEndingCardValid(ending, surveyLanguages)) {
+        if (!currentInvalidSet.has(ending.id)) {
+          currentInvalidSet.add(ending.id);
           hasChanges = true;
         }
-      } else if (currentInvalidSet.has("start")) {
-        currentInvalidSet.delete("start");
+      } else if (currentInvalidSet.has(ending.id)) {
+        currentInvalidSet.delete(ending.id);
+        hasChanges = true;
+      }
+    });
+
+    // Live-clear conditional logic and block-name errors as they get fixed. We only clear
+    // here (never add) so freshly added, not-yet-filled-in rules aren't
+    // flagged prematurely — logic errors are added on save/publish instead.
+    localSurvey.blocks.forEach((block) => {
+      if (currentInvalidSet.has(block.id) && block.name.trim()) {
+        currentInvalidSet.delete(block.id);
         hasChanges = true;
       }
 
-      // Check thank you card
-      localSurvey.endings.forEach((ending) => {
-        if (!isEndingCardValid(ending, surveyLanguages)) {
-          if (!currentInvalidSet.has(ending.id)) {
-            currentInvalidSet.add(ending.id);
-            hasChanges = true;
-          }
-        } else if (currentInvalidSet.has(ending.id)) {
-          currentInvalidSet.delete(ending.id);
+      (block.logic ?? []).forEach((logicItem) => {
+        if (currentInvalidSet.has(logicItem.id) && isBlockLogicItemValid(logicItem)) {
+          currentInvalidSet.delete(logicItem.id);
           hasChanges = true;
         }
       });
+    });
 
-      if (hasChanges) {
-        setInvalidElements(Array.from(currentInvalidSet));
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [
-      elements,
-      surveyLanguages,
-      invalidElements,
-      setInvalidElements,
-      localSurvey.welcomeCard,
-      localSurvey.endings,
-    ]
-  );
+    if (hasChanges) {
+      setInvalidElements(Array.from(currentInvalidSet));
+    }
+  }, [
+    elements,
+    surveyLanguages,
+    invalidElements,
+    setInvalidElements,
+    localSurvey.welcomeCard,
+    localSurvey.endings,
+    localSurvey.blocks,
+  ]);
 
   useEffect(() => {
     const elementWithEmptyFallback = checkForEmptyFallBackValue(localSurvey, selectedLanguageCode);
-    if (elementWithEmptyFallback) {
+    if (elementWithEmptyFallback && activeElementId !== elementWithEmptyFallback.id) {
       setActiveElementId(elementWithEmptyFallback.id);
-      if (activeElementId === elementWithEmptyFallback.id) {
-        toast.error(t("environments.surveys.edit.fallback_missing"));
-      }
+      toast.error(t("workspace.surveys.edit.fallback_missing"));
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeElementId, setActiveElementId, localSurvey, selectedLanguageCode]);
+  }, [activeElementId, setActiveElementId, localSurvey, selectedLanguageCode, t]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -819,10 +847,7 @@ export const ElementsView = ({
       const [movedBlock] = blocks.splice(sourceBlockIndex, 1);
       blocks.splice(destBlockIndex, 0, movedBlock);
 
-      // Renumber blocks sequentially after drag-and-drop reordering
-      const renumberedBlocks = renumberBlocks(blocks);
-
-      setLocalSurvey({ ...localSurvey, blocks: renumberedBlocks });
+      setLocalSurvey({ ...localSurvey, blocks: renumberAutoNamedBlocks(blocks) });
     }
   };
 
@@ -850,8 +875,6 @@ export const ElementsView = ({
             setActiveElementId={setActiveElementId}
             activeElementId={activeElementId}
             isInvalid={invalidElements ? invalidElements.includes("start") : false}
-            setSelectedLanguageCode={setSelectedLanguageCode}
-            selectedLanguageCode={selectedLanguageCode}
             locale={locale}
             isStorageConfigured={isStorageConfigured}
             isExternalUrlsAllowed={isExternalUrlsAllowed}
@@ -867,15 +890,14 @@ export const ElementsView = ({
         <BlocksDroppable
           localSurvey={localSurvey}
           setLocalSurvey={setLocalSurvey}
-          project={project}
+          workspace={workspace}
           moveElement={moveElement}
           updateElement={updateElement}
           updateBlockLogic={updateBlockLogic}
           updateBlockLogicFallback={updateBlockLogicFallback}
+          updateBlockName={updateBlockName}
           updateBlockButtonLabel={updateBlockButtonLabel}
           duplicateElement={duplicateElement}
-          selectedLanguageCode={selectedLanguageCode}
-          setSelectedLanguageCode={setSelectedLanguageCode}
           deleteElement={deleteElement}
           activeElementId={activeElementId}
           setActiveElementId={setActiveElementId}
@@ -896,7 +918,7 @@ export const ElementsView = ({
         />
       </DndContext>
 
-      <AddElementButton addElement={addElement} project={project} isCxMode={isCxMode} />
+      <AddElementButton addElement={addElement} workspace={workspace} isCxMode={isCxMode} />
       <div className="mt-5 flex flex-col gap-5" ref={parent}>
         <hr className="border-t border-dashed" />
         <DndContext
@@ -915,8 +937,6 @@ export const ElementsView = ({
                   setActiveElementId={setActiveElementId}
                   activeElementId={activeElementId}
                   isInvalid={invalidElements ? invalidElements.includes(ending.id) : false}
-                  setSelectedLanguageCode={setSelectedLanguageCode}
-                  selectedLanguageCode={selectedLanguageCode}
                   addEndingCard={addEndingCard}
                   isFormbricksCloud={isFormbricksCloud}
                   locale={locale}
@@ -933,7 +953,6 @@ export const ElementsView = ({
           <>
             <AddEndingCardButton localSurvey={localSurvey} addEndingCard={addEndingCard} />
             <hr />
-
             <HiddenFieldsCard
               localSurvey={localSurvey}
               setLocalSurvey={setLocalSurvey}
@@ -941,23 +960,12 @@ export const ElementsView = ({
               activeElementId={activeElementId}
               quotas={quotas}
             />
-
             <SurveyVariablesCard
               localSurvey={localSurvey}
               setLocalSurvey={setLocalSurvey}
               activeElementId={activeElementId}
               setActiveElementId={setActiveElementId}
               quotas={quotas}
-            />
-
-            <MultiLanguageCard
-              localSurvey={localSurvey}
-              projectLanguages={projectLanguages}
-              setLocalSurvey={setLocalSurvey}
-              setActiveElementId={setActiveElementId}
-              activeElementId={activeElementId}
-              setSelectedLanguageCode={setSelectedLanguageCode}
-              locale={locale}
             />
           </>
         )}
@@ -966,9 +974,9 @@ export const ElementsView = ({
       <ConfirmationModal
         open={logicDeletionWarning.open}
         setOpen={(open) => setLogicDeletionWarning((prev) => ({ ...prev, open: open as boolean }))}
-        title={t("environments.surveys.edit.question_used_in_logic_warning_title")}
-        body={t("environments.surveys.edit.question_used_in_logic_warning_text")}
-        buttonText={t("environments.surveys.edit.delete_anyways")}
+        title={t("workspace.surveys.edit.question_used_in_logic_warning_title")}
+        body={t("workspace.surveys.edit.question_used_in_logic_warning_text")}
+        buttonText={t("workspace.surveys.edit.delete_anyways")}
         onConfirm={() => {
           if (logicDeletionWarning.type === "element") {
             executeDeletion(logicDeletionWarning.elementIdx);

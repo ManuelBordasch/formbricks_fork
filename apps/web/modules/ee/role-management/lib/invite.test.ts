@@ -1,6 +1,6 @@
-import { OrganizationRole, Prisma } from "@prisma/client";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { OrganizationRole, Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { ResourceNotFoundError } from "@formbricks/types/errors";
 import { updateInvite } from "./invite";
@@ -55,7 +55,7 @@ describe("invite.ts", () => {
 
     test("should throw ResourceNotFoundError when invite does not exist", async () => {
       const prismaError = new Prisma.PrismaClientKnownRequestError("Record does not exist", {
-        code: PrismaErrorType.RecordDoesNotExist,
+        code: PrismaErrorType.RecordNotFound,
         clientVersion: "1.0.0",
       });
 

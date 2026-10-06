@@ -1,4 +1,3 @@
-/* eslint-disable no-console -- required for logging */
 import { CommandQueue, CommandType } from "@/lib/common/command-queue";
 import { Config } from "@/lib/common/config";
 import { Logger } from "@/lib/common/logger";
@@ -6,7 +5,7 @@ import { TimeoutStack } from "@/lib/common/timeout-stack";
 import { evaluateNoCodeConfigClick, handleUrlFilters } from "@/lib/common/utils";
 import { trackNoCodeAction } from "@/lib/survey/action";
 import { setIsSurveyRunning } from "@/lib/survey/widget";
-import { type TEnvironmentStateActionClass } from "@/types/config";
+import { type TWorkspaceStateActionClass } from "@/types/config";
 import { type Result } from "@/types/error";
 
 // Factory for creating context-specific tracking handlers
@@ -56,7 +55,7 @@ export const setIsHistoryPatched = (value: boolean): void => {
   isHistoryPatched = value;
 };
 
-const checkTimeOnPage = (actionClasses: TEnvironmentStateActionClass[]): void => {
+const checkTimeOnPage = (actionClasses: TWorkspaceStateActionClass[]): void => {
   const queue = CommandQueue.getInstance();
   const logger = Logger.getInstance();
   const timeoutStack = TimeoutStack.getInstance();
@@ -126,7 +125,7 @@ export const checkPageUrl = async (): Promise<Result<void, unknown>> => {
   const timeoutStack = TimeoutStack.getInstance();
 
   logger.debug(`Checking page url: ${window.location.href}`);
-  const actionClasses = appConfig.get().environment.data.actionClasses;
+  const actionClasses = appConfig.get().workspace.data.actionClasses;
 
   const noCodePageViewActionClasses = actionClasses.filter(
     (action) => action.type === "noCode" && action.noCodeConfig?.type === "pageView"
@@ -165,20 +164,18 @@ export const addPageUrlEventListeners = (): void => {
 
   // Monkey patch history methods if not already done
   if (!isHistoryPatched) {
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- We need to access the original method
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- deliberate monkey-patch; the original is re-invoked via .apply(this, args)
     const originalPushState = history.pushState;
 
-    // eslint-disable-next-line func-names -- We need an anonymous function here
     history.pushState = function (...args) {
       originalPushState.apply(this, args);
       const event = new Event("pushstate");
       window.dispatchEvent(event);
     };
 
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- We need to access the original method
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- deliberate monkey-patch; the original is re-invoked via .apply(this, args)
     const originalReplaceState = history.replaceState;
 
-    // eslint-disable-next-line func-names -- We need an anonymous function here
     history.replaceState = function (...args) {
       originalReplaceState.apply(this, args);
       const event = new Event("replacestate");
@@ -189,7 +186,7 @@ export const addPageUrlEventListeners = (): void => {
   }
 
   events.forEach((event) => {
-    window.addEventListener(event, checkPageUrlWrapper as EventListener);
+    window.addEventListener(event, checkPageUrlWrapper);
   });
   arePageUrlEventListenersAdded = true;
 };
@@ -197,7 +194,7 @@ export const addPageUrlEventListeners = (): void => {
 export const removePageUrlEventListeners = (): void => {
   if (typeof window === "undefined" || !arePageUrlEventListenersAdded) return;
   events.forEach((event) => {
-    window.removeEventListener(event, checkPageUrlWrapper as EventListener);
+    window.removeEventListener(event, checkPageUrlWrapper);
   });
   arePageUrlEventListenersAdded = false;
 };
@@ -209,9 +206,9 @@ const checkClickMatch = async (event: MouseEvent): Promise<void> => {
   const queue = CommandQueue.getInstance();
   const appConfig = Config.getInstance();
 
-  const { environment } = appConfig.get();
+  const { workspace } = appConfig.get();
 
-  const { actionClasses = [] } = environment.data;
+  const { actionClasses = [] } = workspace.data;
 
   const noCodeClickActionClasses = actionClasses.filter(
     (action) => action.type === "noCode" && action.noCodeConfig?.type === "click"
@@ -249,8 +246,8 @@ const checkExitIntent = async (e: MouseEvent): Promise<void> => {
   const queue = CommandQueue.getInstance();
   const appConfig = Config.getInstance();
 
-  const { environment } = appConfig.get();
-  const { actionClasses = [] } = environment.data;
+  const { workspace } = appConfig.get();
+  const { actionClasses = [] } = workspace.data;
 
   const noCodeExitIntentActionClasses = actionClasses.filter(
     (action) => action.type === "noCode" && action.noCodeConfig?.type === "exitIntent"
@@ -308,8 +305,8 @@ const checkScrollDepth = async (): Promise<void> => {
   if (!scrollDepthTriggered && scrollPosition / (bodyHeight - windowSize) >= 0.5) {
     scrollDepthTriggered = true;
 
-    const { environment } = appConfig.get();
-    const { actionClasses = [] } = environment.data;
+    const { workspace } = appConfig.get();
+    const { actionClasses = [] } = workspace.data;
 
     const noCodefiftyPercentScrollActionClasses = actionClasses.filter(
       (action) => action.type === "noCode" && action.noCodeConfig?.type === "fiftyPercentScroll"

@@ -1,39 +1,37 @@
-import DOMPurify from "isomorphic-dompurify";
 import { useTranslation } from "react-i18next";
-import { isValidHTML, stripInlineStyles } from "@/lib/html-utils";
+import { isValidHTML, sanitizeSurveyHtml, stripInlineStyles } from "@/lib/html-utils";
 
 interface HeadlineProps {
   headline: string;
-  elementId: string;
   required?: boolean;
   alignTextCenter?: boolean;
+  /**
+   * Heading level this prompt is exposed at (WCAG 2.4.6). Defaults to 2: the survey name is the
+   * page's only h1 (rendered once by SurveyContainer), so every card headline — welcome, element
+   * prompt, ending — is one level under it.
+   */
+  headingLevel?: 1 | 2;
 }
 
 export function Headline({
   headline,
-  elementId,
   required = false,
   alignTextCenter = false,
+  headingLevel = 2,
 }: Readonly<HeadlineProps>) {
   const hasRequiredRule = required;
   const { t } = useTranslation();
-  const isQuestionCard = elementId !== "EndingCard" && elementId !== "welcomeCard";
+  const HeadingTag = `h${headingLevel.toString()}` as "h1" | "h2";
   // Strip inline styles BEFORE parsing to avoid CSP violations
   const strippedHeadline = stripInlineStyles(headline);
   const isHeadlineHtml = isValidHTML(strippedHeadline);
-  const safeHtml =
-    isHeadlineHtml && strippedHeadline
-      ? DOMPurify.sanitize(strippedHeadline, {
-          ADD_ATTR: ["target"],
-          FORBID_ATTR: ["style"], // Additional safeguard to remove any remaining inline styles
-        })
-      : "";
+  const safeHtml = isHeadlineHtml && strippedHeadline ? sanitizeSurveyHtml(strippedHeadline) : "";
 
   return (
-    <label htmlFor={elementId} className="text-heading mb-[3px] flex flex-col">
-      {hasRequiredRule && isQuestionCard && (
+    <div className="text-heading mb-[3px] flex flex-col">
+      {hasRequiredRule && (
         <span
-          className="label-upper mb-[3px] text-xs leading-6 font-normal opacity-60"
+          className="label-card mb-[3px] text-xs leading-6 font-normal"
           tabIndex={-1}
           data-testid="fb__surveys__headline-optional-text-test">
           {t("common.required")}
@@ -43,17 +41,19 @@ export function Headline({
         className={`flex items-center ${alignTextCenter ? "justify-center" : "justify-between"}`}
         dir="auto">
         {isHeadlineHtml ? (
-          <div
+          <HeadingTag
             data-testid="fb__surveys__headline-text-test"
             className="label-headline htmlbody text-base"
             dangerouslySetInnerHTML={{ __html: safeHtml }}
           />
         ) : (
-          <p data-testid="fb__surveys__headline-text-test" className="label-headline text-base font-semibold">
+          <HeadingTag
+            data-testid="fb__surveys__headline-text-test"
+            className="label-headline text-base font-semibold">
             {headline}
-          </p>
+          </HeadingTag>
         )}
       </div>
-    </label>
+    </div>
   );
 }

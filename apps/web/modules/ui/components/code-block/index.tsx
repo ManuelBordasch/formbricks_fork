@@ -2,6 +2,15 @@
 
 import { CopyIcon } from "lucide-react";
 import Prism from "prismjs";
+// The default prismjs bundle only registers markup, css, clike, and javascript.
+// These languages are used by CodeBlock consumers (e.g. install method snippets)
+// but need their grammars imported explicitly. clike must load before kotlin and
+// dart, which extend it; typescript extends the already-bundled javascript.
+import "prismjs/components/prism-clike";
+import "prismjs/components/prism-dart";
+import "prismjs/components/prism-kotlin";
+import "prismjs/components/prism-swift";
+import "prismjs/components/prism-typescript";
 import "prismjs/themes/prism.css";
 import React, { useEffect } from "react";
 import toast from "react-hot-toast";
@@ -34,7 +43,7 @@ export const CodeBlock = ({
   return (
     <div className={cn("group relative w-full rounded-md text-xs", noMargin ? "" : "mt-4")}>
       {showCopyToClipboard && (
-        <div className="absolute right-2 top-2 z-20 flex cursor-pointer items-center justify-center p-1.5 text-slate-500 hover:text-slate-900">
+        <div className="absolute top-2 right-2 z-20 flex cursor-pointer items-center justify-center p-1.5 text-slate-500 hover:text-slate-900">
           <CopyIcon
             data-testid="copy-icon"
             onClick={() => {
@@ -42,7 +51,7 @@ export const CodeBlock = ({
               navigator.clipboard.writeText(childText);
               toast.success(t("common.copied_to_clipboard"));
             }}
-            className="h-4 w-4"
+            className="size-4"
           />
         </div>
       )}

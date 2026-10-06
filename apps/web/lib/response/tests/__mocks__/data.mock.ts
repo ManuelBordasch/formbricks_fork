@@ -1,5 +1,5 @@
-import { Prisma } from "@prisma/client";
 import { isAfter, isBefore, isSameDay } from "date-fns";
+import { Prisma } from "@formbricks/database/prisma";
 import { TDisplay } from "@formbricks/types/displays";
 import { TSurveyQuota } from "@formbricks/types/quota";
 import { TResponse, TResponseFilterCriteria, TResponseUpdateInput } from "@formbricks/types/responses";
@@ -13,7 +13,7 @@ type ResponseMock = Prisma.ResponseGetPayload<{
   include: typeof responseSelection;
 }>;
 
-export const mockEnvironmentId = "ars2tjk8hsi8oqk1uac00mo7";
+export const mockWorkspaceId = "wksp2tjk8hsi8oqk1uac00mo";
 export const mockContactId = "lhwy39ga2zy8by1ol1bnaiso";
 export const mockResponseId = "z32bqib0nlcw8vqymlj6m8x7";
 export const mockSingleUseId = "qj57j3opsw8b5sxgea20fgcq";
@@ -33,10 +33,10 @@ export const mockMeta = {
 
 export const mockContact = {
   id: mockContactId,
+  workspaceId: mockWorkspaceId,
   userId: mockUserId,
   createdAt: new Date(2000, 1, 1, 19),
   updatedAt: new Date(2000, 1, 1, 19),
-  environmentId: mockEnvironmentId,
   attributes: [],
 };
 
@@ -47,7 +47,7 @@ export const mockTags = [
       name: "tag1",
       createdAt: new Date(),
       updatedAt: new Date(),
-      environmentId: mockEnvironmentId,
+      workspaceId: mockWorkspaceId,
     },
   },
 ];
@@ -78,6 +78,7 @@ export const mockResponse: ResponseMock = {
   variables: {},
   endingId: null,
   displayId: null,
+  ingestFlags: null,
 };
 
 const mockSurveyQuota: TSurveyQuota = {
@@ -116,7 +117,7 @@ const getMockTags = (tags: string[]): { tag: TTag }[] => {
       name: tag,
       createdAt: new Date(),
       updatedAt: new Date(),
-      environmentId: mockEnvironmentId,
+      workspaceId: mockWorkspaceId,
     },
   }));
 };
@@ -150,6 +151,7 @@ export const mockResponses: ResponseMock[] = [
     tags: getMockTags(["tag1", "tag3"]),
     endingId: null,
     displayId: null,
+    ingestFlags: null,
   },
   {
     id: "clsk8db0r001kk8iujkn32q8g",
@@ -176,6 +178,7 @@ export const mockResponses: ResponseMock[] = [
     tags: getMockTags(["tag1", "tag2"]),
     endingId: null,
     displayId: null,
+    ingestFlags: null,
   },
   {
     id: "clsk7b15p001fk8iu04qpvo2f",
@@ -201,6 +204,7 @@ export const mockResponses: ResponseMock[] = [
     language: null,
     endingId: null,
     displayId: null,
+    ingestFlags: null,
   },
   {
     id: "clsk6bk1l0017k8iut9dp0uxt",
@@ -226,6 +230,7 @@ export const mockResponses: ResponseMock[] = [
     language: null,
     endingId: null,
     displayId: null,
+    ingestFlags: null,
   },
   {
     id: "clsk5tgkm000uk8iueqoficwc",
@@ -251,6 +256,7 @@ export const mockResponses: ResponseMock[] = [
     language: null,
     endingId: null,
     displayId: null,
+    ingestFlags: null,
   },
 ];
 
@@ -320,13 +326,13 @@ export const getFilteredMockResponses = (
           case "equals":
             return response.data?.[key] === value.value;
           case "greaterThan":
-            return Number(response.data?.[key]) > value.value;
+            return Number(response.data?.[key]) > Number(value.value);
           case "lessThan":
-            return Number(response.data?.[key]) < value.value;
+            return Number(response.data?.[key]) < Number(value.value);
           case "greaterEqual":
-            return Number(response.data?.[key]) >= value.value;
+            return Number(response.data?.[key]) >= Number(value.value);
           case "lessEqual":
-            return Number(response.data?.[key]) <= value.value;
+            return Number(response.data?.[key]) <= Number(value.value);
           case "includesAll":
             return value.value.every((val: string | number) =>
               (response.data?.[key] as string[])?.includes(String(val))
@@ -429,7 +435,6 @@ export const mockSurvey: TSurvey = {
   updatedAt: new Date("2024-02-06T20:12:03.521Z"),
   name: "New Survey",
   type: "link",
-  environmentId: "envId",
   createdBy: "creatorId",
   status: "draft",
   welcomeCard: mockWelcomeCard,
@@ -523,7 +528,7 @@ export const mockSurvey: TSurvey = {
   displayPercentage: null,
   autoComplete: null,
   isVerifyEmailEnabled: false,
-  projectOverwrites: null,
+  workspaceOverwrites: null,
   recaptcha: null,
   styling: null,
   surveyClosedMessage: null,

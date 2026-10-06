@@ -2,11 +2,12 @@
 import { resolve } from "path";
 import dts from "vite-plugin-dts";
 import { defineConfig } from "vitest/config";
+import { rewriteNodeNextDtsSpecifiers } from "../vite-plugins/node-next-dts";
 
 export default defineConfig({
   resolve: {
     alias: {
-      "@": resolve(__dirname, "."),
+      "@": resolve(__dirname, "src"),
     },
   },
   build: {
@@ -20,6 +21,15 @@ export default defineConfig({
       external: ["redis", "@formbricks/logger", "zod"],
     },
   },
+  plugins: [
+    dts({
+      include: ["src/**/*"],
+      exclude: ["src/**/*.test.ts", "src/**/*.spec.ts"],
+      entryRoot: "src",
+      outDir: "dist",
+      beforeWriteFile: rewriteNodeNextDtsSpecifiers,
+    }),
+  ],
   test: {
     environment: "node",
     globals: true,
@@ -27,11 +37,4 @@ export default defineConfig({
       reporter: ["text", "json", "html", "lcov"],
     },
   },
-  plugins: [
-    dts({
-      include: ["src/**/*", "types/**/*"],
-      entryRoot: ".",
-      outDir: "dist",
-    }),
-  ],
 });

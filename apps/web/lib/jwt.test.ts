@@ -5,12 +5,18 @@ import * as crypto from "@/lib/crypto";
 import {
   createEmailChangeToken,
   createEmailToken,
+  createFeedbackRecordsGatewayToken,
+  createGatewayServiceToken,
   createInviteToken,
+  createSsoRelinkIntent,
   createToken,
   createTokenForLinkSurvey,
   getEmailFromEmailToken,
   verifyEmailChangeToken,
+  verifyFeedbackRecordsGatewayToken,
+  verifyGatewayServiceToken,
   verifyInviteToken,
+  verifySsoRelinkIntent,
   verifyToken,
   verifyTokenForLinkSurvey,
 } from "./jwt";
@@ -89,6 +95,12 @@ vi.mock("@formbricks/database", () => ({
   },
 }));
 
+// `updatedAt` on the user's `credential` account, which Prisma bumps on every password write.
+// Email-change tokens are bound to it, so moving it in the prisma mock is how these tests simulate a
+// password reset or change.
+const CREDENTIAL_UPDATED_AT = new Date("2026-01-01T00:00:00.000Z");
+const CREDENTIAL_UPDATED_AT_AFTER_RESET = new Date("2026-01-02T09:30:00.000Z");
+
 // Mock logger
 vi.mock("@formbricks/logger", () => ({
   logger: {
@@ -102,6 +114,7 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
   const mockUser = {
     id: "test-user-id",
     email: "test@example.com",
+    accounts: [{ updatedAt: CREDENTIAL_UPDATED_AT }],
   };
 
   let mockSymmetricEncrypt: any;
@@ -131,7 +144,7 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
     });
 
     test("should accept custom options", () => {
-      const customOptions = { expiresIn: "1h" };
+      const customOptions = { expiresIn: "1h" as const };
       const token = createToken(mockUser.id, customOptions);
       expect(token).toBeDefined();
 
@@ -148,6 +161,43 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
         testNextAuthSecret: true,
         testEncryptionKey: false,
       });
+    });
+  });
+
+  describe("feedback records gateway tokens", () => {
+    test("creates and verifies a generic gateway token for feedbackRecords", () => {
+      const { token, expiresAt } = createGatewayServiceToken(mockUser.id, "feedbackRecords");
+
+      expect(token).toBeDefined();
+      expect(new Date(expiresAt).toString()).not.toBe("Invalid Date");
+      expect(verifyGatewayServiceToken(token, "feedbackRecords")).toEqual({ userId: mockUser.id });
+    });
+
+    test("creates and verifies a feedback records gateway token", () => {
+      const { token, expiresAt } = createFeedbackRecordsGatewayToken(mockUser.id);
+
+      expect(token).toBeDefined();
+      expect(new Date(expiresAt).toString()).not.toBe("Invalid Date");
+      expect(verifyFeedbackRecordsGatewayToken(token)).toEqual({ userId: mockUser.id });
+    });
+
+    test("rejects feedback records gateway tokens with the wrong purpose", () => {
+      const token = jwt.sign({ purpose: "wrong_purpose" }, TEST_NEXTAUTH_SECRET, {
+        subject: mockUser.id,
+      });
+
+      expect(() => verifyFeedbackRecordsGatewayToken(token)).toThrow(
+        "Invalid feedback records gateway token"
+      );
+    });
+
+    test("rejects expired feedback records gateway tokens", () => {
+      const expiredToken = jwt.sign({ purpose: "feedback_records_gateway" }, TEST_NEXTAUTH_SECRET, {
+        subject: mockUser.id,
+        expiresIn: -1,
+      });
+
+      expect(() => verifyFeedbackRecordsGatewayToken(expiredToken)).toThrow();
     });
   });
 
@@ -186,8 +236,8 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
   });
 
   describe("createEmailChangeToken", () => {
-    test("should create a valid email change token with 1 day expiration", () => {
-      const token = createEmailChangeToken(mockUser.id, mockUser.email);
+    test("should create a valid email change token with 1 day expiration", async () => {
+      const token = await createEmailChangeToken(mockUser.id, mockUser.email);
       expect(token).toBeDefined();
       expect(mockSymmetricEncrypt).toHaveBeenCalledWith(mockUser.id, TEST_ENCRYPTION_KEY);
       expect(mockSymmetricEncrypt).toHaveBeenCalledWith(mockUser.email, TEST_ENCRYPTION_KEY);
@@ -200,7 +250,17 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
     });
 
     test("should throw error if NEXTAUTH_SECRET or ENCRYPTION_KEY is not set", async () => {
-      await testMissingSecretsError(createEmailChangeToken, [mockUser.id, mockUser.email]);
+      await testMissingSecretsError(createEmailChangeToken, [mockUser.id, mockUser.email], {
+        isAsync: true,
+      });
+    });
+
+    test("should refuse to mint a token for a user without a credential account", async () => {
+      (prisma.user.findUnique as any).mockResolvedValue({ ...mockUser, accounts: [] });
+
+      await expect(createEmailChangeToken(mockUser.id, "new@example.com")).rejects.toThrow(
+        "Email change token cannot be bound"
+      );
     });
   });
 
@@ -255,6 +315,20 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
       const token = jwt.sign({ email: "test@example.com" }, TEST_NEXTAUTH_SECRET);
       await testMissingSecretsError(getEmailFromEmailToken, [token]);
     });
+
+    test("should reject a link survey token minted for another flow", () => {
+      const token = createTokenForLinkSurvey("test-survey-id", mockUser.email);
+      expect(() => getEmailFromEmailToken(token)).toThrow("Invalid token");
+    });
+
+    test("should reject an expired email-display token", () => {
+      const token = jwt.sign(
+        { email: `encrypted_${mockUser.email}`, purpose: "email_display" },
+        TEST_NEXTAUTH_SECRET,
+        { expiresIn: "-1s" }
+      );
+      expect(() => getEmailFromEmailToken(token)).toThrow();
+    });
   });
 
   describe("verifyTokenForLinkSurvey", () => {
@@ -263,6 +337,43 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
       const token = createTokenForLinkSurvey(surveyId, mockUser.email);
       const verifiedEmail = verifyTokenForLinkSurvey(token, surveyId);
       expect(verifiedEmail).toBe(mockUser.email);
+    });
+
+    // Regression: every token in this module is signed with NEXTAUTH_SECRET, so a token minted for a
+    // different flow must not pass as a verified email. `createEmailToken` is reachable through an
+    // unauthenticated server action for any registered address, so accepting it here bypassed the
+    // link-survey email gate for arbitrary people.
+    test("should reject an email-display token as a link survey verification token", () => {
+      const token = createEmailToken(mockUser.email);
+      expect(verifyTokenForLinkSurvey(token, "test-survey-id")).toBeNull();
+    });
+
+    test("should reject an invite token as a link survey verification token", () => {
+      const token = createInviteToken("invite-id", mockUser.email);
+      expect(verifyTokenForLinkSurvey(token, "test-survey-id")).toBeNull();
+    });
+
+    test("should reject a token with no surveyId claim signed with the plain secret", () => {
+      const token = jwt.sign({ email: `encrypted_${mockUser.email}` }, TEST_NEXTAUTH_SECRET);
+      expect(verifyTokenForLinkSurvey(token, "test-survey-id")).toBeNull();
+    });
+
+    test("should reject a link survey token whose purpose is for another flow", () => {
+      const token = jwt.sign(
+        { email: `encrypted_${mockUser.email}`, surveyId: "test-survey-id", purpose: "email_display" },
+        TEST_NEXTAUTH_SECRET
+      );
+      expect(verifyTokenForLinkSurvey(token, "test-survey-id")).toBeNull();
+    });
+
+    test("should reject an expired link survey token", () => {
+      const surveyId = "test-survey-id";
+      const token = jwt.sign(
+        { email: `encrypted_${mockUser.email}`, surveyId, purpose: "link_survey_email_verification" },
+        TEST_NEXTAUTH_SECRET,
+        { expiresIn: "-1s" }
+      );
+      expect(verifyTokenForLinkSurvey(token, surveyId)).toBeNull();
     });
 
     test("should return null for invalid token", () => {
@@ -380,6 +491,7 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
       expect(verified).toEqual({
         id: mockUser.id, // Returns the decrypted user ID
         email: mockUser.email,
+        purpose: "email_verification",
       });
     });
 
@@ -414,6 +526,7 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
       expect(verified).toEqual({
         id: mockUser.id, // Returns the raw ID from payload
         email: mockUser.email,
+        purpose: "email_verification",
       });
     });
 
@@ -425,6 +538,7 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
       expect(verified).toEqual({
         id: mockUser.id, // Returns the decrypted user ID
         email: mockUser.email,
+        purpose: "email_verification",
       });
     });
 
@@ -524,9 +638,9 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
 
   describe("verifyEmailChangeToken", () => {
     test("should verify and decrypt valid email change token", async () => {
-      const userId = "test-user-id";
-      const email = "test@example.com";
-      const token = createEmailChangeToken(userId, email);
+      const userId = mockUser.id;
+      const email = "new@example.com";
+      const token = await createEmailChangeToken(userId, email);
       const result = await verifyEmailChangeToken(token);
       expect(result).toEqual({ id: userId, email });
     });
@@ -556,17 +670,6 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
       );
     });
 
-    test("should return original id/email if decryption fails", async () => {
-      mockSymmetricDecrypt.mockImplementation(() => {
-        throw new Error("Decryption failed");
-      });
-
-      const payload = { id: "plain-id", email: "plain@example.com" };
-      const token = jwt.sign(payload, TEST_NEXTAUTH_SECRET);
-      const result = await verifyEmailChangeToken(token);
-      expect(result).toEqual(payload);
-    });
-
     test("should throw error for token with wrong signature", async () => {
       const invalidToken = jwt.sign(
         {
@@ -577,6 +680,110 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
       );
 
       await expect(verifyEmailChangeToken(invalidToken)).rejects.toThrow();
+    });
+
+    // ENG-2106: the link is consumable without a session, so the token must die with the credential
+    // state it was minted against — otherwise a password recovery revokes every session but leaves a
+    // token that can still move the login address (and the password-reset destination) to an attacker.
+    describe("credential-state binding", () => {
+      test("should reject a token minted before the password was reset", async () => {
+        const token = await createEmailChangeToken(mockUser.id, "attacker@evil.com");
+
+        // Prisma bumps the credential row's updatedAt on the password write. Note this holds even if the
+        // reset set the *same* password, which binding to the hash itself would have missed.
+        (prisma.user.findUnique as any).mockResolvedValue({
+          ...mockUser,
+          accounts: [{ updatedAt: CREDENTIAL_UPDATED_AT_AFTER_RESET }],
+        });
+
+        await expect(verifyEmailChangeToken(token)).rejects.toThrow("Email change token is no longer valid");
+      });
+
+      test("should reject a token replayed after the email already changed", async () => {
+        const token = await createEmailChangeToken(mockUser.id, "new@example.com");
+
+        // First use succeeds and moves the login address...
+        await expect(verifyEmailChangeToken(token)).resolves.toEqual({
+          id: mockUser.id,
+          email: "new@example.com",
+        });
+
+        // ...which is exactly what makes the same link inert on a second click.
+        (prisma.user.findUnique as any).mockResolvedValue({ ...mockUser, email: "new@example.com" });
+
+        await expect(verifyEmailChangeToken(token)).rejects.toThrow("Email change token is no longer valid");
+      });
+
+      test("should reject a token once the credential account is gone", async () => {
+        const token = await createEmailChangeToken(mockUser.id, "new@example.com");
+
+        (prisma.user.findUnique as any).mockResolvedValue({ ...mockUser, accounts: [] });
+
+        await expect(verifyEmailChangeToken(token)).rejects.toThrow("Email change token cannot be bound");
+      });
+
+      // The row this binds to must be the one Better Auth bumps on a password write — the full
+      // `(provider, providerAccountId)` unique tuple. Matching on `provider` alone would take an arbitrary
+      // `credential` row for a user that somehow had two, binding to a timestamp a reset never moves.
+      test("should scope the credential lookup to this user's own credential row", async () => {
+        await createEmailChangeToken(mockUser.id, "new@example.com");
+
+        expect(prisma.user.findUnique).toHaveBeenCalledWith(
+          expect.objectContaining({
+            select: expect.objectContaining({
+              accounts: expect.objectContaining({
+                where: { provider: "credential", providerAccountId: mockUser.id },
+              }),
+            }),
+          })
+        );
+      });
+
+      test("should reject an unbound token in the pre-fix shape", async () => {
+        const unboundToken = jwt.sign(
+          { id: `encrypted_${mockUser.id}`, email: "encrypted_attacker@evil.com" },
+          TEST_NEXTAUTH_SECRET,
+          { expiresIn: "1d" }
+        );
+
+        await expect(verifyEmailChangeToken(unboundToken)).rejects.toThrow(
+          "Token is invalid or missing required fields"
+        );
+      });
+
+      test("should reject a token whose fingerprint does not match", async () => {
+        const forgedToken = jwt.sign(
+          {
+            id: `encrypted_${mockUser.id}`,
+            email: "encrypted_attacker@evil.com",
+            purpose: "email_change",
+            fingerprint: "ab".repeat(32),
+          },
+          TEST_NEXTAUTH_SECRET,
+          { expiresIn: "1d" }
+        );
+
+        await expect(verifyEmailChangeToken(forgedToken)).rejects.toThrow(
+          "Email change token is no longer valid"
+        );
+      });
+
+      test("should reject a token issued for a different flow", async () => {
+        const wrongPurposeToken = jwt.sign(
+          {
+            id: `encrypted_${mockUser.id}`,
+            email: "encrypted_attacker@evil.com",
+            purpose: "email_verification",
+            fingerprint: "ab".repeat(32),
+          },
+          TEST_NEXTAUTH_SECRET,
+          { expiresIn: "1d" }
+        );
+
+        await expect(verifyEmailChangeToken(wrongPurposeToken)).rejects.toThrow(
+          "Token is invalid or missing required fields"
+        );
+      });
     });
   });
 
@@ -880,23 +1087,26 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
         expect(result.email).toBe(mockUser.email);
       });
 
-      test("should handle mixed encrypted/unencrypted fields", async () => {
+      // Email-change tokens deliberately have no legacy path — an unbound payload is rejected outright
+      // (see the credential-state binding tests) — so the per-field decryption fallback is covered here
+      // on the invite token, which still accepts pre-encryption payloads.
+      test("should handle mixed encrypted/unencrypted fields", () => {
         mockSymmetricDecrypt
-          .mockImplementationOnce(() => mockUser.id) // id decrypts successfully
+          .mockImplementationOnce(() => "test-invite-id") // inviteId decrypts successfully
           .mockImplementationOnce(() => {
             throw new Error("Email not encrypted");
           }); // email fails
 
         const token = jwt.sign(
           {
-            id: "encrypted_test-id",
+            inviteId: "encrypted_test-invite-id",
             email: "plain-email@example.com",
           },
           TEST_NEXTAUTH_SECRET
         );
 
-        const result = await verifyEmailChangeToken(token);
-        expect(result.id).toBe(mockUser.id);
+        const result = verifyInviteToken(token);
+        expect(result.inviteId).toBe("test-invite-id");
         expect(result.email).toBe("plain-email@example.com");
       });
 
@@ -1002,6 +1212,79 @@ describe("JWT Functions - Comprehensive Security Tests", () => {
         const results = await Promise.all(verifications);
         expect(results.length).toBe(100);
         expect(results.every((result: any) => result.id === mockUser.id)).toBe(true); // Returns decrypted user ID
+      });
+    });
+
+    describe("SSO recovery support", () => {
+      test("creates verification tokens that preserve the recovery purpose", async () => {
+        const token = createToken(mockUser.id, { purpose: "sso_recovery", expiresIn: "15m" });
+
+        await expect(verifyToken(token)).resolves.toEqual(
+          expect.objectContaining({
+            id: mockUser.id,
+            email: mockUser.email,
+            purpose: "sso_recovery",
+          })
+        );
+      });
+
+      test("defaults legacy verification tokens to email_verification when purpose is missing", async () => {
+        const legacyToken = jwt.sign({ id: `encrypted_${mockUser.id}` }, TEST_NEXTAUTH_SECRET);
+
+        await expect(verifyToken(legacyToken)).resolves.toEqual(
+          expect.objectContaining({
+            id: mockUser.id,
+            email: mockUser.email,
+            purpose: "email_verification",
+          })
+        );
+      });
+
+      test("round-trips SSO relink intents without losing callback state", () => {
+        const intent = createSsoRelinkIntent({
+          userId: mockUser.id,
+          email: mockUser.email,
+          provider: "google",
+          providerAccountId: "provider-123",
+          callbackUrl: "http://localhost:3000/invite?token=invite-token",
+        });
+
+        expect(verifySsoRelinkIntent(intent)).toEqual({
+          userId: mockUser.id,
+          email: mockUser.email,
+          provider: "google",
+          providerAccountId: "provider-123",
+          callbackUrl: "http://localhost:3000/invite?token=invite-token",
+        });
+      });
+
+      test("rejects expired SSO relink intents", () => {
+        const expiredIntent = jwt.sign(
+          {
+            userId: crypto.symmetricEncrypt(mockUser.id, TEST_ENCRYPTION_KEY),
+            email: crypto.symmetricEncrypt(mockUser.email, TEST_ENCRYPTION_KEY),
+            provider: "google",
+            providerAccountId: crypto.symmetricEncrypt("provider-123", TEST_ENCRYPTION_KEY),
+            callbackUrl: crypto.symmetricEncrypt("http://localhost:3000", TEST_ENCRYPTION_KEY),
+            exp: Math.floor(Date.now() / 1000) - 3600,
+          },
+          TEST_NEXTAUTH_SECRET
+        );
+
+        expect(() => verifySsoRelinkIntent(expiredIntent)).toThrow();
+      });
+
+      test("rejects tampered SSO relink intents", () => {
+        const intent = createSsoRelinkIntent({
+          userId: mockUser.id,
+          email: mockUser.email,
+          provider: "google",
+          providerAccountId: "provider-123",
+          callbackUrl: "http://localhost:3000",
+        });
+
+        const tamperedIntent = `${intent.slice(0, -1)}x`;
+        expect(() => verifySsoRelinkIntent(tamperedIntent)).toThrow();
       });
     });
   });

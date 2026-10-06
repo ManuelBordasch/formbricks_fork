@@ -1,13 +1,14 @@
 import "server-only";
-import { Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
 import { prisma } from "@formbricks/database";
+import { PrismaErrorType } from "@formbricks/database/types/error";
 import { DatabaseError, InvalidInputError, ResourceNotFoundError } from "@formbricks/types/errors";
 import { TSurveyStatus } from "@formbricks/types/surveys/types";
+import { isPrismaKnownRequestError, isUniqueConstraintError } from "@/lib/utils/prisma-error";
 
 export interface TSurveyBySlug {
   id: string;
-  environmentId: string;
+  workspaceId: string;
   status: string;
 }
 
@@ -17,13 +18,10 @@ export interface TSurveyWithSlug {
   slug: string | null;
   status: TSurveyStatus;
   createdAt: Date;
-  environment: {
+  workspace: {
     id: string;
-    type: "production" | "development";
-    project: {
-      id: string;
-      name: string;
-    };
+    name: string;
+    organizationId: string;
   };
 }
 
@@ -32,11 +30,11 @@ export const getSurveyBySlug = reactCache(async (slug: string): Promise<TSurveyB
   try {
     const survey = await prisma.survey.findUnique({
       where: { slug },
-      select: { id: true, environmentId: true, status: true },
+      select: { id: true, workspaceId: true, status: true },
     });
     return survey;
   } catch (error) {
-    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    if (isPrismaKnownRequestError(error)) {
       throw new DatabaseError(error.message);
     }
     throw error;
@@ -56,15 +54,15 @@ export const updateSurveySlug = async (
     });
     return result;
   } catch (error) {
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+    if (isUniqueConstraintError(error)) {
       throw new InvalidInputError("A survey with this slug already exists");
     }
 
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025") {
+    if (isPrismaKnownRequestError(error, PrismaErrorType.RecordNotFound)) {
       throw new ResourceNotFoundError("Survey", surveyId);
     }
 
-    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    if (isPrismaKnownRequestError(error)) {
       throw new DatabaseError(error.message);
     }
 
@@ -79,9 +77,7 @@ export const getSurveysWithSlugsByOrganizationId = reactCache(
       const surveys = await prisma.survey.findMany({
         where: {
           slug: { not: null },
-          environment: {
-            project: { organizationId },
-          },
+          workspace: { organizationId },
         },
         select: {
           id: true,
@@ -89,20 +85,14 @@ export const getSurveysWithSlugsByOrganizationId = reactCache(
           slug: true,
           status: true,
           createdAt: true,
-          environment: {
-            select: {
-              id: true,
-              type: true,
-              project: {
-                select: { id: true, name: true },
-              },
-            },
+          workspace: {
+            select: { id: true, name: true, organizationId: true },
           },
         },
       });
       return surveys;
     } catch (error) {
-      if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      if (isPrismaKnownRequestError(error)) {
         throw new DatabaseError(error.message);
       }
       throw error;

@@ -1,6 +1,6 @@
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { useAutoAnimate } from "@formkit/auto-animate/react";
-import { Project } from "@prisma/client";
+import { Workspace } from "@formbricks/database/prisma-browser";
 import { TI18nString } from "@formbricks/types/i18n";
 import { TSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
 import { TSurveyElement } from "@formbricks/types/surveys/elements";
@@ -11,11 +11,12 @@ import { BlockCard } from "@/modules/survey/editor/components/block-card";
 interface BlocksDroppableProps {
   localSurvey: TSurvey;
   setLocalSurvey: (survey: TSurvey) => void;
-  project: Project;
+  workspace: Workspace;
   moveElement: (elementIdx: number, up: boolean) => void;
   updateElement: (elementIdx: number, updatedAttributes: any) => void;
   updateBlockLogic: (elementIdx: number, logic: TSurveyBlockLogic[]) => void;
   updateBlockLogicFallback: (elementIdx: number, logicFallback: string | undefined) => void;
+  updateBlockName: (blockIdx: number, name: string) => void;
   updateBlockButtonLabel: (
     blockIndex: number,
     labelKey: "buttonLabel" | "backButtonLabel",
@@ -25,8 +26,6 @@ interface BlocksDroppableProps {
   duplicateElement: (elementIdx: number) => void;
   activeElementId: string | null;
   setActiveElementId: (elementId: string | null) => void;
-  selectedLanguageCode: string;
-  setSelectedLanguageCode: (language: string) => void;
   invalidElements: string[] | null;
   addElement: (element: any, index?: number) => void;
   isFormbricksCloud: boolean;
@@ -51,13 +50,12 @@ export const BlocksDroppable = ({
   localSurvey,
   setLocalSurvey,
   moveElement,
-  project,
-  selectedLanguageCode,
+  workspace,
   setActiveElementId,
-  setSelectedLanguageCode,
   updateElement,
   updateBlockLogic,
   updateBlockLogicFallback,
+  updateBlockName,
   updateBlockButtonLabel,
   addElement,
   isFormbricksCloud,
@@ -72,7 +70,7 @@ export const BlocksDroppable = ({
   moveBlock,
   addElementToBlock,
   moveElementToBlock,
-}: BlocksDroppableProps) => {
+}: Readonly<BlocksDroppableProps>) => {
   const [parent] = useAutoAnimate();
 
   return (
@@ -88,17 +86,16 @@ export const BlocksDroppable = ({
               key={block.id}
               localSurvey={localSurvey}
               setLocalSurvey={setLocalSurvey}
-              project={project}
+              workspace={workspace}
               block={block}
               blockIdx={blockIdx}
               moveElement={moveElement}
               updateElement={updateElement}
               updateBlockLogic={updateBlockLogic}
               updateBlockLogicFallback={updateBlockLogicFallback}
+              updateBlockName={updateBlockName}
               updateBlockButtonLabel={updateBlockButtonLabel}
               duplicateElement={duplicateElement}
-              selectedLanguageCode={selectedLanguageCode}
-              setSelectedLanguageCode={setSelectedLanguageCode}
               deleteElement={deleteElement}
               activeElementId={activeElementId}
               setActiveElementId={setActiveElementId}

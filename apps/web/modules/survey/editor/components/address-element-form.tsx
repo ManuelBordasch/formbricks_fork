@@ -19,8 +19,6 @@ interface AddressElementFormProps {
   elementIdx: number;
   updateElement: (elementIdx: number, updatedAttributes: Partial<TSurveyElement>) => void;
   isInvalid: boolean;
-  selectedLanguageCode: string;
-  setSelectedLanguageCode: (language: string) => void;
   locale: TUserLocale;
   isStorageConfigured: boolean;
   isExternalUrlsAllowed?: boolean;
@@ -32,8 +30,6 @@ export const AddressElementForm = ({
   updateElement,
   isInvalid,
   localSurvey,
-  selectedLanguageCode,
-  setSelectedLanguageCode,
   locale,
   isStorageConfigured = true,
   isExternalUrlsAllowed,
@@ -43,32 +39,32 @@ export const AddressElementForm = ({
   const fields = [
     {
       id: "addressLine1",
-      label: t("environments.surveys.edit.address_line_1"),
+      label: t("workspace.surveys.edit.address_line_1"),
       ...element.addressLine1,
     },
     {
       id: "addressLine2",
-      label: t("environments.surveys.edit.address_line_2"),
+      label: t("workspace.surveys.edit.address_line_2"),
       ...element.addressLine2,
     },
     {
       id: "city",
-      label: t("environments.surveys.edit.city"),
+      label: t("workspace.surveys.edit.city"),
       ...element.city,
     },
     {
       id: "state",
-      label: t("environments.surveys.edit.state"),
+      label: t("workspace.surveys.edit.state"),
       ...element.state,
     },
     {
       id: "zip",
-      label: t("environments.surveys.edit.zip"),
+      label: t("workspace.surveys.edit.zip"),
       ...element.zip,
     },
     {
       id: "country",
-      label: t("environments.surveys.edit.country"),
+      label: t("workspace.surveys.edit.country"),
       ...element.country,
     },
   ];
@@ -86,7 +82,7 @@ export const AddressElementForm = ({
       .every((field) => !field.required);
 
     updateElement(elementIdx, { required: !allFieldsAreOptional });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- sync-only effect; adding updateElement/elementIdx would loop as it writes back into the survey
   }, [element.addressLine1, element.addressLine2, element.city, element.state, element.zip, element.country]);
 
   const [parent] = useAutoAnimate();
@@ -96,13 +92,11 @@ export const AddressElementForm = ({
       <ElementFormInput
         id="headline"
         value={element.headline}
-        label={t("environments.surveys.edit.question") + "*"}
+        label={t("workspace.surveys.edit.question") + "*"}
         localSurvey={localSurvey}
         elementIdx={elementIdx}
         isInvalid={isInvalid}
         updateElement={updateElement}
-        selectedLanguageCode={selectedLanguageCode}
-        setSelectedLanguageCode={setSelectedLanguageCode}
         locale={locale}
         isStorageConfigured={isStorageConfigured}
         autoFocus={!element.headline?.default || element.headline.default.trim() === ""}
@@ -121,8 +115,6 @@ export const AddressElementForm = ({
                 elementIdx={elementIdx}
                 isInvalid={isInvalid}
                 updateElement={updateElement}
-                selectedLanguageCode={selectedLanguageCode}
-                setSelectedLanguageCode={setSelectedLanguageCode}
                 locale={locale}
                 isStorageConfigured={isStorageConfigured}
                 autoFocus={!element.subheader?.default || element.subheader.default.trim() === ""}
@@ -142,8 +134,8 @@ export const AddressElementForm = ({
                 subheader: createI18nString("", surveyLanguageCodes),
               });
             }}>
-            <PlusIcon className="mr-1 h-4 w-4" />
-            {t("environments.surveys.edit.add_description")}
+            <PlusIcon className="mr-1 size-4" />
+            {t("workspace.surveys.edit.add_description")}
           </Button>
         )}
 
@@ -154,8 +146,6 @@ export const AddressElementForm = ({
           elementIdx={elementIdx}
           isInvalid={isInvalid}
           updateElement={updateElement}
-          selectedLanguageCode={selectedLanguageCode}
-          setSelectedLanguageCode={setSelectedLanguageCode}
           locale={locale}
           isStorageConfigured={isStorageConfigured}
         />

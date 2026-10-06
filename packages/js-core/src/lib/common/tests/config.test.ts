@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/unbound-method -- required for mocking */
 // config.test.ts
 import { type Mock, afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { Config } from "@/lib/common/config";
@@ -91,7 +90,7 @@ describe("Config", () => {
     // Now we call update()
     const newStatus = { value: "error", expiresAt: "2100-01-01T00:00:00Z" } as unknown as TConfig["status"];
 
-    configInstance.update({ ...mockConfig, status: newStatus } as unknown as TConfigUpdateInput);
+    configInstance.update({ ...mockConfig, status: newStatus });
 
     // The update call should eventually call setItem on AsyncStorage
     expect(setItemMock).toHaveBeenCalledWith(JS_LOCAL_STORAGE_KEY, expect.any(String));

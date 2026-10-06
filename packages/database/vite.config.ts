@@ -1,8 +1,10 @@
 import { promises as fs } from "fs";
 import { glob } from "glob";
 import { dirname, resolve } from "path";
-import { Plugin, UserConfig, defineConfig } from "vite";
+import { Plugin } from "vite";
 import dts from "vite-plugin-dts";
+import { ViteUserConfig, defineConfig } from "vitest/config";
+import { rewriteNodeNextDtsSpecifiers } from "../vite-plugins/node-next-dts";
 
 const copySqlMigrationsPlugin: Plugin = {
   name: "copy-sql-migrations",
@@ -20,8 +22,9 @@ const copySqlMigrationsPlugin: Plugin = {
   },
 };
 
-export default defineConfig(async (): Promise<UserConfig> => {
+export default defineConfig(async (): Promise<ViteUserConfig> => {
   const migrationTsFiles = await glob("migration/**/migration.ts", { cwd: __dirname });
+  const generatedPrismaTsFiles = await glob("generated/prisma/**/*.ts", { cwd: __dirname });
   const migrationEntries = migrationTsFiles.reduce((acc: Record<string, string>, file: string) => {
     const dir = dirname(file);
     const entryName = `${dir}/migration`;
@@ -30,18 +33,28 @@ export default defineConfig(async (): Promise<UserConfig> => {
   }, {});
 
   return {
+    test: {
+      coverage: {
+        reporter: ["text", "json", "html", "lcov"],
+      },
+    },
     resolve: {
       alias: {
         "@": resolve(__dirname, "src"),
+        "@formbricks/logger": resolve(__dirname, "../logger/src/index.ts"),
       },
     },
     build: {
       rollupOptions: {
         input: {
           index: resolve(__dirname, "src/index.ts"),
+          "src/prisma": resolve(__dirname, "src/prisma.ts"),
+          "src/prisma-browser": resolve(__dirname, "src/prisma-browser.ts"),
+          "src/prisma-adapter": resolve(__dirname, "src/prisma-adapter.ts"),
           "scripts/apply-migrations": resolve(__dirname, "src/scripts/apply-migrations.ts"),
           "scripts/create-saml-database": resolve(__dirname, "src/scripts/create-saml-database.ts"),
           "scripts/migration-runner": resolve(__dirname, "src/scripts/migration-runner.ts"),
+          "scripts/wait-for-database": resolve(__dirname, "src/scripts/wait-for-database.ts"),
           "scripts/backfill-attribute-values": resolve(__dirname, "src/scripts/backfill-attribute-values.ts"),
           ...migrationEntries,
         },
@@ -59,7 +72,10 @@ export default defineConfig(async (): Promise<UserConfig> => {
         ],
         external: [
           // External dependencies that should not be bundled
-          "@prisma/client",
+          "@prisma/adapter-pg",
+          "@prisma/client/runtime/client",
+          "@prisma/client/runtime/index-browser",
+          "pg",
           "zod",
           "zod-openapi",
           "@paralleldrive/cuid2",
@@ -72,9 +88,19 @@ export default defineConfig(async (): Promise<UserConfig> => {
     plugins: [
       dts({
         rollupTypes: false,
-        include: ["src/**/*"],
-        exclude: ["src/**/*.test.ts", "src/**/*.spec.ts"],
+        include: [
+          "src/index.ts",
+          "src/client.ts",
+          "src/json-types.ts",
+          "src/prisma.ts",
+          "src/prisma-browser.ts",
+          "src/prisma-adapter.ts",
+          ...generatedPrismaTsFiles,
+        ],
+        entryRoot: ".",
+        exclude: ["src/**/*.test.ts", "src/**/*.spec.ts", "migration/**/*"],
         insertTypesEntry: true,
+        beforeWriteFile: rewriteNodeNextDtsSpecifiers,
       }),
       copySqlMigrationsPlugin,
     ],

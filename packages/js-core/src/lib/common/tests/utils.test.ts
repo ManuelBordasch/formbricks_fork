@@ -1,6 +1,6 @@
 // utils.test.ts
 import { beforeEach, describe, expect, test, vi } from "vitest";
-import { mockProjectId, mockSurveyId } from "@/lib/common/tests/__mocks__/config.mock";
+import { mockSurveyId } from "@/lib/common/tests/__mocks__/config.mock";
 import {
   checkUrlMatch,
   diffInDays,
@@ -11,7 +11,6 @@ import {
   getLanguageCode,
   getSecureRandom,
   getStyling,
-  handleHiddenFields,
   handleUrlFilters,
   isNowExpired,
   shouldDisplayBasedOnPercentage,
@@ -19,12 +18,11 @@ import {
   wrapThrowsAsync,
 } from "@/lib/common/utils";
 import type {
-  TEnvironmentState,
-  TEnvironmentStateActionClass,
-  TEnvironmentStateProject,
-  TEnvironmentStateSurvey,
-  TSurveyStyling,
   TUserState,
+  TWorkspaceState,
+  TWorkspaceStateActionClass,
+  TWorkspaceStateSettings,
+  TWorkspaceStateSurvey,
 } from "@/types/config";
 import { type TActionClassNoCodeConfig, type TActionClassPageUrlRule } from "@/types/survey";
 
@@ -151,10 +149,10 @@ describe("utils.ts", () => {
   // filterSurveys
   // ---------------------------------------------------------------------------------
   describe("filterSurveys()", () => {
-    // We'll create a minimal environment state
-    let environment: TEnvironmentState;
+    // We'll create a minimal workspace state
+    let workspace: TWorkspaceState;
     let user: TUserState;
-    const baseSurvey: Partial<TEnvironmentStateSurvey> = {
+    const baseSurvey: Partial<TWorkspaceStateSurvey> = {
       id: mockSurveyId,
       displayOption: "displayOnce",
       displayLimit: 1,
@@ -163,18 +161,17 @@ describe("utils.ts", () => {
     };
 
     beforeEach(() => {
-      environment = {
+      workspace = {
         expiresAt: new Date(),
         data: {
-          project: {
-            id: mockProjectId,
+          settings: {
             recontactDays: 7, // fallback if survey doesn't have it
             clickOutsideClose: false,
             overlay: "none",
             placement: "bottomRight",
             inAppSurveyBranding: true,
             styling: { allowStyleOverwrite: false },
-          } as TEnvironmentStateProject,
+          },
           surveys: [],
           actionClasses: [],
         },
@@ -194,72 +191,72 @@ describe("utils.ts", () => {
 
     test("returns no surveys if user has no segments and userId is set", () => {
       user.data.userId = "user_abc";
-      // environment has a single survey
-      environment.data.surveys = [
-        { ...baseSurvey, id: mockSurveyId1, segment: { id: mockSegmentId1 } } as TEnvironmentStateSurvey,
+      // workspace has a single survey
+      workspace.data.surveys = [
+        { ...baseSurvey, id: mockSurveyId1, segment: { id: mockSegmentId1 } } as TWorkspaceStateSurvey,
       ];
 
-      const result = filterSurveys(environment, user);
+      const result = filterSurveys(workspace, user);
       expect(result).toEqual([]); // no segments => none pass
     });
 
     test("returns surveys if user has no userId but displayOnce and no displays yet", () => {
       // userId is null => it won't segment filter
-      environment.data.surveys = [
-        { ...baseSurvey, id: mockSurveyId1, displayOption: "displayOnce" } as TEnvironmentStateSurvey,
+      workspace.data.surveys = [
+        { ...baseSurvey, id: mockSurveyId1, displayOption: "displayOnce" } as TWorkspaceStateSurvey,
       ];
 
-      const result = filterSurveys(environment, user);
+      const result = filterSurveys(workspace, user);
       expect(result).toHaveLength(1);
       expect(result[0].id).toBe(mockSurveyId1);
     });
 
     test("skips surveys that already displayed if displayOnce is used", () => {
-      environment.data.surveys = [
-        { ...baseSurvey, id: mockSurveyId1, displayOption: "displayOnce" } as TEnvironmentStateSurvey,
+      workspace.data.surveys = [
+        { ...baseSurvey, id: mockSurveyId1, displayOption: "displayOnce" } as TWorkspaceStateSurvey,
       ];
       user.data.displays = [{ surveyId: mockSurveyId1, createdAt: new Date() }];
 
-      const result = filterSurveys(environment, user);
+      const result = filterSurveys(workspace, user);
       expect(result).toEqual([]);
     });
 
     test("skips surveys if user responded to them and displayOption=displayMultiple", () => {
-      environment.data.surveys = [
-        { ...baseSurvey, id: mockSurveyId1, displayOption: "displayMultiple" } as TEnvironmentStateSurvey,
+      workspace.data.surveys = [
+        { ...baseSurvey, id: mockSurveyId1, displayOption: "displayMultiple" } as TWorkspaceStateSurvey,
       ];
       user.data.responses = [mockSurveyId1];
 
-      const result = filterSurveys(environment, user);
+      const result = filterSurveys(workspace, user);
       expect(result).toEqual([]);
     });
 
     test("handles displaySome logic with displayLimit", () => {
-      environment.data.surveys = [
+      workspace.data.surveys = [
         {
           ...baseSurvey,
           id: mockSurveyId1,
           displayOption: "displaySome",
           displayLimit: 2,
-        } as TEnvironmentStateSurvey,
+        } as TWorkspaceStateSurvey,
       ];
       // user has 1 display of s1
       user.data.displays = [{ surveyId: mockSurveyId1, createdAt: new Date() }];
 
       // No responses => so it's still allowed
-      const result = filterSurveys(environment, user);
+      const result = filterSurveys(workspace, user);
       expect(result).toHaveLength(1);
     });
 
     test("filters out surveys if recontactDays not met", () => {
-      // Suppose survey uses project fallback (7 days)
-      environment.data.surveys = [
-        { ...baseSurvey, id: mockSurveyId1, displayOption: "displayOnce" } as TEnvironmentStateSurvey,
+      // Suppose survey uses workspace fallback (7 days)
+      workspace.data.surveys = [
+        { ...baseSurvey, id: mockSurveyId1, displayOption: "displayOnce" } as TWorkspaceStateSurvey,
       ];
       // user last displayAt is only 3 days ago
       user.data.lastDisplayAt = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
 
-      const result = filterSurveys(environment, user);
+      const result = filterSurveys(workspace, user);
       expect(result).toHaveLength(0);
     });
 
@@ -267,37 +264,83 @@ describe("utils.ts", () => {
       // user last displayAt is 8 days ago
       user.data.lastDisplayAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
 
-      environment.data.surveys = [
+      workspace.data.surveys = [
         {
           ...baseSurvey,
           id: mockSurveyId1,
           displayOption: "respondMultiple",
           recontactDays: null,
-        } as TEnvironmentStateSurvey,
+        } as TWorkspaceStateSurvey,
       ];
-      const result = filterSurveys(environment, user);
+      const result = filterSurveys(workspace, user);
       expect(result).toHaveLength(1);
+    });
+
+    test("anonymous user: excludes segment-targeted surveys (new shape: hasFilters=true)", () => {
+      workspace.data.surveys = [
+        {
+          ...baseSurvey,
+          id: mockSurveyId1,
+          segment: { id: mockSegmentId1, hasFilters: true },
+          displayOption: "respondMultiple",
+        } as TWorkspaceStateSurvey,
+        {
+          ...baseSurvey,
+          id: mockSurveyId2,
+          segment: { id: mockSegmentId2, hasFilters: false },
+          displayOption: "respondMultiple",
+        } as TWorkspaceStateSurvey,
+      ];
+
+      const result = filterSurveys(workspace, user);
+      expect(result).toHaveLength(1);
+      expect(result[0].id).toBe(mockSurveyId2);
+    });
+
+    test("anonymous user: excludes segment-targeted surveys when cached payload uses legacy shape (filters array)", () => {
+      // Simulates a localStorage payload written by an older SDK version that
+      // still has `segment.filters` and no `hasFilters`. The defensive check
+      // must fall back to the legacy shape so anonymous users don't receive
+      // segment-targeted surveys.
+      workspace.data.surveys = [
+        {
+          ...baseSurvey,
+          id: mockSurveyId1,
+          segment: { id: mockSegmentId1, filters: [{ type: "attribute", value: "plan" }] },
+          displayOption: "respondMultiple",
+        } as unknown as TWorkspaceStateSurvey,
+        {
+          ...baseSurvey,
+          id: mockSurveyId2,
+          segment: { id: mockSegmentId2, filters: [] },
+          displayOption: "respondMultiple",
+        } as unknown as TWorkspaceStateSurvey,
+      ];
+
+      const result = filterSurveys(workspace, user);
+      expect(result).toHaveLength(1);
+      expect(result[0].id).toBe(mockSurveyId2);
     });
 
     test("filters by segment if userId is set and user has segments", () => {
       user.data.userId = "user_abc";
       user.data.segments = [mockSegmentId1];
-      environment.data.surveys = [
+      workspace.data.surveys = [
         {
           ...baseSurvey,
           id: mockSurveyId1,
           segment: { id: mockSegmentId1 },
           displayOption: "respondMultiple",
-        } as TEnvironmentStateSurvey,
+        } as TWorkspaceStateSurvey,
         {
           ...baseSurvey,
           id: mockSurveyId2,
           segment: { id: mockSegmentId2 },
           displayOption: "respondMultiple",
-        } as TEnvironmentStateSurvey,
+        } as TWorkspaceStateSurvey,
       ];
 
-      const result = filterSurveys(environment, user);
+      const result = filterSurveys(workspace, user);
       // only the one that matches user's segment
       expect(result).toHaveLength(1);
       expect(result[0].id).toBe(mockSurveyId1);
@@ -308,53 +351,50 @@ describe("utils.ts", () => {
   // getStyling
   // ---------------------------------------------------------------------------------
   describe("getStyling()", () => {
-    test("returns project styling if allowStyleOverwrite=false", () => {
-      const project = {
-        id: "p1",
+    test("returns workspace styling if allowStyleOverwrite=false", () => {
+      const settings = {
         styling: { allowStyleOverwrite: false, brandColor: { light: "#fff" } },
-      } as TEnvironmentStateProject;
+      } as TWorkspaceStateSettings;
       const survey = {
         styling: {
           overwriteThemeStyling: true,
           brandColor: { light: "#000" },
-        } as TSurveyStyling,
-      } as TEnvironmentStateSurvey;
+        },
+      } as TWorkspaceStateSurvey;
 
-      const result = getStyling(project, survey);
-      // should get project styling
-      expect(result).toEqual(project.styling);
+      const result = getStyling(settings, survey);
+      // should get workspace styling
+      expect(result).toEqual(settings.styling);
     });
 
-    test("returns project styling if allowStyleOverwrite=true but survey overwriteThemeStyling=false", () => {
-      const project = {
-        id: "p1",
+    test("returns workspace styling if allowStyleOverwrite=true but survey overwriteThemeStyling=false", () => {
+      const settings = {
         styling: { allowStyleOverwrite: true, brandColor: { light: "#fff" } },
-      } as TEnvironmentStateProject;
+      } as TWorkspaceStateSettings;
       const survey = {
         styling: {
           overwriteThemeStyling: false,
           brandColor: { light: "#000" },
-        } as TSurveyStyling,
-      } as TEnvironmentStateSurvey;
+        },
+      } as TWorkspaceStateSurvey;
 
-      const result = getStyling(project, survey);
-      // should get project styling still
-      expect(result).toEqual(project.styling);
+      const result = getStyling(settings, survey);
+      // should get workspace styling still
+      expect(result).toEqual(settings.styling);
     });
 
     test("returns survey styling if allowStyleOverwrite=true and survey overwriteThemeStyling=true", () => {
-      const project = {
-        id: "p1",
+      const settings = {
         styling: { allowStyleOverwrite: true, brandColor: { light: "#fff" } },
-      } as TEnvironmentStateProject;
+      } as TWorkspaceStateSettings;
       const survey = {
         styling: {
           overwriteThemeStyling: true,
           brandColor: { light: "#000" },
-        } as TSurveyStyling,
-      } as TEnvironmentStateSurvey;
+        },
+      } as TWorkspaceStateSurvey;
 
-      const result = getStyling(project, survey);
+      const result = getStyling(settings, survey);
       expect(result).toEqual(survey.styling);
     });
   });
@@ -377,7 +417,7 @@ describe("utils.ts", () => {
             enabled: true,
           },
         ],
-      } as unknown as TEnvironmentStateSurvey;
+      } as unknown as TWorkspaceStateSurvey;
       expect(getDefaultLanguageCode(survey)).toBe("fr");
     });
 
@@ -387,7 +427,7 @@ describe("utils.ts", () => {
           { language: { code: "en" }, default: false, enabled: true },
           { language: { code: "fr" }, default: false, enabled: true },
         ],
-      } as unknown as TEnvironmentStateSurvey;
+      } as unknown as TWorkspaceStateSurvey;
       expect(getDefaultLanguageCode(survey)).toBeUndefined();
     });
   });
@@ -399,7 +439,7 @@ describe("utils.ts", () => {
     test("returns 'default' if no language param is passed", () => {
       const survey = {
         languages: [{ language: { code: "en" }, default: true, enabled: true }],
-      } as unknown as TEnvironmentStateSurvey;
+      } as unknown as TWorkspaceStateSurvey;
       const code = getLanguageCode(survey, undefined);
       expect(code).toBe("default");
     });
@@ -410,7 +450,7 @@ describe("utils.ts", () => {
           { language: { code: "en" }, default: true, enabled: true },
           { language: { code: "fr" }, default: false, enabled: true },
         ],
-      } as unknown as TEnvironmentStateSurvey;
+      } as unknown as TWorkspaceStateSurvey;
       const code = getLanguageCode(survey, "en");
       expect(code).toBe("default");
     });
@@ -421,7 +461,7 @@ describe("utils.ts", () => {
           { language: { code: "en" }, default: true, enabled: true },
           { language: { code: "fr" }, default: false, enabled: false },
         ],
-      } as unknown as TEnvironmentStateSurvey;
+      } as unknown as TWorkspaceStateSurvey;
       const code = getLanguageCode(survey, "fr");
       expect(code).toBeUndefined();
     });
@@ -432,7 +472,7 @@ describe("utils.ts", () => {
           { language: { code: "en", alias: "English" }, default: true, enabled: true },
           { language: { code: "fr", alias: "fr-FR" }, default: false, enabled: true },
         ],
-      } as unknown as TEnvironmentStateSurvey;
+      } as unknown as TWorkspaceStateSurvey;
       expect(getLanguageCode(survey, "fr")).toBe("fr");
       expect(getLanguageCode(survey, "fr-FR")).toBe("fr");
     });
@@ -819,7 +859,7 @@ describe("utils.ts", () => {
     test("returns false if type is not click", () => {
       const targetElement = document.createElement("div");
 
-      const action: TEnvironmentStateActionClass = {
+      const action: TWorkspaceStateActionClass = {
         id: "clabc123abc",
         name: "Test Action",
         type: "noCode",
@@ -838,7 +878,7 @@ describe("utils.ts", () => {
       const targetElement = document.createElement("div");
       targetElement.innerHTML = "Test";
 
-      const action: TEnvironmentStateActionClass = {
+      const action: TWorkspaceStateActionClass = {
         id: "clabc123abc",
         name: "Test Action",
         type: "noCode",
@@ -863,7 +903,7 @@ describe("utils.ts", () => {
 
       targetElement.matches = vi.fn(() => true);
 
-      const action: TEnvironmentStateActionClass = {
+      const action: TWorkspaceStateActionClass = {
         id: "clabc123abc",
         name: "Test Action",
         type: "noCode",
@@ -889,7 +929,7 @@ describe("utils.ts", () => {
       targetElement.matches = vi.fn(() => false);
       targetElement.closest = vi.fn(() => null); // no ancestor matches either
 
-      const action: TEnvironmentStateActionClass = {
+      const action: TWorkspaceStateActionClass = {
         id: "clabc123abc",
         name: "Test Action",
         type: "noCode",
@@ -910,7 +950,7 @@ describe("utils.ts", () => {
     test("returns false if neither innerHtml nor cssSelector is provided", () => {
       const targetElement = document.createElement("div");
 
-      const action: TEnvironmentStateActionClass = {
+      const action: TWorkspaceStateActionClass = {
         id: "clabc123abc",
         name: "Test Action",
         type: "noCode",
@@ -937,7 +977,7 @@ describe("utils.ts", () => {
         },
       });
 
-      const action: TEnvironmentStateActionClass = {
+      const action: TWorkspaceStateActionClass = {
         id: "clabc123abc",
         name: "Test Action",
         type: "noCode",
@@ -947,7 +987,7 @@ describe("utils.ts", () => {
           urlFilters: [
             {
               value: "https://example.com/other",
-              rule: "exactMatch" as unknown as TActionClassPageUrlRule,
+              rule: "exactMatch",
             },
           ],
           elementSelector: {
@@ -971,7 +1011,7 @@ describe("utils.ts", () => {
         },
       });
 
-      const action: TEnvironmentStateActionClass = {
+      const action: TWorkspaceStateActionClass = {
         id: "clabc123abc",
         name: "Test Action",
         type: "noCode",
@@ -981,7 +1021,7 @@ describe("utils.ts", () => {
           urlFilters: [
             {
               value: "path",
-              rule: "contains" as unknown as TActionClassPageUrlRule,
+              rule: "contains",
             },
           ],
           elementSelector: {
@@ -1007,7 +1047,7 @@ describe("utils.ts", () => {
       (icon as unknown as { matches: ReturnType<typeof vi.fn> }).matches = vi.fn(() => false);
       (icon as unknown as { closest: ReturnType<typeof vi.fn> }).closest = vi.fn(() => button);
 
-      const action: TEnvironmentStateActionClass = {
+      const action: TWorkspaceStateActionClass = {
         id: "clabc123abc",
         name: "Test Action",
         type: "noCode",
@@ -1021,7 +1061,7 @@ describe("utils.ts", () => {
 
       // Before fix: matches() → false → returns false (bug)
       // After fix:  matches() → false → closest() → button → returns true (correct)
-      const result = evaluateNoCodeConfigClick(icon as unknown as HTMLElement, action);
+      const result = evaluateNoCodeConfigClick(icon, action);
       expect(result).toBe(true);
     });
 
@@ -1032,7 +1072,7 @@ describe("utils.ts", () => {
       (other as unknown as { matches: ReturnType<typeof vi.fn> }).matches = vi.fn(() => false);
       (other as unknown as { closest: ReturnType<typeof vi.fn> }).closest = vi.fn(() => null);
 
-      const action: TEnvironmentStateActionClass = {
+      const action: TWorkspaceStateActionClass = {
         id: "clabc123abc",
         name: "Test Action",
         type: "noCode",
@@ -1044,7 +1084,7 @@ describe("utils.ts", () => {
         },
       };
 
-      const result = evaluateNoCodeConfigClick(other as unknown as HTMLElement, action);
+      const result = evaluateNoCodeConfigClick(other, action);
       expect(result).toBe(false);
     });
 
@@ -1056,7 +1096,7 @@ describe("utils.ts", () => {
       const closestSpy = vi.fn();
       (button as unknown as { closest: ReturnType<typeof vi.fn> }).closest = closestSpy;
 
-      const action: TEnvironmentStateActionClass = {
+      const action: TWorkspaceStateActionClass = {
         id: "clabc123abc",
         name: "Test Action",
         type: "noCode",
@@ -1068,7 +1108,7 @@ describe("utils.ts", () => {
         },
       };
 
-      const result = evaluateNoCodeConfigClick(button as unknown as HTMLElement, action);
+      const result = evaluateNoCodeConfigClick(button, action);
       expect(result).toBe(true);
       expect(closestSpy).not.toHaveBeenCalled(); // closest() is only a fallback
     });
@@ -1082,7 +1122,7 @@ describe("utils.ts", () => {
       });
       targetElement.closest = vi.fn(() => null); // not needed but consistent with mock environment
 
-      const action: TEnvironmentStateActionClass = {
+      const action: TWorkspaceStateActionClass = {
         id: "clabc123abc",
         name: "Test Action",
         type: "noCode",
@@ -1147,81 +1187,6 @@ describe("utils.ts", () => {
   });
 
   // ---------------------------------------------------------------------------------
-  // handleHiddenFields
-  // ---------------------------------------------------------------------------------
-  describe("handleHiddenFields()", () => {
-    test("returns empty object when hidden fields are not enabled", () => {
-      const hiddenFieldsConfig = {
-        enabled: false,
-        fieldIds: ["field1", "field2"],
-      };
-      const hiddenFields = {
-        field1: "value1",
-        field2: "value2",
-      };
-
-      const result = handleHiddenFields(hiddenFieldsConfig, hiddenFields);
-      expect(result).toEqual({});
-    });
-
-    test("returns empty object when no hidden fields are provided", () => {
-      const hiddenFieldsConfig = {
-        enabled: true,
-        fieldIds: ["field1", "field2"],
-      };
-
-      const result = handleHiddenFields(hiddenFieldsConfig);
-      expect(result).toEqual({});
-    });
-
-    test("filters and returns only valid hidden fields", () => {
-      const hiddenFieldsConfig = {
-        enabled: true,
-        fieldIds: ["field1", "field2"],
-      };
-      const hiddenFields = {
-        field1: "value1",
-        field2: "value2",
-        field3: "value3", // This should be filtered out
-      };
-
-      const result = handleHiddenFields(hiddenFieldsConfig, hiddenFields);
-      expect(result).toEqual({
-        field1: "value1",
-        field2: "value2",
-      });
-    });
-
-    test("handles empty fieldIds array", () => {
-      const hiddenFieldsConfig = {
-        enabled: true,
-        fieldIds: [],
-      };
-      const hiddenFields = {
-        field1: "value1",
-        field2: "value2",
-      };
-
-      const result = handleHiddenFields(hiddenFieldsConfig, hiddenFields);
-      expect(result).toEqual({});
-    });
-
-    test("handles null fieldIds", () => {
-      const hiddenFieldsConfig = {
-        enabled: true,
-        fieldIds: undefined,
-      };
-      const hiddenFields = {
-        field1: "value1",
-        field2: "value2",
-      };
-
-      const result = handleHiddenFields(hiddenFieldsConfig, hiddenFields);
-      expect(result).toEqual({});
-    });
-  });
-
-  // ---------------------------------------------------------------------------------
   // getSecureRandom
   // ---------------------------------------------------------------------------------
   describe("getSecureRandom()", () => {
@@ -1243,5 +1208,165 @@ describe("utils.ts", () => {
       expect(mockGetRandomValues).toHaveBeenCalled();
       mockGetRandomValues.mockRestore();
     });
+  });
+});
+
+describe("filterSurveys() — interaction targeting × recontact/display-cap matrix", () => {
+  // Composition seam (ENG-1275): the client decides show/no-show from server-computed segment
+  // membership (`user.segments`) combined with local displayOption / recontactDays / workspace
+  // cooldown / lastDisplayAt. Interaction-segment membership is computed server-side, so at this
+  // layer it's an input ("is the survey's segment in user.segments?"). This matrix locks the
+  // interplay — a survey shows only when membership AND display-cap AND recontact all pass.
+  const SURVEY = "e3kxlpnzmdp84op9qzxl9olj";
+  const SEGMENT = "p6yrnz3s2tvoe5r0l28unq7k";
+  const DAY = 1000 * 60 * 60 * 24;
+  const daysAgo = (n: number): Date => new Date(Date.now() - n * DAY);
+
+  const buildWorkspace = (survey: TWorkspaceStateSurvey, cooldownDays: number): TWorkspaceState => ({
+    expiresAt: new Date(),
+    data: {
+      settings: {
+        recontactDays: cooldownDays,
+        clickOutsideClose: false,
+        overlay: "none",
+        placement: "bottomRight",
+        inAppSurveyBranding: true,
+        styling: { allowStyleOverwrite: false },
+      },
+      surveys: [survey],
+      actionClasses: [],
+    },
+  });
+
+  const buildUser = (data: Partial<TUserState["data"]>): TUserState => ({
+    expiresAt: null,
+    data: {
+      userId: "user_abc",
+      contactId: null,
+      segments: [],
+      displays: [],
+      responses: [],
+      lastDisplayAt: null,
+      ...data,
+    },
+  });
+
+  const buildSurvey = (survey: Partial<TWorkspaceStateSurvey>): TWorkspaceStateSurvey =>
+    ({
+      id: SURVEY,
+      displayOption: "respondMultiple",
+      displayLimit: null,
+      recontactDays: null,
+      languages: [],
+      segment: { id: SEGMENT, hasFilters: true },
+      ...survey,
+    }) as TWorkspaceStateSurvey;
+
+  const cases: {
+    name: string;
+    survey: Partial<TWorkspaceStateSurvey>;
+    cooldownDays?: number;
+    user: Partial<TUserState["data"]>;
+    shown: boolean;
+  }[] = [
+    {
+      name: "in segment + respondMultiple → shown",
+      survey: { displayOption: "respondMultiple" },
+      user: { segments: [SEGMENT] },
+      shown: true,
+    },
+    {
+      name: "identified but not in segment → hidden (membership gates it out)",
+      survey: { displayOption: "respondMultiple" },
+      user: { segments: [] },
+      shown: false,
+    },
+    {
+      name: "in segment but displayOnce + already displayed → hidden (display cap beats membership)",
+      survey: { displayOption: "displayOnce", displayLimit: 1 },
+      user: { segments: [SEGMENT], displays: [{ surveyId: SURVEY, createdAt: daysAgo(0) }] },
+      shown: false,
+    },
+    {
+      name: "in segment + displayOnce + never displayed → shown",
+      survey: { displayOption: "displayOnce", displayLimit: 1 },
+      user: { segments: [SEGMENT] },
+      shown: true,
+    },
+    {
+      name: "in segment but survey recontactDays not elapsed → hidden",
+      survey: { displayOption: "respondMultiple", recontactDays: 7 },
+      user: { segments: [SEGMENT], lastDisplayAt: daysAgo(2) },
+      shown: false,
+    },
+    {
+      name: "in segment + survey recontactDays elapsed → shown",
+      survey: { displayOption: "respondMultiple", recontactDays: 7 },
+      user: { segments: [SEGMENT], lastDisplayAt: daysAgo(10) },
+      shown: true,
+    },
+    {
+      name: "in segment but workspace cooldown not elapsed (survey recontactDays null) → hidden",
+      survey: { displayOption: "respondMultiple", recontactDays: null },
+      cooldownDays: 7,
+      user: { segments: [SEGMENT], lastDisplayAt: daysAgo(3) },
+      shown: false,
+    },
+    {
+      name: "in segment + workspace cooldown elapsed → shown",
+      survey: { displayOption: "respondMultiple", recontactDays: null },
+      cooldownDays: 7,
+      user: { segments: [SEGMENT], lastDisplayAt: daysAgo(8) },
+      shown: true,
+    },
+    {
+      name: "in segment + displayMultiple + already responded → hidden",
+      survey: { displayOption: "displayMultiple" },
+      user: { segments: [SEGMENT], responses: [SURVEY] },
+      shown: false,
+    },
+    {
+      name: "in segment + displayMultiple + no response → shown",
+      survey: { displayOption: "displayMultiple" },
+      user: { segments: [SEGMENT] },
+      shown: true,
+    },
+    {
+      name: "in segment + displaySome under limit → shown",
+      survey: { displayOption: "displaySome", displayLimit: 2 },
+      user: { segments: [SEGMENT], displays: [{ surveyId: SURVEY, createdAt: daysAgo(0) }] },
+      shown: true,
+    },
+    {
+      name: "in segment + displaySome at limit → hidden",
+      survey: { displayOption: "displaySome", displayLimit: 2 },
+      user: {
+        segments: [SEGMENT],
+        displays: [
+          { surveyId: SURVEY, createdAt: daysAgo(0) },
+          { surveyId: SURVEY, createdAt: daysAgo(1) },
+        ],
+      },
+      shown: false,
+    },
+    {
+      name: "anonymous (no userId) + interaction segment (hasFilters) → hidden (needs identity)",
+      survey: { displayOption: "respondMultiple", segment: { id: SEGMENT, hasFilters: true } },
+      user: { userId: null, segments: [] },
+      shown: false,
+    },
+    {
+      name: "anonymous (no userId) + segment without filters → shown",
+      survey: { displayOption: "respondMultiple", segment: { id: SEGMENT, hasFilters: false } },
+      user: { userId: null, segments: [] },
+      shown: true,
+    },
+  ];
+
+  test.each(cases)("$name", ({ survey, cooldownDays = 7, user, shown }) => {
+    const workspace = buildWorkspace(buildSurvey(survey), cooldownDays);
+    const userState = buildUser(user);
+    const result = filterSurveys(workspace, userState);
+    expect(result.some((s) => s.id === SURVEY)).toBe(shown);
   });
 });

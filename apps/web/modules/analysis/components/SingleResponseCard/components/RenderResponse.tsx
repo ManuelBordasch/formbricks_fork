@@ -53,6 +53,8 @@ export const RenderResponse: React.FC<RenderResponseProps> = ({
   };
   switch (element.type) {
     case TSurveyElementTypeEnum.Rating:
+    case TSurveyElementTypeEnum.CSAT:
+    case TSurveyElementTypeEnum.CES:
       if (typeof responseData === "number") {
         return (
           <RatingResponse
@@ -120,7 +122,7 @@ export const RenderResponse: React.FC<RenderResponseProps> = ({
           <ResponseBadges
             items={[{ value: responseData.toString() }]}
             isExpanded={isExpanded}
-            icon={<PhoneIcon className="h-4 w-4 text-slate-500" />}
+            icon={<PhoneIcon className="size-4 text-slate-500" />}
             showId={showId}
           />
         );
@@ -132,7 +134,7 @@ export const RenderResponse: React.FC<RenderResponseProps> = ({
           <ResponseBadges
             items={[{ value: responseData.toString() }]}
             isExpanded={isExpanded}
-            icon={<CheckCheckIcon className="h-4 w-4 text-slate-500" />}
+            icon={<CheckCheckIcon className="size-4 text-slate-500" />}
             showId={showId}
           />
         );
@@ -144,7 +146,7 @@ export const RenderResponse: React.FC<RenderResponseProps> = ({
           <ResponseBadges
             items={[{ value: responseData.toString() }]}
             isExpanded={isExpanded}
-            icon={<MousePointerClickIcon className="h-4 w-4 text-slate-500" />}
+            icon={<MousePointerClickIcon className="size-4 text-slate-500" />}
             showId={showId}
           />
         );
@@ -163,10 +165,12 @@ export const RenderResponse: React.FC<RenderResponseProps> = ({
           />
         );
       } else if (Array.isArray(responseData)) {
-        const itemsArray = responseData.map((choice) => {
-          const choiceId = getChoiceIdByValue(choice, element);
-          return { value: choice, id: choiceId };
-        });
+        const itemsArray = responseData
+          .filter((choice) => choice !== "")
+          .map((choice) => {
+            const choiceId = getChoiceIdByValue(choice, element);
+            return { value: choice, id: choiceId };
+          });
         return (
           <>
             {element.type === TSurveyElementTypeEnum.Ranking ? (

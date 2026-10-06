@@ -231,8 +231,49 @@ const NATIVE_NAMES: Record<Iso639Code, string> = {
 
 /**
  * Returns the native display name for a language code (e.g. "de" → "Deutsch").
- * Falls back to the raw code if the code is not in the map.
+ *
+ * Canonical codes are region-tagged (`hi-IN`, `zh-Hans-CN`) and not every one has its own entry in
+ * NATIVE_NAMES, so we fall back from the exact code to its language+script form, then to the bare
+ * language: `hi-IN` → `hi` → "हिन्दी"; `zh-Hans-CN` → `zh-Hans` → "简体中文". Region-specific entries that
+ * do exist (e.g. `de-DE`, `de-AT`) are still preferred. Finally falls back to the raw code.
  */
 export function getLanguageDisplayName(code: string): string {
-  return NATIVE_NAMES[code as Iso639Code] ?? code;
+  let name = NATIVE_NAMES[code as Iso639Code];
+  if (!name) {
+    try {
+      const locale = new Intl.Locale(code);
+      const languageWithScript = [locale.language, locale.script].filter(Boolean).join("-");
+      name = NATIVE_NAMES[languageWithScript as Iso639Code] ?? NATIVE_NAMES[locale.language as Iso639Code];
+    } catch {
+      // malformed code — fall through to the raw code below
+    }
+  }
+  name = name ?? code;
+  // Capitalize the first letter so names like "español" display as "Español"
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+/**
+ * Region-less variant of {@link getLanguageDisplayName}, for labels with no room for a full name.
+ *
+ * Canonical codes carry a region and NATIVE_NAMES spells it out wherever it has an entry, so
+ * `de-DE` reads "Deutsch (Deutschland)" and `en-US` reads "American English". That is right for a
+ * list, where "Português (Brasil)" has to be told apart from "Português (Portugal)", but too long
+ * for a compact one-line label. Only the REGION is dropped: the script is what distinguishes
+ * 简体中文 from 繁體中文, so it is kept (`zh-Hans-CN` → "简体中文", `de-DE` → "Deutsch").
+ */
+export function getShortLanguageDisplayName(code: string): string {
+  try {
+    const locale = new Intl.Locale(code);
+    const languageWithScript = [locale.language, locale.script].filter(Boolean).join("-");
+    if (languageWithScript) {
+      const short = getLanguageDisplayName(languageWithScript);
+      // getLanguageDisplayName echoes the code back when it has no entry. A code whose bare
+      // language is unknown but whose full form is named ("xx-YY") is better off with the full name.
+      if (short.toLowerCase() !== languageWithScript.toLowerCase()) return short;
+    }
+  } catch {
+    // malformed code — fall back to the full name below
+  }
+  return getLanguageDisplayName(code);
 }

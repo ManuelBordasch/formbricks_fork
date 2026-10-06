@@ -1,8 +1,7 @@
 "use client";
 
 import { zodResolver } from "@hookform/resolvers/zod";
-import { signIn } from "next-auth/react";
-import Link from "next/dist/client/link";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { FormProvider, SubmitHandler, useForm } from "react-hook-form";
@@ -11,13 +10,16 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 import { cn } from "@/lib/cn";
 import { FORMBRICKS_LOGGED_IN_WITH_LS } from "@/lib/localStorage";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
-import { createEmailTokenAction } from "@/modules/auth/actions";
+import { buildAttributionQuerySuffix } from "@/modules/auth/lib/attribution";
+import { authClient } from "@/modules/auth/lib/auth-client";
+import { getOAuthErrorVariant } from "@/modules/auth/lib/oauth-error";
 import { SSOOptions } from "@/modules/ee/sso/components/sso-options";
 import { TwoFactor } from "@/modules/ee/two-factor-auth/components/two-factor";
 import { TwoFactorBackup } from "@/modules/ee/two-factor-auth/components/two-factor-backup";
+import { Alert, AlertDescription, AlertTitle } from "@/modules/ui/components/alert";
 import { Button } from "@/modules/ui/components/button";
-import { FormControl, FormError, FormField, FormItem } from "@/modules/ui/components/form";
+import { FormControl, FormError, FormField, FormItem, FormLabel } from "@/modules/ui/components/form";
+import { Input } from "@/modules/ui/components/input";
 import { PasswordInput } from "@/modules/ui/components/password-input";
 
 const ZLoginForm = z.object({
@@ -48,8 +50,12 @@ interface LoginFormProps {
   isMultiOrgEnabled: boolean;
   isSsoEnabled: boolean;
   samlSsoEnabled: boolean;
-  samlTenant: string;
-  samlProduct: string;
+  oauthError?: string;
+  emailJustVerified?: boolean;
+  prefilledEmail?: string;
+  inviteToken?: string | null;
+  resolvedCallbackPath: string;
+  resolvedCallbackUrl: string;
 }
 
 export const LoginForm = ({
@@ -64,18 +70,60 @@ export const LoginForm = ({
   isMultiOrgEnabled,
   isSsoEnabled,
   samlSsoEnabled,
-  samlTenant,
-  samlProduct,
-}: LoginFormProps) => {
+  oauthError,
+  emailJustVerified,
+  prefilledEmail,
+  inviteToken,
+  resolvedCallbackPath,
+  resolvedCallbackUrl,
+}: Readonly<LoginFormProps>) => {
   const router = useRouter();
   const searchParams = useSearchParams();
   const emailRef = useRef<HTMLInputElement>(null);
-  const callbackUrl = searchParams?.get("callbackUrl") ?? "";
+  // Any SSO callback failure lands here as `?error=<code>`; classify it so the user is told what
+  // happened instead of meeting an untouched form (ENG-2089).
+  const oauthErrorVariant = getOAuthErrorVariant(oauthError);
   const { t } = useTranslation();
+
+  // The `t("…")` calls are written out per variant because `scan-translations` only recognizes literal
+  // keys; a key reached through a lookup table reads as unused and fails `pnpm i18n:validate`.
+  const oauthErrorAlert = useMemo(() => {
+    switch (oauthErrorVariant) {
+      case "account_not_linked":
+        return {
+          title: t("auth.login.oauth_account_not_linked_title"),
+          description: t("auth.login.oauth_account_not_linked_description"),
+        };
+      case "signup_not_allowed":
+        return {
+          title: t("auth.login.oauth_signup_not_allowed_title"),
+          description: t("auth.login.oauth_signup_not_allowed_description"),
+        };
+      case "misconfigured":
+        return {
+          title: t("auth.login.oauth_misconfigured_title"),
+          description: t("auth.login.oauth_misconfigured_description"),
+        };
+      case "generic":
+        return {
+          title: t("auth.login.oauth_generic_error_title"),
+          description: t("auth.login.oauth_generic_error_description"),
+        };
+      default:
+        return null;
+    }
+  }, [oauthErrorVariant, t]);
+
+  const signupHref = useMemo(() => {
+    const base = inviteToken ? `/auth/signup?inviteToken=${inviteToken}` : "/auth/signup";
+    const attributionSuffix = buildAttributionQuerySuffix(searchParams);
+    if (!attributionSuffix) return base;
+    return `${base}${base.includes("?") ? "&" : "?"}${attributionSuffix}`;
+  }, [inviteToken, searchParams]);
 
   const form = useForm<TLoginForm>({
     defaultValues: {
-      email: searchParams?.get("email") ?? "",
+      email: prefilledEmail ?? "",
       password: "",
       totpCode: "",
       backupCode: "",
@@ -88,39 +136,51 @@ export const LoginForm = ({
       localStorage.setItem(FORMBRICKS_LOGGED_IN_WITH_LS, "Email");
     }
     try {
-      const signInResponse = await signIn("credentials", {
-        callbackUrl: callbackUrl ?? "/",
+      // Step 2 — the user is answering a two-factor challenge. Better Auth issued a partial
+      // session on the first step; verifying the TOTP or backup code promotes it to a full session.
+      if (totpLogin || totpBackup) {
+        const { error } = totpBackup
+          ? await authClient.twoFactor.verifyBackupCode({ code: data.backupCode ?? "" })
+          : await authClient.twoFactor.verifyTotp({ code: data.totpCode ?? "" });
+
+        if (error) {
+          toast.error(error.message ?? t("common.something_went_wrong"));
+          return;
+        }
+
+        router.push(resolvedCallbackPath || "/");
+        return;
+      }
+
+      // Step 1 — email + password.
+      const { data: signInData, error } = await authClient.signIn.email({
         email: data.email.toLowerCase(),
         password: data.password,
-        ...(totpLogin && { totpCode: data.totpCode }),
-        ...(totpBackup && { backupCode: data.backupCode }),
-        redirect: false,
+        // For an unverified address Better Auth (sendOnSignIn) resends the verification email and builds
+        // its link around this callbackURL; without it the post-verify redirect falls back to "/", so an
+        // unverified user signing in from an invite/deep-link would lose the original destination.
+        callbackURL: resolvedCallbackUrl,
       });
 
-      if (signInResponse?.error === "second factor required") {
+      if (error) {
+        // Better Auth (re)sends its own verification email for an unverified address, so we only
+        // point the user at their inbox instead of minting a verification token ourselves.
+        if (error.code === "EMAIL_NOT_VERIFIED") {
+          toast.error(t("auth.login.please_verify_your_email_to_continue"));
+          return;
+        }
+        toast.error(error.message ?? t("common.something_went_wrong"));
+        return;
+      }
+
+      // Two-factor is enabled: Better Auth returns `twoFactorRedirect` instead of a session. No
+      // client `twoFactorPage` is configured, so surface the inline TOTP/backup challenge here.
+      if (signInData && "twoFactorRedirect" in signInData && signInData.twoFactorRedirect) {
         setTotpLogin(true);
         return;
       }
 
-      if (signInResponse?.error === "Email Verification is Pending") {
-        const emailTokenActionResponse = await createEmailTokenAction({ email: data.email });
-        if (emailTokenActionResponse?.data) {
-          router.push(`/auth/verification-requested?token=${emailTokenActionResponse?.data}`);
-        } else {
-          const errorMessage = getFormattedErrorMessage(emailTokenActionResponse);
-          toast.error(errorMessage);
-        }
-        return;
-      }
-
-      if (signInResponse?.error) {
-        toast.error(signInResponse.error);
-        return;
-      }
-
-      if (!signInResponse?.error) {
-        router.push(searchParams?.get("callbackUrl") ?? "/");
-      }
+      router.push(resolvedCallbackPath || "/");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
     }
@@ -129,8 +189,6 @@ export const LoginForm = ({
   const [showLogin, setShowLogin] = useState(false);
   const [totpLogin, setTotpLogin] = useState(false);
   const [totpBackup, setTotpBackup] = useState(false);
-  const formRef = useRef<HTMLFormElement>(null);
-  const inviteToken = callbackUrl ? new URL(callbackUrl).searchParams.get("token") : null;
   const [lastLoggedInWith, setLastLoggedInWith] = useState("");
 
   useEffect(() => {
@@ -139,7 +197,10 @@ export const LoginForm = ({
     }
   }, []);
 
-  const formLabel = useMemo(() => {
+  // Neither of these was memoized for a reason worth keeping: one picks a translated string, the
+  // other builds a single element. Both listed `form`, which react-hook-form mutates in place, so
+  // the memo could hold a value built against form state that has since moved on (ENG-2366).
+  const getFormLabel = () => {
     if (totpBackup) {
       return t("auth.login.enter_your_backup_code");
     }
@@ -149,9 +210,10 @@ export const LoginForm = ({
     }
 
     return t("auth.login.login_to_your_account");
-  }, [t, totpBackup, totpLogin]);
+  };
+  const formLabel = getFormLabel();
 
-  const TwoFactorComponent = useMemo(() => {
+  const renderTwoFactor = () => {
     if (totpBackup) {
       return <TwoFactorBackup form={form} />;
     }
@@ -161,12 +223,29 @@ export const LoginForm = ({
     }
 
     return null;
-  }, [form, totpBackup, totpLogin]);
+  };
+  const TwoFactorComponent = renderTwoFactor();
 
   return (
     <FormProvider {...form}>
       <div className="text-center">
-        <h1 className="mb-4 text-slate-700">{formLabel}</h1>
+        <h1 className="mb-4 text-xl font-semibold text-balance text-slate-800">{formLabel}</h1>
+        {emailJustVerified && (
+          <Alert variant="success" className="mb-4 text-left" role="status">
+            <AlertTitle>{t("auth.login.email_verified_sign_in_title")}</AlertTitle>
+            <AlertDescription>
+              <p>{t("auth.login.email_verified_sign_in_description")}</p>
+            </AlertDescription>
+          </Alert>
+        )}
+        {oauthErrorAlert && (
+          <Alert variant="error" className="mb-4 text-left" role="status">
+            <AlertTitle>{oauthErrorAlert.title}</AlertTitle>
+            <AlertDescription>
+              <p>{oauthErrorAlert.description}</p>
+            </AlertDescription>
+          </Alert>
+        )}
 
         <div className="space-y-2">
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-2">
@@ -176,56 +255,56 @@ export const LoginForm = ({
                 <FormField
                   control={form.control}
                   name="email"
-                  render={({ field, fieldState: { error } }) => (
-                    <FormItem className="w-full">
+                  render={({ field }) => (
+                    <FormItem className="w-full text-left">
+                      <FormLabel>{t("common.email")}</FormLabel>
                       <FormControl>
-                        <div>
-                          <input
-                            id="email"
-                            type="email"
-                            autoComplete="email"
-                            required
-                            value={field.value}
-                            onChange={(email) => field.onChange(email)}
-                            placeholder="work@email.com"
-                            className="block w-full rounded-md border-slate-300 shadow-sm focus:border-brand-dark focus:ring-brand-dark sm:text-sm"
-                          />
-                          {error?.message && <FormError className="text-left">{error.message}</FormError>}
-                        </div>
+                        <Input
+                          ref={emailRef}
+                          type="email"
+                          autoComplete="email"
+                          inputMode="email"
+                          autoCapitalize="none"
+                          autoCorrect="off"
+                          spellCheck={false}
+                          required
+                          name={field.name}
+                          value={field.value}
+                          onBlur={field.onBlur}
+                          onChange={(email) => field.onChange(email)}
+                          placeholder="work@email.com"
+                        />
                       </FormControl>
+                      <FormError role="alert" />
                     </FormItem>
                   )}
                 />
                 <FormField
                   control={form.control}
                   name="password"
-                  render={({ field, fieldState: { error } }) => (
-                    <FormItem className="w-full">
+                  render={({ field }) => (
+                    <FormItem className="w-full text-left">
+                      <FormLabel>{t("common.password")}</FormLabel>
                       <FormControl>
-                        <div>
-                          <PasswordInput
-                            id="password"
-                            autoComplete="current-password"
-                            placeholder="*******"
-                            aria-placeholder="password"
-                            aria-label="password"
-                            aria-required="true"
-                            required
-                            className="block w-full rounded-md border-slate-300 pr-8 shadow-sm focus:border-brand-dark focus:ring-brand-dark sm:text-sm"
-                            value={field.value}
-                            onChange={(password) => field.onChange(password)}
-                          />
-                          {error?.message && <FormError className="text-left">{error.message}</FormError>}
-                        </div>
+                        <PasswordInput
+                          autoComplete="current-password"
+                          placeholder="*******"
+                          required
+                          name={field.name}
+                          value={field.value}
+                          onBlur={field.onBlur}
+                          onChange={(password) => field.onChange(password)}
+                        />
                       </FormControl>
+                      <FormError role="alert" />
                     </FormItem>
                   )}
                 />
                 {passwordResetEnabled && (
-                  <div className="ml-1 text-right transition-all duration-500 ease-in-out">
+                  <div className="text-right transition-all duration-500 ease-in-out">
                     <Link
                       href="/auth/forgot-password"
-                      className="text-xs text-slate-500 hover:text-brand-dark">
+                      className="inline-flex min-h-6 items-center rounded-sm py-1 text-sm text-slate-500 hover:text-brand-dark focus-visible:ring-2 focus-visible:ring-brand-dark focus-visible:outline-hidden">
                       {t("auth.login.forgot_your_password")}
                     </Link>
                   </div>
@@ -234,20 +313,23 @@ export const LoginForm = ({
             )}
             {emailAuthEnabled && (
               <Button
-                onClick={() => {
-                  if (!showLogin) {
-                    setShowLogin(true);
-                    // Add a slight delay before focusing the input field to ensure it's visible
-                    setTimeout(() => emailRef.current?.focus(), 100);
-                  } else if (formRef.current) {
-                    formRef.current.requestSubmit();
-                  }
-                }}
-                className="relative w-full justify-center"
+                type={showLogin ? "submit" : "button"}
+                onClick={
+                  showLogin
+                    ? undefined
+                    : () => {
+                        setShowLogin(true);
+                        // Add a slight delay before focusing the input field to ensure it's visible
+                        setTimeout(() => emailRef.current?.focus(), 100);
+                      }
+                }
+                className="h-11 w-full min-w-0 justify-center sm:h-9"
                 loading={form.formState.isSubmitting}>
-                {totpLogin ? t("common.submit") : t("auth.login.login_with_email")}
+                <span className="truncate">
+                  {totpLogin ? t("common.submit") : t("auth.login.login_with_email")}
+                </span>
                 {lastLoggedInWith && lastLoggedInWith === "Email" ? (
-                  <span className="absolute right-3 text-xs opacity-50">{t("auth.last_used")}</span>
+                  <span className="shrink-0 text-xs opacity-50">{t("auth.last_used")}</span>
                 ) : null}
               </Button>
             )}
@@ -260,9 +342,7 @@ export const LoginForm = ({
               oidcOAuthEnabled={oidcOAuthEnabled}
               oidcDisplayName={oidcDisplayName}
               samlSsoEnabled={samlSsoEnabled}
-              samlTenant={samlTenant}
-              samlProduct={samlProduct}
-              callbackUrl={callbackUrl}
+              returnToUrl={resolvedCallbackUrl}
               source="signin"
             />
           )}
@@ -273,8 +353,8 @@ export const LoginForm = ({
             <span className="leading-5 text-slate-500">{t("auth.login.new_to_formbricks")}</span>
             <br />
             <Link
-              href={inviteToken ? `/auth/signup?inviteToken=${inviteToken}` : "/auth/signup"}
-              className="font-semibold text-slate-600 underline hover:text-slate-700">
+              href={signupHref}
+              className="inline-flex min-h-6 items-center justify-center rounded-sm py-1 font-semibold text-slate-600 underline hover:text-slate-700 focus-visible:ring-2 focus-visible:ring-brand-dark focus-visible:outline-hidden">
               {t("auth.login.create_an_account")}
             </Link>
           </div>
@@ -288,7 +368,7 @@ export const LoginForm = ({
           <div className="flex flex-col">
             <button
               type="button"
-              className="font-semibold text-slate-600 underline hover:text-slate-700"
+              className="inline-flex min-h-6 items-center justify-center rounded-sm py-1 font-semibold text-slate-600 underline hover:text-slate-700 focus-visible:ring-2 focus-visible:ring-brand-dark focus-visible:outline-hidden"
               onClick={() => {
                 setTotpBackup(true);
               }}>
@@ -297,7 +377,7 @@ export const LoginForm = ({
 
             <button
               type="button"
-              className="mt-4 font-semibold text-slate-600 underline hover:text-slate-700"
+              className="mt-4 inline-flex min-h-6 items-center justify-center rounded-sm py-1 font-semibold text-slate-600 underline hover:text-slate-700 focus-visible:ring-2 focus-visible:ring-brand-dark focus-visible:outline-hidden"
               onClick={() => {
                 setTotpLogin(false);
               }}>
@@ -311,7 +391,7 @@ export const LoginForm = ({
         <div className="mt-9 text-center text-xs">
           <button
             type="button"
-            className="font-semibold text-slate-600 underline hover:text-slate-700"
+            className="inline-flex min-h-6 items-center justify-center rounded-sm py-1 font-semibold text-slate-600 underline hover:text-slate-700 focus-visible:ring-2 focus-visible:ring-brand-dark focus-visible:outline-hidden"
             onClick={() => {
               setTotpBackup(false);
             }}>

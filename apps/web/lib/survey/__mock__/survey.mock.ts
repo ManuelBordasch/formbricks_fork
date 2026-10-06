@@ -1,9 +1,11 @@
-import { Prisma } from "@prisma/client";
+import { Prisma } from "@formbricks/database/prisma";
 import { TActionClass } from "@formbricks/types/action-classes";
 import { TContactAttributeKey } from "@formbricks/types/contact-attribute-key";
-import { TEnvironment } from "@formbricks/types/environment";
+import {
+  type TLinkedEmbeddedField,
+  deriveLegacyEmbeddedData,
+} from "@formbricks/types/embedded-data-resolver";
 import { TOrganization } from "@formbricks/types/organizations";
-import { TProject } from "@formbricks/types/project";
 import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import {
   TSurvey,
@@ -12,13 +14,14 @@ import {
   TSurveyWelcomeCard,
 } from "@formbricks/types/surveys/types";
 import { TUser } from "@formbricks/types/user";
+import { TWorkspace } from "@formbricks/types/workspace";
 import { selectSurvey } from "../service";
 
 const selectContact = {
   id: true,
   createdAt: true,
   updatedAt: true,
-  environmentId: true,
+  workspaceId: true,
   attributes: {
     select: {
       value: true,
@@ -40,7 +43,7 @@ export const mockId = "ars2tjk8hsi8oqk1uac00mo8";
 const commonMockProperties = {
   createdAt: currentDate,
   updatedAt: currentDate,
-  environmentId: mockId,
+  workspaceId: mockId,
 };
 
 type SurveyMock = Prisma.SurveyGetPayload<{
@@ -57,7 +60,7 @@ export const mockSurveyLanguages: TSurveyLanguage[] = [
       alias: null,
       createdAt: new Date(),
       updatedAt: new Date(),
-      projectId: mockId,
+      workspaceId: mockId,
     },
   },
   {
@@ -69,16 +72,16 @@ export const mockSurveyLanguages: TSurveyLanguage[] = [
       alias: null,
       createdAt: new Date(),
       updatedAt: new Date(),
-      projectId: mockId,
+      workspaceId: mockId,
     },
   },
 ];
 
-export const mockProject: TProject = {
+export const mockWorkspace: TWorkspace = {
   id: mockId,
   createdAt: currentDate,
   updatedAt: currentDate,
-  name: "mock Project",
+  name: "mock Workspace",
   organizationId: mockId,
   recontactDays: 0,
   linkSurveyBranding: false,
@@ -86,7 +89,7 @@ export const mockProject: TProject = {
   placement: "bottomRight",
   clickOutsideClose: false,
   overlay: "none",
-  environments: [],
+  appSetupCompleted: false,
   languages: [],
   config: {
     channel: "link",
@@ -107,20 +110,11 @@ export const mockDisplay = {
   status: null,
 };
 
-export const mockEnvironment: TEnvironment = {
-  id: mockId,
-  createdAt: currentDate,
-  updatedAt: currentDate,
-  type: "production",
-  projectId: mockId,
-  appSetupCompleted: false,
-};
-
 export const mockUser: TUser = {
   id: mockId,
   name: "mock User",
   email: "test@unit.com",
-  emailVerified: currentDate,
+  emailVerified: true,
   createdAt: currentDate,
   updatedAt: currentDate,
   twoFactorEnabled: false,
@@ -190,26 +184,33 @@ const mockWelcomeCard: TSurveyWelcomeCard = {
   showResponseCount: false,
 };
 
+const mockBlocks = [
+  {
+    id: "block1",
+    name: "Block 1",
+    elements: [mockQuestion],
+  },
+];
+
 const baseSurveyProperties = {
   id: mockId,
   name: "Mock Survey",
   autoClose: 10,
   delay: 0,
   autoComplete: 7,
+  publishOn: null,
+  closeOn: null,
+  archivedAt: null,
   redirectUrl: "https://github.com/formbricks/formbricks",
   recontactDays: 3,
   displayLimit: 3,
   welcomeCard: mockWelcomeCard,
   questions: [],
-  blocks: [
-    {
-      id: "block1",
-      name: "Block 1",
-      elements: [mockQuestion],
-    },
-  ],
+  blocks: mockBlocks as unknown as SurveyMock["blocks"],
   isBackButtonHidden: false,
+  isAutoProgressingEnabled: false,
   isCaptureIpEnabled: false,
+  isAnonymizeResponsesEnabled: false,
   endings: [
     {
       id: "umyknohldc7w26ocjdhaa62c",
@@ -222,7 +223,6 @@ const baseSurveyProperties = {
     enabled: false,
   },
   isVerifyEmailEnabled: false,
-  isSingleResponsePerEmailEnabled: false,
   attributeFilters: [],
   ...commonMockProperties,
 };
@@ -233,11 +233,10 @@ export const mockOrganizationOutput: TOrganization = {
   createdAt: currentDate,
   updatedAt: currentDate,
   isAISmartToolsEnabled: false,
-  isAIDataAnalysisEnabled: false,
   billing: {
     stripeCustomerId: null,
     limits: {
-      projects: 3,
+      workspaces: 3,
       monthly: {
         responses: 1500,
       },
@@ -251,7 +250,7 @@ export const mockSyncSurveyOutput: SurveyMock = {
   status: "inProgress",
   displayOption: "respondMultiple",
   triggers: [{ actionClass: mockActionClass }],
-  projectOverwrites: null,
+  workspaceOverwrites: null,
   singleUse: null,
   styling: null,
   recaptcha: null,
@@ -262,6 +261,9 @@ export const mockSyncSurveyOutput: SurveyMock = {
   segmentId: null,
   inlineTriggers: null,
   languages: mockSurveyLanguages,
+  // ENG-1837: the join `selectSurvey` now carries. Empty here, so readers fall back to the legacy
+  // columns above — the shape these fixtures have always described.
+  embeddedDataLinks: [],
   ...baseSurveyProperties,
   followUps: [],
   variables: [],
@@ -278,7 +280,7 @@ export const mockSurveyOutput: SurveyMock = {
   displayOption: "respondMultiple",
   metadata: {},
   triggers: [{ actionClass: mockActionClass }],
-  projectOverwrites: null,
+  workspaceOverwrites: null,
   recaptcha: null,
   singleUse: null,
   styling: null,
@@ -289,6 +291,7 @@ export const mockSurveyOutput: SurveyMock = {
   segmentId: null,
   inlineTriggers: null,
   languages: mockSurveyLanguages,
+  embeddedDataLinks: [],
   followUps: [],
   variables: [],
   showLanguageSwitch: null,
@@ -303,6 +306,7 @@ export const createSurveyInput: TSurveyCreateInput = {
   displayOption: "respondMultiple",
   triggers: [{ actionClass: mockActionClass }],
   ...baseSurveyProperties,
+  blocks: mockBlocks,
 };
 
 export const updateSurveyInput: TSurvey = {
@@ -311,7 +315,7 @@ export const updateSurveyInput: TSurvey = {
   displayOption: "respondMultiple",
   metadata: {},
   triggers: [{ actionClass: mockActionClass }],
-  projectOverwrites: null,
+  workspaceOverwrites: null,
   recaptcha: null,
   singleUse: null,
   styling: null,
@@ -325,18 +329,24 @@ export const updateSurveyInput: TSurvey = {
   followUps: [],
   ...baseSurveyProperties,
   ...commonMockProperties,
+  blocks: mockBlocks,
   slug: null,
   customHeadScripts: null,
   customHeadScriptsMode: null,
 };
 
-export const mockTransformedSurveyOutput = {
-  ...mockSurveyOutput,
-};
+/**
+ * What `transformPrismaSurvey` returns: the raw `embeddedDataLinks` relation is replaced by the
+ * inlined `embeddedFields` the read seam consumes (ENG-1837).
+ */
+const withInlinedEmbeddedFields = <T extends { embeddedDataLinks: unknown[] }>({
+  embeddedDataLinks,
+  ...survey
+}: T) => ({ ...survey, embeddedFields: [] as TLinkedEmbeddedField[] });
 
-export const mockTransformedSyncSurveyOutput = {
-  ...mockSyncSurveyOutput,
-};
+export const mockTransformedSurveyOutput = withInlinedEmbeddedFields(mockSurveyOutput);
+
+export const mockTransformedSyncSurveyOutput = withInlinedEmbeddedFields(mockSyncSurveyOutput);
 
 export const mockSurveyWithLogic: TSurvey = {
   ...mockSyncSurveyOutput,
@@ -580,6 +590,14 @@ export const mockSurveyWithLogic: TSurvey = {
     { id: "siog1dabtpo3l0a3xoxw2922", type: "text", name: "var1", value: "lmao" },
     { id: "km1srr55owtn2r7lkoh5ny1u", type: "number", name: "var2", value: 32 },
   ],
+  // Since ENG-2412 the rows are the only thing `getSurveyEmbeddedFields` reads, so a survey that
+  // declares variables has to carry the matching rows — that is what a real read returns.
+  embeddedFields: deriveLegacyEmbeddedData({
+    variables: [
+      { id: "siog1dabtpo3l0a3xoxw2922", type: "text", name: "var1", value: "lmao" },
+      { id: "km1srr55owtn2r7lkoh5ny1u", type: "number", name: "var2", value: 32 },
+    ],
+  }),
   customHeadScripts: null,
   customHeadScriptsMode: null,
 };

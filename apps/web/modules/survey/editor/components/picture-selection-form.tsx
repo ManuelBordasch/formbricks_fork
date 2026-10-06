@@ -5,6 +5,7 @@ import { createId } from "@paralleldrive/cuid2";
 import { PlusIcon } from "lucide-react";
 import { type JSX } from "react";
 import { useTranslation } from "react-i18next";
+import { IMAGE_FILE_EXTENSIONS } from "@formbricks/types/storage";
 import type { TSurveyElement, TSurveyPictureSelectionElement } from "@formbricks/types/surveys/elements";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
@@ -22,8 +23,6 @@ interface PictureSelectionFormProps {
   element: TSurveyPictureSelectionElement;
   elementIdx: number;
   updateElement: (elementIdx: number, updatedAttributes: Partial<TSurveyElement>) => void;
-  selectedLanguageCode: string;
-  setSelectedLanguageCode: (language: string) => void;
   isInvalid: boolean;
   locale: TUserLocale;
   isStorageConfigured: boolean;
@@ -35,14 +34,12 @@ export const PictureSelectionForm = ({
   element,
   elementIdx,
   updateElement,
-  selectedLanguageCode,
-  setSelectedLanguageCode,
   isInvalid,
   locale,
   isStorageConfigured = true,
   isExternalUrlsAllowed,
 }: PictureSelectionFormProps): JSX.Element => {
-  const environmentId = localSurvey.environmentId;
+  const workspaceId = localSurvey.workspaceId;
   const surveyLanguageCodes = extractLanguageCodes(localSurvey.languages);
   const { t } = useTranslation();
   const handleChoiceDeletion = (choiceValue: string) => {
@@ -82,13 +79,11 @@ export const PictureSelectionForm = ({
       <ElementFormInput
         id="headline"
         value={element.headline}
-        label={t("environments.surveys.edit.question") + "*"}
+        label={t("workspace.surveys.edit.question") + "*"}
         localSurvey={localSurvey}
         elementIdx={elementIdx}
         isInvalid={isInvalid}
         updateElement={updateElement}
-        selectedLanguageCode={selectedLanguageCode}
-        setSelectedLanguageCode={setSelectedLanguageCode}
         locale={locale}
         isStorageConfigured={isStorageConfigured}
         isExternalUrlsAllowed={isExternalUrlsAllowed}
@@ -106,8 +101,6 @@ export const PictureSelectionForm = ({
                 elementIdx={elementIdx}
                 isInvalid={isInvalid}
                 updateElement={updateElement}
-                selectedLanguageCode={selectedLanguageCode}
-                setSelectedLanguageCode={setSelectedLanguageCode}
                 locale={locale}
                 isStorageConfigured={isStorageConfigured}
                 isExternalUrlsAllowed={isExternalUrlsAllowed}
@@ -127,8 +120,8 @@ export const PictureSelectionForm = ({
                 subheader: createI18nString("", surveyLanguageCodes),
               });
             }}>
-            <PlusIcon className="mr-1 h-4 w-4" />
-            {t("environments.surveys.edit.add_description")}
+            <PlusIcon className="mr-1 size-4" />
+            {t("workspace.surveys.edit.add_description")}
           </Button>
         )}
       </div>
@@ -139,14 +132,14 @@ export const PictureSelectionForm = ({
             className={cn("text-slate-400", {
               "text-red-600": isInvalid && element.choices?.length < 2,
             })}>
-            ({t("environments.surveys.edit.upload_at_least_2_images")})
+            ({t("workspace.surveys.edit.upload_at_least_2_images")})
           </span>
         </Label>
         <div className="mt-3 flex w-full items-center justify-center">
           <FileInput
             id="choices-file-input"
-            allowedFileExtensions={["png", "jpeg", "jpg", "webp", "heic"]}
-            environmentId={environmentId}
+            allowedFileExtensions={[...IMAGE_FILE_EXTENSIONS]}
+            workspaceId={workspaceId}
             onFileUpload={handleFileInputChanges}
             fileUrl={element?.choices?.map((choice) => choice.imageUrl)}
             multiple={true}
@@ -156,7 +149,7 @@ export const PictureSelectionForm = ({
         </div>
       </div>
 
-      <div className="my-4 flex items-center space-x-2">
+      <div className="my-4 flex items-center gap-x-2">
         <Switch
           id="multi-select-toggle"
           checked={element.allowMulti}
@@ -180,10 +173,10 @@ export const PictureSelectionForm = ({
         <Label htmlFor="multi-select-toggle" className="cursor-pointer">
           <div className="ml-2">
             <h3 className="text-sm font-semibold text-slate-700">
-              {t("environments.surveys.edit.allow_multi_select")}
+              {t("workspace.surveys.edit.allow_multi_select")}
             </h3>
             <p className="text-xs font-normal text-slate-500">
-              {t("environments.surveys.edit.allow_users_to_select_more_than_one_image")}
+              {t("workspace.surveys.edit.allow_users_to_select_more_than_one_image")}
             </p>
           </div>
         </Label>

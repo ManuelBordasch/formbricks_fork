@@ -7,6 +7,7 @@ import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import type { TOrganizationRole } from "@formbricks/types/memberships";
 import { getAccessFlags } from "@/lib/membership/utils";
+import { getFormattedErrorMessage } from "@/lib/utils/helper";
 import { Badge } from "@/modules/ui/components/badge";
 import { Button } from "@/modules/ui/components/button";
 import {
@@ -61,11 +62,21 @@ export function EditMembershipRole({
 
     try {
       if (memberAccepted && memberId) {
-        await updateMembershipAction({ userId: memberId, organizationId, data: { role } });
+        const result = await updateMembershipAction({ userId: memberId, organizationId, data: { role } });
+        if (result?.serverError) {
+          toast.error(getFormattedErrorMessage(result));
+          setLoading(false);
+          return;
+        }
       }
 
       if (inviteId) {
-        await updateInviteAction({ inviteId: inviteId, data: { role } });
+        const result = await updateInviteAction({ inviteId: inviteId, data: { role } });
+        if (result?.serverError) {
+          toast.error(getFormattedErrorMessage(result));
+          setLoading(false);
+          return;
+        }
       }
     } catch (error) {
       toast.error(t("common.something_went_wrong_please_try_again"));
@@ -101,10 +112,9 @@ export function EditMembershipRole({
             disabled={disableRole}
             loading={loading}
             size="sm"
-            variant="secondary"
-            role="button-role">
+            variant="secondary">
             <span className="ml-1 capitalize">{memberRole}</span>
-            <ChevronDownIcon className="h-4 w-4" />
+            <ChevronDownIcon className="size-4" />
           </Button>
         </DropdownMenuTrigger>
         {!disableRole && (
@@ -127,5 +137,5 @@ export function EditMembershipRole({
     );
   }
 
-  return <Badge size="tiny" type="gray" role="badge-role" text={memberRole} className="capitalize" />;
+  return <Badge size="tiny" type="gray" text={memberRole} className="capitalize" />;
 }

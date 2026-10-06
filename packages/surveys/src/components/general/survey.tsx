@@ -1,7 +1,20 @@
 import { type JSX } from "preact";
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useTranslation } from "react-i18next";
+import { applyIngestContract } from "@formbricks/types/embedded-data-ingest";
+import {
+  RESERVED_FIELD_CATALOG,
+  coerceToEmbeddedDataType,
+  dropShadowedReservedEntries,
+  getComputedEmbeddedFields,
+  getIngestedEmbeddedFields,
+  getSurveyEmbeddedFields,
+  listShadowingNames,
+  mergeReservedValues,
+  projectClientReservedValues,
+} from "@formbricks/types/embedded-data-resolver";
 import { SurveyContainerProps } from "@formbricks/types/formbricks-surveys";
-import { type TJsEnvironmentStateSurvey, TJsFileUploadParams } from "@formbricks/types/js";
+import { TJsFileUploadParams, type TJsWorkspaceStateSurvey } from "@formbricks/types/js";
 import type {
   TResponseData,
   TResponseTtc,
@@ -9,6 +22,7 @@ import type {
   TResponseVariables,
 } from "@formbricks/types/responses";
 import { TUploadFileConfig } from "@formbricks/types/storage";
+import { getLinkSurveyCardMaxWidth } from "@formbricks/types/styling";
 import { TSurveyBlock, TSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
 import { TSurveyElement } from "@formbricks/types/surveys/elements";
 import { BlockConditional } from "@/components/general/block-conditional";
@@ -19,17 +33,55 @@ import { LanguageSwitch } from "@/components/general/language-switch";
 import { ProgressBar } from "@/components/general/progress-bar";
 import { RecaptchaBranding } from "@/components/general/recaptcha-branding";
 import { ResponseErrorComponent } from "@/components/general/response-error-component";
+import { Subheader } from "@/components/general/subheader";
 import { SurveyCloseButton } from "@/components/general/survey-close-button";
 import { WelcomeCard } from "@/components/general/welcome-card";
 import { AutoCloseWrapper } from "@/components/wrappers/auto-close-wrapper";
+import { CardlessSurveyLayout } from "@/components/wrappers/cardless-survey-layout";
 import { StackedCardsContainer } from "@/components/wrappers/stacked-cards-container";
 import { ApiClient } from "@/lib/api-client";
+import { type TWebSurveyMeta, createWebSurveyMetaSnapshot } from "@/lib/browser-context";
+import { getLocalizedValue } from "@/lib/i18n";
+import { INGEST_DROP_MESSAGES, logIngestResult } from "@/lib/ingest-logging";
 import { evaluateLogic, performActions } from "@/lib/logic";
-import { parseRecallInformation } from "@/lib/recall";
+import {
+  type SerializedSurveyState,
+  clearSurveyProgress,
+  getSurveyProgress,
+  patchSurveyProgressSnapshot,
+  saveSurveyProgress,
+} from "@/lib/offline-storage";
+import { parseRecallInformation, replaceRecallInfo } from "@/lib/recall";
 import { ResponseQueue } from "@/lib/response-queue";
+import { SURVEY_INSTRUCTIONS_ID, getSurveyPagePosition, hasSurveyInstructions } from "@/lib/survey-page";
 import { SurveyState } from "@/lib/survey-state";
+import { useOnlineStatus } from "@/lib/use-online-status";
 import { cn, findBlockByElementId, getDefaultLanguageCode, getElementsFromSurveyBlocks } from "@/lib/utils";
 import { TResponseErrorCodesEnum } from "@/types/response-error-codes";
+
+const restoreSurveyStateFromSnapshot = (
+  surveyState: SurveyState,
+  snapshot: SerializedSurveyState,
+  progress: {
+    responseData: TResponseData;
+    ttc: TResponseTtc;
+    currentVariables: TResponseVariables;
+  }
+): void => {
+  if (snapshot.responseId) surveyState.updateResponseId(snapshot.responseId);
+  if (snapshot.displayId) surveyState.updateDisplayId(snapshot.displayId);
+  if (snapshot.userId) surveyState.updateUserId(snapshot.userId);
+  if (snapshot.contactId) surveyState.updateContactId(snapshot.contactId);
+  if (snapshot.singleUseId) surveyState.singleUseId = snapshot.singleUseId;
+  surveyState.disableBootstrapResponseCreate();
+  surveyState.responseAcc = {
+    ...snapshot.responseAcc,
+    data: progress.responseData,
+    ttc: progress.ttc,
+    variables: progress.currentVariables,
+    displayId: snapshot.displayId ?? snapshot.responseAcc.displayId,
+  };
+};
 
 interface VariableStackEntry {
   questionId: string;
@@ -38,6 +90,9 @@ interface VariableStackEntry {
 
 export function Survey({
   appUrl,
+  workspaceId: workspaceIdProp,
+  // Legacy SDKs (e.g. Android ≤ v1.2.0) pass `environmentId` instead of
+  // `workspaceId`. Accept it as a fallback so their response submission works.
   environmentId,
   isPreviewMode = false,
   userId,
@@ -71,47 +126,96 @@ export function Survey({
   action,
   singleUseId,
   singleUseResponseId,
+  pinAuthToken,
   isWebEnvironment = true,
   getRecaptchaToken,
   isSpamProtectionEnabled,
   dir = "auto",
   setDir,
+  onLanguageChange,
+  onPageChange,
   placement,
-}: SurveyContainerProps) {
+  offlineSupport = false,
+  onOfflineStatusChange,
+  showCardlessPreviewLogoSlot = false,
+}: Readonly<SurveyContainerProps>) {
+  const { t } = useTranslation();
+  const workspaceId = workspaceIdProp ?? environmentId;
   let apiClient: ApiClient | null = null;
 
-  if (appUrl && environmentId) {
+  if (appUrl && workspaceId) {
     apiClient = new ApiClient({
       appUrl,
-      environmentId,
+      workspaceId,
     });
   }
 
   const surveyState = useMemo(() => {
-    if (appUrl && environmentId) {
+    if (appUrl && workspaceId) {
       if (mode === "inline") {
-        return new SurveyState(survey.id, singleUseId, singleUseResponseId, userId, contactId);
+        return new SurveyState(survey.id, singleUseId, singleUseResponseId, userId, contactId, pinAuthToken);
       }
 
-      return new SurveyState(survey.id, null, null, userId, contactId);
+      return new SurveyState(survey.id, null, null, userId, contactId, pinAuthToken);
     }
     return null;
-  }, [appUrl, environmentId, mode, survey.id, userId, singleUseId, singleUseResponseId, contactId]);
+  }, [
+    appUrl,
+    workspaceId,
+    mode,
+    survey.id,
+    userId,
+    singleUseId,
+    singleUseResponseId,
+    contactId,
+    pinAuthToken,
+  ]);
 
   // Update the responseQueue to use the stored responseId
 
   const [hasInteracted, setHasInteracted] = useState(false);
 
-  const [localSurvey, setlocalSurvey] = useState<TJsEnvironmentStateSurvey>(survey);
+  const [localSurvey, setlocalSurvey] = useState<TJsWorkspaceStateSurvey>(survey);
   const [currentVariables, setCurrentVariables] = useState<TResponseVariables>({});
 
+  const isLinkSurvey = survey.type === "link";
+  const offlinePersistEnabled = offlineSupport && isLinkSurvey && !isPreviewMode && !!appUrl && !!workspaceId;
+
+  const persistSurveyStateSnapshot = useCallback(
+    async (snapshotPatch: Partial<SerializedSurveyState>) => {
+      if (!offlinePersistEnabled) return;
+      await patchSurveyProgressSnapshot(survey.id, snapshotPatch);
+    },
+    [offlinePersistEnabled, survey.id]
+  );
+
+  // `onResponseCreateOrUpdate` runs on every question submit, but a response is only *created* on the
+  // first submit — later submits update it. `onResponseCreated` must therefore fire once, not per
+  // question, otherwise a 5-question survey triggers 5 downstream `/user` refreshes in js-core.
+  //
+  // Fired from the queue's server-ack seam below (not at enqueue time) so it can carry the persisted
+  // `responseId` — the id is minted by the server, so an event that carries it can only fire after
+  // the ack (ENG-1846). Same post-ack semantics as `onDisplayCreated`, which fires after
+  // createDisplay. Preview mode never reaches the queue and fires this without an id at submit time.
+  const responseCreatedRef = useRef(false);
+  const triggerResponseCreatedOnce = useCallback(
+    (responseId?: string) => {
+      if (responseCreatedRef.current) return;
+      responseCreatedRef.current = true;
+      void onResponseCreated?.(responseId);
+    },
+    [onResponseCreated]
+  );
+
   const responseQueue = useMemo(() => {
-    if (appUrl && environmentId && surveyState) {
+    if (appUrl && workspaceId && surveyState) {
       return new ResponseQueue(
         {
           appUrl,
-          environmentId,
+          workspaceId,
           retryAttempts: 4,
+          persistOffline: offlinePersistEnabled,
+          surveyId: survey.id,
           onResponseSendingFailed: (_, errorCode?: TResponseErrorCodesEnum) => {
             setShowError(true);
             setErrorType(errorCode);
@@ -122,6 +226,8 @@ export function Survey({
           },
           onResponseSendingFinished: () => {
             setIsResponseSendingFinished(true);
+            setShowError(false);
+            setErrorType(undefined);
 
             if (getSetIsResponseSendingFinished) {
               getSetIsResponseSendingFinished((_prev) => {});
@@ -134,13 +240,35 @@ export function Survey({
               setBlockId(quotaInfo.endingCardId);
             }
           },
+          onResponseCreated: (responseId) => {
+            void persistSurveyStateSnapshot({ responseId });
+            try {
+              triggerResponseCreatedOnce(responseId);
+            } catch (error) {
+              // This runs inside ResponseQueue.sendResponse's try block, and the callback reaches
+              // host-supplied code (js-core's event bus → the host page). A throw here would be
+              // caught as a SEND failure — the respondent shown an error and a retry for a response
+              // the server already created. Never let a host page do that.
+              console.error("Formbricks: onResponseCreated handler threw", error);
+            }
+          },
         },
         surveyState
       );
     }
 
     return null;
-  }, [appUrl, environmentId, getSetIsError, getSetIsResponseSendingFinished, surveyState]);
+  }, [
+    appUrl,
+    workspaceId,
+    getSetIsError,
+    getSetIsResponseSendingFinished,
+    surveyState,
+    offlinePersistEnabled,
+    persistSurveyStateSnapshot,
+    triggerResponseCreatedOnce,
+    survey.id,
+  ]);
 
   const questions = useMemo(() => getElementsFromSurveyBlocks(localSurvey.blocks), [localSurvey.blocks]);
 
@@ -160,14 +288,26 @@ export function Survey({
     setlocalSurvey(survey);
   }, [survey]);
 
+  // ENG-1837: computed fields are seeded from their definitions in the EmbeddedData tables, falling
+  // back to the legacy `variables` column for surveys whose rows are not joined in. Only `variables`
+  // and `embeddedFields` are passed (and depended on): a computed field can never be derived from
+  // `hiddenFields`, so nothing else can change this map.
   useEffect(() => {
     setCurrentVariables(
-      survey.variables.reduce<TResponseVariables>((acc, variable) => {
-        acc[variable.id] = variable.value;
+      getComputedEmbeddedFields({
+        variables: survey.variables,
+        embeddedFields: survey.embeddedFields,
+      }).reduce<TResponseVariables>((acc, { field, link }) => {
+        // Provably the variable's declared value for every field derived from the legacy shape:
+        // ZSurveyVariable pins a number variable to a number and a text one to a string, and both
+        // are pass-throughs here (see the seeding test in embedded-data-mapping.test.ts). Booleans
+        // and dates have no slot in TResponseVariables and no computed field can carry one.
+        const seed = coerceToEmbeddedDataType(field.defaultValue, field.dataType);
+        if (typeof seed === "string" || typeof seed === "number") acc[link.storageKey] = seed;
         return acc;
       }, {})
     );
-  }, [survey.variables]);
+  }, [survey.variables, survey.embeddedFields]);
 
   const autoFocusEnabled = autoFocus ?? window.self === window.top;
 
@@ -184,6 +324,11 @@ export function Survey({
     return localSurvey.blocks[0]?.id;
   });
 
+  // True once the user navigated between cards (Next/Back/auto-progress). Moving focus into
+  // the new card is then a response to a user action (safe under WCAG 3.2.x), unlike the
+  // initial render of an embedded survey, where stealing focus from the host page is not.
+  const hasUserNavigatedRef = useRef(false);
+
   const [errorType, setErrorType] = useState<TResponseErrorCodesEnum | undefined>(undefined);
   const [showError, setShowError] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
@@ -194,16 +339,73 @@ export function Survey({
   const [selectedLanguage, setSelectedLanguage] = useState(languageCode);
   const [loadingElement, setLoadingElement] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
-  const [responseData, setResponseData] = useState<TResponseData>(hiddenFieldsRecord ?? {});
+  const isNavigatingBackRef = useRef(false);
+  /**
+   * The Embedded Data ingest contract (ENG-1845) applied to whatever the host handed us — URL params
+   * for a link survey, `track({ hiddenFields })` or `setEmbeddedData` for an app one. Every caller
+   * passes a raw bag and this is the one place it is filtered and coerced, so the SDKs stay dumb
+   * pipes and the four mobile ones inherit the rules without shipping a copy (ENG-2472).
+   *
+   * In a lazy initialiser because it belongs to the display-time snapshot: the bag is read once, at
+   * mount, like the browser-runtime context beside it. The values it produces are the ones the
+   * respondent's logic and recall see, so they must not change under them mid-survey.
+   *
+   * Client-side enforcement is for immediate correctness and developer feedback only — the server
+   * re-runs the same contract on ingest and recomputes the flags, because it cannot trust this.
+   */
+  const [ingestedFieldsRecord] = useState<TResponseData>(() => {
+    const elementIds = getElementsFromSurveyBlocks(survey.blocks).map((element) => element.id);
+    const result = applyIngestContract({
+      incoming: hiddenFieldsRecord ?? {},
+      ingestedFields: getIngestedEmbeddedFields(survey),
+      elementIds,
+      // This record is what the queue sends, so cutting here would hand the server a value that
+      // already fits — and the server's re-run is what produces the persisted flags, so the
+      // `truncated` verdict would be lost on the only path the feature actually ships on. The flag is
+      // still raised below for the console; the server does the cutting.
+      enforceSizeLimit: false,
+    });
+    logIngestResult(result);
+
+    // The contract passes question answers through because at a server boundary `incoming` IS
+    // `response.data`. Here it is only the host's bag, so a key naming a question is not an answer —
+    // and keeping it would be worse than useless: `ResponseQueue` merges this record OVER `data` on
+    // every submit, so a hidden field named after a question id would re-apply its display-time
+    // value on top of whatever the respondent actually answered. Prefilling has its own prop.
+    const elementIdSet = new Set(elementIds);
+    return Object.fromEntries(
+      Object.entries(result.data).filter(([key]) => {
+        if (!elementIdSet.has(key)) return true;
+        console.warn(
+          `Formbricks: "${key}" ${INGEST_DROP_MESSAGES.element_id_collision}, so the value was ignored.`
+        );
+        return false;
+      })
+    );
+  });
+  const [responseData, setResponseData] = useState<TResponseData>(ingestedFieldsRecord);
   const [_variableStack, setVariableStack] = useState<VariableStackEntry[]>([]);
 
   const [ttc, setTtc] = useState<TResponseTtc>({});
+  const isOnline = useOnlineStatus();
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [pendingSyncCount, setPendingSyncCount] = useState(0);
+  const [progressRestored, setProgressRestored] = useState(!offlinePersistEnabled);
+
+  // Notify parent of offline status changes (for rendering alert in the React layer)
+  useEffect(() => {
+    onOfflineStatusChange?.({ isOnline, isSyncing, pendingSyncCount });
+  }, [isOnline, isSyncing, pendingSyncCount, onOfflineStatusChange]);
+
   const cardArrangement = useMemo(() => {
     if (localSurvey.type === "link") {
       return styling.cardArrangement?.linkSurveys ?? "straight";
     }
     return styling.cardArrangement?.appSurveys ?? "straight";
   }, [localSurvey.type, styling.cardArrangement?.linkSurveys, styling.cardArrangement?.appSurveys]);
+  const isCardless = cardArrangement === "cardless";
+  const linkSurveyCardMaxWidth =
+    localSurvey.type === "link" ? getLinkSurveyCardMaxWidth(styling.linkSurveyCardWidth) : undefined;
 
   // Current block tracking (replaces currentQuestionIndex)
   const currentBlockIndex = localSurvey.blocks.findIndex((b) => b.id === blockId);
@@ -275,6 +477,7 @@ export function Survey({
 
         surveyState.updateDisplayId(display.data.id);
         responseQueue.updateSurveyState(surveyState);
+        await persistSurveyStateSnapshot({ displayId: display.data.id });
 
         if (onDisplayCreated) {
           onDisplayCreated();
@@ -293,19 +496,32 @@ export function Survey({
     onDisplayCreated,
     isPreviewMode,
     onDisplay,
+    persistSurveyStateSnapshot,
   ]);
 
-  useEffect(() => {
-    // call onDisplay when component is mounted
+  // Create display on mount. When offline persistence is enabled, wait for progress
+  // restoration so we can skip creating a new display if a session was restored.
+  const displayCreatedRef = useRef(false);
 
-    if (appUrl && environmentId) {
+  useEffect(() => {
+    if (offlinePersistEnabled && !progressRestored) return;
+
+    // If we restored a session that already has a displayId, skip creating a new one.
+    if (offlinePersistEnabled && surveyState?.displayId) {
+      displayCreatedRef.current = true;
+      return;
+    }
+
+    if (displayCreatedRef.current) return;
+    displayCreatedRef.current = true;
+
+    if (appUrl && workspaceId) {
       createDisplay();
     } else {
       onDisplay?.();
     }
-
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- onDisplay should only be called once
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once, or once after restore for offline
+  }, [progressRestored]);
 
   useEffect(() => {
     if (getSetIsError) {
@@ -342,6 +558,232 @@ export function Survey({
   useEffect(() => {
     setSelectedLanguage(languageCode);
   }, [languageCode]);
+
+  // Report the active language (initial value + every switch) so a link-survey
+  // host can keep the page lang/dir in sync (WCAG 3.1.1). Embedded widgets pass
+  // no callback, so the host page is never touched.
+  useEffect(() => {
+    onLanguageChange?.(selectedLanguage);
+  }, [selectedLanguage, onLanguageChange]);
+
+  // Report the respondent's position (initial card + every navigation) so a link-survey host can
+  // title the document per step (WCAG 2.4.2). The label is localized HERE rather than by the host:
+  // the survey knows its own active language, while the host's i18n is in the viewer's UI locale,
+  // so a title assembled there would mix the two. Embedded widgets pass no callback.
+  useEffect(() => {
+    if (!onPageChange) return;
+    const { index, total } = getSurveyPagePosition(localSurvey, blockId);
+    onPageChange({
+      index,
+      total,
+      label: t("common.page_x_of_y", { current: index, total }),
+    });
+  }, [blockId, localSurvey, onPageChange, t]);
+
+  // --- Offline support: restore progress from IndexedDB on mount ---
+  useEffect(() => {
+    if (!offlinePersistEnabled) return;
+
+    let cancelled = false;
+
+    const restore = async () => {
+      const progress = await getSurveyProgress(survey.id);
+
+      if (cancelled || !progress) {
+        setProgressRestored(true);
+        return;
+      }
+
+      // Discard stale progress (older than 24 hours)
+      const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+      if (Date.now() - progress.updatedAt > MAX_AGE_MS) {
+        await clearSurveyProgress(survey.id);
+        setProgressRestored(true);
+        return;
+      }
+
+      // Check pending responses first — this determines whether the survey is truly complete.
+      const pendingCount = responseQueue ? await responseQueue.loadPersistedQueue() : 0;
+
+      // If the survey is fully complete (no pending responses + finished), discard stale
+      // progress and start fresh instead of restoring to the ending card.
+      if (pendingCount === 0) {
+        const isEndingCard = localSurvey.endings.some((e) => e.id === progress.blockId);
+        const isResponseFinished = progress.surveyStateSnapshot?.responseAcc?.finished === true;
+
+        if (isEndingCard || isResponseFinished) {
+          await clearSurveyProgress(survey.id);
+          setProgressRestored(true);
+          return;
+        }
+      }
+
+      if (pendingCount > 0) {
+        setPendingSyncCount(pendingCount);
+      }
+
+      /*
+       * Reinstate the browser context this response was first displayed with. Past this point the
+       * entry is being resumed, so the writes that follow go to the response `surveyStateSnapshot`
+       * already identifies — and the meta they carry has to keep describing the original display.
+       * Lazy `useRef` init has already measured the *current* page by now (a reload can land on a
+       * different URL, referrer or viewport), so the persisted snapshot replaces it rather than
+       * merging with it: a partial merge would report a context that never existed.
+       *
+       * Entries written before this field existed carry no meta and keep the freshly measured
+       * snapshot, which is exactly the behaviour they had.
+       */
+      if (progress.webSurveyMeta) {
+        const restoredMeta = progress.webSurveyMeta;
+        webSurveyMetaRef.current = () => restoredMeta;
+      }
+
+      // Validate that the saved blockId still exists in the current survey
+      const blockExists =
+        progress.blockId === "start" ||
+        progress.blockId === "end" ||
+        localSurvey.blocks.some((b) => b.id === progress.blockId) ||
+        localSurvey.endings.some((e) => e.id === progress.blockId);
+
+      if (blockExists) {
+        setBlockId(progress.blockId);
+        setResponseData(progress.responseData);
+        setTtc(progress.ttc);
+        setCurrentVariables(progress.currentVariables);
+        setHistory(progress.history);
+        setSelectedLanguage(progress.selectedLanguage);
+
+        // Restore survey state from snapshot
+        if (surveyState && progress.surveyStateSnapshot) {
+          restoreSurveyStateFromSnapshot(surveyState, progress.surveyStateSnapshot, progress);
+
+          if (pendingCount === 0 && !progress.surveyStateSnapshot.responseId) {
+            if (progress.surveyStateSnapshot.displayId && apiClient) {
+              const responseLookup = await apiClient.getResponseIdByDisplayId(
+                progress.surveyStateSnapshot.displayId
+              );
+
+              if (responseLookup.ok && responseLookup.data.responseId) {
+                surveyState.updateResponseId(responseLookup.data.responseId);
+                await persistSurveyStateSnapshot({ responseId: responseLookup.data.responseId });
+              } else if (responseLookup.ok) {
+                surveyState.enableBootstrapResponseCreate();
+              } else if (responseLookup.error.status === 404) {
+                surveyState.updateDisplayId(null);
+                surveyState.enableBootstrapResponseCreate();
+                await persistSurveyStateSnapshot({ displayId: null });
+              } else {
+                console.error("Formbricks: Failed to recover responseId from displayId", {
+                  displayId: progress.surveyStateSnapshot.displayId,
+                  error: responseLookup.error,
+                });
+                surveyState.enableBootstrapResponseCreate();
+              }
+            } else {
+              surveyState.enableBootstrapResponseCreate();
+            }
+          }
+
+          responseQueue?.updateSurveyState(surveyState);
+        }
+      } else {
+        // Block no longer exists (survey structure changed) — discard UI progress
+        // but still restore survey state and sync pending responses below.
+        await clearSurveyProgress(survey.id);
+
+        if (surveyState && progress.surveyStateSnapshot) {
+          restoreSurveyStateFromSnapshot(surveyState, progress.surveyStateSnapshot, progress);
+          responseQueue?.updateSurveyState(surveyState);
+        }
+      }
+
+      setProgressRestored(true);
+    };
+
+    void restore();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- should only run on mount
+  }, []);
+
+  // --- Offline support: save progress to IndexedDB on submit (see onSubmit) ---
+
+  // --- Offline support: sync pending responses when coming back online ---
+  const isSyncingRef = useRef(false);
+
+  useEffect(() => {
+    if (!offlinePersistEnabled || !responseQueue || !progressRestored) return;
+
+    // Reset the guard when going offline so a new sync can start next time we're online
+    if (!isOnline) {
+      isSyncingRef.current = false;
+      return;
+    }
+
+    // Prevent duplicate syncs from re-renders while a sync is already in progress
+    if (isSyncingRef.current) return;
+    isSyncingRef.current = true;
+
+    const syncPending = async () => {
+      try {
+        const count = await responseQueue.getPendingCount();
+        if (count === 0) return;
+
+        setIsSyncing(true);
+        setPendingSyncCount(count);
+
+        const result = await responseQueue.syncPersistedResponses((synced, total) => {
+          setPendingSyncCount(total - synced);
+        });
+
+        setIsSyncing(false);
+        setPendingSyncCount(0);
+
+        if (result.syncedCount > 0) {
+          console.log(`Formbricks: Synced ${result.syncedCount} offline response(s)`);
+        }
+
+        // Clean up IndexedDB and mark sending as finished after successful sync
+        // Individual entries are already removed from IndexedDB inside syncPersistedResponses.
+        // Don't use clearPendingResponses here — it would wipe entries added during the async sync.
+        if (result.success) {
+          await clearSurveyProgress(survey.id);
+
+          if (result.syncedCount > 0) {
+            setIsResponseSendingFinished(true);
+          }
+        }
+      } finally {
+        isSyncingRef.current = false;
+      }
+    };
+
+    void syncPending();
+  }, [isOnline, offlinePersistEnabled, responseQueue, progressRestored, survey.id]);
+
+  // --- Warn before leaving mid-survey or with unsent offline responses ---
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      // Warn if user has started answering but hasn't finished the survey (only when offline support is active)
+      if (offlinePersistEnabled && history.length > 0 && !isSurveyFinished) {
+        e.preventDefault();
+        return;
+      }
+      // Warn if there are unsent offline responses
+      if (
+        offlinePersistEnabled &&
+        responseQueue &&
+        (responseQueue.queue.length > 0 || pendingSyncCount > 0)
+      ) {
+        e.preventDefault();
+      }
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [history.length, isSurveyFinished, offlinePersistEnabled, responseQueue, pendingSyncCount]);
 
   const onChange = (responseDataUpdate: TResponseData) => {
     const updatedResponseData = { ...responseData, ...responseDataUpdate };
@@ -420,7 +862,13 @@ export function Survey({
   };
 
   const evaluateLogicAndGetNextBlockId = (
-    data: TResponseData
+    data: TResponseData,
+    /**
+     * Reserved-field values, passed in rather than closed over: this is declared above the memo that
+     * produces them, and taking them as a parameter keeps the sole call site explicit about the fact
+     * that logic reads the same map recall does.
+     */
+    reservedFieldValues: Record<string, string | number>
   ): { nextBlockId: string | undefined; calculatedVariables: TResponseVariables } => {
     const firstEndingId = survey.endings.length > 0 ? survey.endings[0].id : undefined;
 
@@ -454,7 +902,10 @@ export function Survey({
         localResponseData,
         calculationResults,
         logic.conditions,
-        selectedLanguage
+        selectedLanguage,
+        // Merged against the in-flight response data (answers from this block included), so a
+        // declared field shadows a same-named reserved entry here exactly as it does in recall.
+        mergeReservedValues(reservedFieldValues, localResponseData)
       );
 
       if (!isLogicMet) {
@@ -529,22 +980,26 @@ export function Survey({
     };
   };
 
-  const getWebSurveyMeta = useCallback(() => {
-    if (!isWebEnvironment) return {};
+  /**
+   * The browser-runtime context, snapshotted **once on this survey's first render** and frozen for
+   * the rest of its life. `onResponseCreateOrUpdate` runs on every submit, so reading the runtime
+   * there — as this did before — meant a respondent who rotated their phone or resized the window
+   * mid-survey silently rewrote the viewport the finished response reports.
+   *
+   * Lazy `useRef` initialisation is what makes "first render" the capture point. A survey with a
+   * `delay` is not mounted until the widget actually renders it, so render time is the only moment
+   * this component can reach — and it is the right one anyway: it is when the respondent first sees
+   * the survey, not when some earlier action queued it.
+   */
+  const webSurveyMetaRef = useRef<(() => TWebSurveyMeta) | null>(null);
+  webSurveyMetaRef.current ??= createWebSurveyMetaSnapshot(isWebEnvironment);
 
-    const url = new URL(window.location.href);
-    const source = url.searchParams.get("source");
-
-    return {
-      url: url.href,
-      ...(source ? { source } : {}),
-    };
-  }, [isWebEnvironment]);
+  const getWebSurveyMeta = useCallback((): TWebSurveyMeta => webSurveyMetaRef.current?.() ?? {}, []);
 
   const onResponseCreateOrUpdate = useCallback(
     async (responseUpdate: TResponseUpdate) => {
       // Always trigger the onResponse callback even in preview mode
-      if (!appUrl || !environmentId) {
+      if (!appUrl || !workspaceId) {
         onResponse?.({
           data: responseUpdate.data,
           ttc: responseUpdate.ttc,
@@ -556,9 +1011,9 @@ export function Survey({
         return;
       }
 
-      // Skip response creation in preview mode but still trigger the onResponseCreated callback
+      // Skip response creation in preview mode but still trigger the onResponseCreated callback (once)
       if (isPreviewMode) {
-        onResponseCreated?.();
+        triggerResponseCreatedOnce();
 
         // When in preview mode, set isResponseSendingFinished to true if the response is finished
         if (responseUpdate.finished) {
@@ -590,27 +1045,102 @@ export function Survey({
           variables: responseUpdate.variables,
           displayId: surveyState.displayId,
           endingId: responseUpdate.endingId,
-          hiddenFields: hiddenFieldsRecord,
+          // The filtered record, not the raw prop: `ResponseQueue` merges `hiddenFields` over `data`
+          // on every submit, so sending the raw bag here would put the dropped and uncoerced values
+          // straight back.
+          hiddenFields: ingestedFieldsRecord,
         });
-
-        onResponseCreated?.();
+        // No trigger here: the queue's onResponseCreated ack fires it with the persisted responseId.
       }
     },
     [
       appUrl,
-      environmentId,
+      workspaceId,
       isPreviewMode,
       surveyState,
       responseQueue,
       onResponse,
-      onResponseCreated,
+      triggerResponseCreatedOnce,
       contactId,
       userId,
       survey,
       action,
-      hiddenFieldsRecord,
+      ingestedFieldsRecord,
       getWebSurveyMeta,
     ]
+  );
+
+  /**
+   * The catalog entries this survey may resolve at all — everything the survey does not declare
+   * itself (ENG-2538).
+   *
+   * Without this filter the projection below carried a reserved value for every name in the catalog,
+   * and {@link mergeReservedValues}'s spread was the only thing keeping a declared field ahead of
+   * it. A spread only wins for keys that exist, so a survey declaring an optional `url` rendered the
+   * page's own address — an internal `/edit` URL in the editor's preview, the respondent's own link
+   * in production — wherever the respondent had not supplied the field. That is the normal case for
+   * a hidden field, and it reached respondent-facing copy.
+   *
+   * Element ids count as declarations here, which is why `questions` is in the list: a question with
+   * id `url` is absent from `responseData` until it is answered, so the reserved read would win for
+   * exactly as long as the respondent had not reached it.
+   */
+  const readableReservedEntries = useMemo(
+    () =>
+      dropShadowedReservedEntries(
+        RESERVED_FIELD_CATALOG,
+        listShadowingNames(
+          getSurveyEmbeddedFields(localSurvey),
+          questions.map((question) => question.id)
+        )
+      ),
+    [localSurvey, questions]
+  );
+
+  /**
+   * Reserved-field values this renderer can resolve *right now* (ENG-1840).
+   *
+   * `projectClientReservedValues` drops every `server` catalog entry, so the map holds only what a
+   * browser mid-survey actually knows (url, source, action, language today; the SDK-captured entries
+   * light up automatically once they land in the catalog). A recall token or logic operand naming a
+   * server-derived field — country, durationSeconds, browser — finds no key and reads as unset,
+   * which is the correct answer rather than a fabricated empty string.
+   *
+   * The meta slice is the same expression the response queue persists, so what recall shows and what
+   * ingest stores cannot drift apart. `language` is resolved the same way too: `"default"` is a
+   * renderer-internal sentinel, and `#recall:language#` must render the real language code.
+   */
+  const reservedValues = useMemo(
+    () =>
+      projectClientReservedValues(readableReservedEntries, {
+        surveyId: localSurvey.id,
+        language:
+          selectedLanguage === "default" ? (getDefaultLanguageCode(survey) ?? null) : selectedLanguage,
+        data: responseData,
+        variables: currentVariables,
+        ttc,
+        meta: { ...getWebSurveyMeta(), action },
+      }),
+    [
+      readableReservedEntries,
+      localSurvey.id,
+      selectedLanguage,
+      survey,
+      responseData,
+      currentVariables,
+      ttc,
+      getWebSurveyMeta,
+      action,
+    ]
+  );
+
+  /**
+   * Recall's lookup map. The reserved side is already shadow-filtered, so a declared field owns its
+   * name whether or not it has a value; the merge order is what still protects a stored `""` or `0`.
+   */
+  const recallValues = useMemo(
+    () => mergeReservedValues(reservedValues, responseData),
+    [reservedValues, responseData]
   );
 
   useEffect(() => {
@@ -624,15 +1154,38 @@ export function Survey({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- this is a one-time effect
   }, []);
 
+  // When offline with persistence, the response is safely stored in IndexedDB.
+  // Mark it as "sending finished" for the UI (ending card) without triggering cleanup.
+  useEffect(() => {
+    if (offlinePersistEnabled && !isOnline && isSurveyFinished && !isResponseSendingFinished) {
+      setIsResponseSendingFinished(true);
+    }
+  }, [offlinePersistEnabled, isOnline, isSurveyFinished, isResponseSendingFinished]);
+
   useEffect(() => {
     if (isResponseSendingFinished && isSurveyFinished) {
       // Post a message to the parent window indicating that the survey is completed.
       window.parent.postMessage("formbricksSurveyCompleted", "*"); // NOSONAR typescript:S2819 // We can't check the targetOrigin here because we don't know the parent window's origin.
-      onFinished?.();
+      // Gated on isResponseSendingFinished, so outside preview/offline the ack has landed and the
+      // queue has stamped the persisted responseId onto surveyState (ENG-1846).
+      onFinished?.(surveyState?.responseId ?? undefined);
     }
   }, [isResponseSendingFinished, isSurveyFinished, onFinished]);
 
+  // The outgoing card stays visible while the card transition cross-fades, so a
+  // control that kept focus would show its focus ring hanging mid-fade before
+  // vanishing with the card. Drop focus when navigation starts; the incoming
+  // card focuses its first control on mount.
+  const blurOutgoingCard = (): void => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) active.blur();
+  };
+
   const onSubmit = async (surveyResponseData: TResponseData, responsettc: TResponseTtc) => {
+    isNavigatingBackRef.current = false;
+    hasUserNavigatedRef.current = true;
+    blurOutgoingCard();
+
     // Get the first responded element ID for tracking
     const respondedElementIds = Object.keys(surveyResponseData);
     const firstRespondedElementId = respondedElementIds[0];
@@ -653,14 +1206,25 @@ export function Survey({
 
     pushVariableState(firstRespondedElementId);
 
-    const { nextBlockId, calculatedVariables } = evaluateLogicAndGetNextBlockId(surveyResponseData);
+    const { nextBlockId: rawNextBlockId, calculatedVariables } = evaluateLogicAndGetNextBlockId(
+      surveyResponseData,
+      reservedValues
+    );
+    // A jump target may reference a deleted block or ending; treat such stale ids as "no target"
+    // so the shown ending and the persisted endingId stay in sync
+    const targetIsBlock = localSurvey.blocks.some((block) => block.id === rawNextBlockId);
+    const targetIsEnding = localSurvey.endings.some((ending) => ending.id === rawNextBlockId);
+    const isValidTarget = targetIsBlock || targetIsEnding;
+    const nextBlockId = isValidTarget ? rawNextBlockId : undefined;
     const finished =
       nextBlockId === undefined || !localSurvey.blocks.map((block) => block.id).includes(nextBlockId);
 
     setIsSurveyFinished(finished);
 
-    const endingId = nextBlockId
-      ? localSurvey.endings.find((ending) => ending.id === nextBlockId)?.id
+    // The ending that will be shown: an explicit jump target, or the first ending when the survey
+    // falls off the last block (mirrors the display fallback below so the persisted endingId matches it)
+    const endingId = finished
+      ? (localSurvey.endings.find((ending) => ending.id === nextBlockId)?.id ?? localSurvey.endings[0]?.id)
       : undefined;
 
     onChange(surveyResponseData);
@@ -688,11 +1252,43 @@ export function Survey({
       }
     }
     // add current block to history
-    setHistory([...history, blockId]);
+    const newHistory = [...history, blockId];
+    setHistory(newHistory);
+
+    // --- Offline support: save progress on each submit ---
+    if (offlinePersistEnabled) {
+      const newBlockId = finished ? endingId || localSurvey.endings[0]?.id || "end" : nextBlockId || blockId;
+
+      void saveSurveyProgress({
+        surveyId: survey.id,
+        blockId: newBlockId,
+        responseData: { ...responseData, ...surveyResponseData },
+        ttc: { ...ttc, ...responsettc },
+        currentVariables: calculatedVariables,
+        history: newHistory,
+        selectedLanguage,
+        webSurveyMeta: getWebSurveyMeta(),
+        surveyStateSnapshot: {
+          responseId: surveyState?.responseId ?? null,
+          displayId: surveyState?.displayId ?? null,
+          surveyId: survey.id,
+          singleUseId: surveyState?.singleUseId ?? null,
+          userId: surveyState?.userId ?? null,
+          contactId: surveyState?.contactId ?? null,
+          responseAcc: surveyState?.responseAcc ?? { finished: false, data: {}, ttc: {}, variables: {} },
+        },
+        updatedAt: Date.now(),
+      });
+    }
+
     setLoadingElement(false);
   };
 
   const onBack = (): void => {
+    isNavigatingBackRef.current = true;
+    hasUserNavigatedRef.current = true;
+    blurOutgoingCard();
+
     let prevBlockId: string | undefined;
     // use history if available
     if (history.length > 0) {
@@ -735,20 +1331,41 @@ export function Survey({
       switch (errorType) {
         case TResponseErrorCodesEnum.ResponseSendingError:
           return (
-            <ResponseErrorComponent
-              responseData={responseQueue?.getUnsentData() ?? responseData}
-              questions={questions}
-              onRetry={retryResponse}
-              isRetrying={isRetrying}
-            />
+            <>
+              {localSurvey.type !== "link" ? (
+                <div className="bg-survey-bg relative h-8 w-full">
+                  <div className="flex w-full items-center justify-end">
+                    <SurveyCloseButton
+                      onClose={onClose}
+                      hoverColor={styling.inputBgColor?.light ?? "#f8fafc"}
+                      borderRadius={styling.roundness ?? 8}
+                    />
+                  </div>
+                </div>
+              ) : null}
+              <ResponseErrorComponent
+                responseData={responseQueue?.getUnsentData() ?? responseData}
+                questions={questions}
+                onRetry={retryResponse}
+                isRetrying={isRetrying}
+              />
+            </>
           );
         case TResponseErrorCodesEnum.RecaptchaError:
         case TResponseErrorCodesEnum.InvalidDeviceError:
+        case TResponseErrorCodesEnum.ResponseAlreadyCompleted:
+        case TResponseErrorCodesEnum.ResponseSendingErrorPermanent:
           return (
             <>
               {localSurvey.type !== "link" ? (
-                <div className="bg-survey-bg flex h-6 justify-end pt-2 pr-2">
-                  <SurveyCloseButton onClose={onClose} />
+                <div className="bg-survey-bg relative h-8 w-full">
+                  <div className="flex w-full items-center justify-end">
+                    <SurveyCloseButton
+                      onClose={onClose}
+                      hoverColor={styling.inputBgColor?.light ?? "#f8fafc"}
+                      borderRadius={styling.roundness ?? 8}
+                    />
+                  </div>
                 </div>
               ) : null}
               <ErrorComponent errorType={errorType} />
@@ -771,12 +1388,13 @@ export function Survey({
             survey={localSurvey}
             languageCode={selectedLanguage}
             responseCount={responseCount}
-            autoFocusEnabled={autoFocusEnabled}
+            autoFocusEnabled={autoFocusEnabled || hasUserNavigatedRef.current}
             isCurrent={offset === 0}
-            responseData={responseData}
+            responseData={recallValues}
             variablesData={currentVariables}
             isPreviewMode={isPreviewMode}
             fullSizeCards={fullSizeCards}
+            isCardless={isCardless}
           />
         );
       } else if (blockIdx >= localSurvey.blocks.length) {
@@ -789,15 +1407,17 @@ export function Survey({
               survey={localSurvey}
               endingCard={endingCard}
               isRedirectDisabled={isRedirectDisabled}
-              autoFocusEnabled={autoFocusEnabled}
+              autoFocusEnabled={autoFocusEnabled || hasUserNavigatedRef.current}
               isCurrent={offset === 0}
               languageCode={selectedLanguage}
               isResponseSendingFinished={isResponseSendingFinished}
-              responseData={responseData}
+              responseData={recallValues}
               variablesData={currentVariables}
               onOpenExternalURL={onOpenExternalURL}
               isPreviewMode={isPreviewMode}
               fullSizeCards={fullSizeCards}
+              isCardless={isCardless}
+              isOfflineWithPending={offlinePersistEnabled && !isOnline && isSurveyFinished}
             />
           );
         }
@@ -812,7 +1432,7 @@ export function Survey({
               block={{
                 ...block,
                 elements: block.elements.map((element) =>
-                  parseRecallInformation(element, selectedLanguage, responseData, currentVariables)
+                  parseRecallInformation(element, selectedLanguage, recallValues, currentVariables)
                 ),
               }}
               value={responseData}
@@ -823,15 +1443,18 @@ export function Survey({
               setTtc={setTtc}
               onFileUpload={onFileUpload}
               isFirstBlock={block.id === localSurvey.blocks[0]?.id}
-              skipPrefilled={skipPrefilled}
+              skipPrefilled={skipPrefilled && !isNavigatingBackRef.current}
               prefilledResponseData={offset === 0 ? prefillResponseData : undefined}
               isLastBlock={block.id === localSurvey.blocks[localSurvey.blocks.length - 1].id}
               languageCode={selectedLanguage}
               autoFocusEnabled={autoFocusEnabled}
+              shouldFocusOnMount={autoFocusEnabled || hasUserNavigatedRef.current}
               isBackButtonHidden={localSurvey.isBackButtonHidden}
+              isAutoProgressingEnabled={localSurvey.isAutoProgressingEnabled}
               onOpenExternalURL={onOpenExternalURL}
               dir={dir}
               fullSizeCards={fullSizeCards}
+              isCardless={isCardless}
             />
           )
         );
@@ -850,44 +1473,52 @@ export function Survey({
         setHasInteracted={setHasInteracted}>
         <div
           className={cn(
-            "no-scrollbar bg-survey-bg flex h-full w-full flex-col justify-between overflow-hidden transition-opacity duration-1000 ease-in-out",
-            offset === 0 || cardArrangement === "simple" ? "opacity-100" : "opacity-0"
+            "no-scrollbar flex w-full flex-col justify-between transition-opacity duration-1000 ease-in-out",
+            isCardless ? "" : "bg-survey-bg h-full overflow-hidden",
+            offset === 0 || cardArrangement === "simple" || isCardless ? "opacity-100" : "opacity-0"
           )}>
           <div className={cn("relative")}>
-            <div className="flex w-full flex-col items-end">
-              {showProgressBar ? <ProgressBar survey={localSurvey} blockId={blockId} /> : null}
+            {(!isCardless && showProgressBar) || isLanguageSwitchVisible || isCloseButtonVisible ? (
+              <div className="flex w-full flex-col items-end">
+                {!isCardless && showProgressBar ? (
+                  <ProgressBar survey={localSurvey} blockId={blockId} />
+                ) : null}
 
-              <div
-                className={cn(
-                  "relative w-full",
-                  isCloseButtonVisible || isLanguageSwitchVisible ? "h-8" : "h-5"
-                )}>
-                <div className={cn("flex w-full items-center justify-end")}>
-                  {isLanguageSwitchVisible && (
-                    <LanguageSwitch
-                      survey={localSurvey}
-                      surveyLanguages={localSurvey.languages}
-                      setSelectedLanguageCode={setSelectedLanguage}
-                      hoverColor={styling.inputColor?.light ?? "#f8fafc"}
-                      borderRadius={styling.roundness ?? 8}
-                      setDir={setDir}
-                      dir={dir}
-                    />
-                  )}
-                  {isLanguageSwitchVisible && isCloseButtonVisible && (
-                    <div aria-hidden="true" className="z-1001 h-5 w-px bg-slate-200" />
-                  )}
+                {isCloseButtonVisible || isLanguageSwitchVisible ? (
+                  <div
+                    className={cn(
+                      "relative w-full",
+                      isCloseButtonVisible || isLanguageSwitchVisible ? "h-8" : "h-5"
+                    )}>
+                    <div className={cn("flex w-full items-center justify-end")}>
+                      {isLanguageSwitchVisible && (
+                        <LanguageSwitch
+                          survey={localSurvey}
+                          surveyLanguages={localSurvey.languages}
+                          selectedLanguageCode={selectedLanguage}
+                          setSelectedLanguageCode={setSelectedLanguage}
+                          hoverColor={styling.inputBgColor?.light ?? "#f8fafc"}
+                          borderRadius={styling.roundness ?? 8}
+                          setDir={setDir}
+                          dir={dir}
+                        />
+                      )}
+                      {isLanguageSwitchVisible && isCloseButtonVisible && (
+                        <div aria-hidden="true" className="z-1001 h-5 w-px bg-slate-200" />
+                      )}
 
-                  {isCloseButtonVisible && (
-                    <SurveyCloseButton
-                      onClose={onClose}
-                      hoverColor={styling.inputColor?.light ?? "#f8fafc"}
-                      borderRadius={styling.roundness ?? 8}
-                    />
-                  )}
-                </div>
+                      {isCloseButtonVisible && (
+                        <SurveyCloseButton
+                          onClose={onClose}
+                          hoverColor={styling.inputBgColor?.light ?? "#f8fafc"}
+                          borderRadius={styling.roundness ?? 8}
+                        />
+                      )}
+                    </div>
+                  </div>
+                ) : null}
               </div>
-            </div>
+            ) : null}
             <div
               ref={contentRef}
               className={cn(
@@ -911,7 +1542,29 @@ export function Survey({
     );
   };
 
-  return (
+  // Survey instructions, available on every page. They live on the welcome card, which the
+  // respondent leaves after one click and can never get back to — so the text that explains what the
+  // survey is for was gone for the rest of it (the second half of the 2.4.2 VPAT finding).
+  //
+  // Rendered once here rather than inside getCardContent, which runs per card and would emit a
+  // duplicate id for every peeking card in the stacked layout. Visually hidden: the card designs
+  // have no room for a persistent block, and a sighted respondent has already read it on the
+  // welcome card. SurveyContainer points the form's aria-describedby at this id, so a screen reader
+  // announces it on entry to each page.
+  const instructions = hasSurveyInstructions(localSurvey) ? (
+    <div id={SURVEY_INSTRUCTIONS_ID} className="sr-only">
+      <Subheader
+        subheader={replaceRecallInfo(
+          getLocalizedValue(localSurvey.welcomeCard.subheader, selectedLanguage),
+          responseData,
+          currentVariables,
+          selectedLanguage
+        )}
+      />
+    </div>
+  ) : null;
+
+  const stackedCardsContainer = (
     <StackedCardsContainer
       cardArrangement={cardArrangement}
       currentBlockId={blockId}
@@ -923,5 +1576,30 @@ export function Survey({
       fullSizeCards={fullSizeCards}
       placement={placement}
     />
+  );
+
+  if (isCardless) {
+    return (
+      <CardlessSurveyLayout
+        survey={localSurvey}
+        blockId={blockId}
+        styling={styling}
+        showProgressBar={showProgressBar}
+        isPreviewMode={isPreviewMode}
+        showCardlessPreviewLogoSlot={showCardlessPreviewLogoSlot}
+        linkSurveyCardMaxWidth={linkSurveyCardMaxWidth}>
+        <>
+          {instructions}
+          {stackedCardsContainer}
+        </>
+      </CardlessSurveyLayout>
+    );
+  }
+
+  return (
+    <>
+      {instructions}
+      {stackedCardsContainer}
+    </>
   );
 }

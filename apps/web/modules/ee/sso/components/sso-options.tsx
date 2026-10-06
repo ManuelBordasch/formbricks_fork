@@ -15,10 +15,8 @@ interface SSOOptionsProps {
   azureOAuthEnabled: boolean;
   oidcOAuthEnabled: boolean;
   oidcDisplayName?: string;
-  callbackUrl: string;
+  returnToUrl: string;
   samlSsoEnabled: boolean;
-  samlTenant: string;
-  samlProduct: string;
   source: "signin" | "signup";
 }
 
@@ -28,10 +26,8 @@ export const SSOOptions = ({
   azureOAuthEnabled,
   oidcOAuthEnabled,
   oidcDisplayName,
-  callbackUrl,
+  returnToUrl,
   samlSsoEnabled,
-  samlTenant,
-  samlProduct,
   source,
 }: SSOOptionsProps) => {
   const { t } = useTranslation();
@@ -46,30 +42,24 @@ export const SSOOptions = ({
   return (
     <div className="space-y-2">
       {googleOAuthEnabled && (
-        <GoogleButton inviteUrl={callbackUrl} lastUsed={lastLoggedInWith === "Google"} source={source} />
+        <GoogleButton returnToUrl={returnToUrl} lastUsed={lastLoggedInWith === "Google"} source={source} />
       )}
       {githubOAuthEnabled && (
-        <GithubButton inviteUrl={callbackUrl} lastUsed={lastLoggedInWith === "Github"} source={source} />
+        <GithubButton returnToUrl={returnToUrl} lastUsed={lastLoggedInWith === "Github"} source={source} />
       )}
       {azureOAuthEnabled && (
-        <AzureButton inviteUrl={callbackUrl} lastUsed={lastLoggedInWith === "Azure"} source={source} />
+        <AzureButton returnToUrl={returnToUrl} lastUsed={lastLoggedInWith === "Azure"} source={source} />
       )}
       {oidcOAuthEnabled && (
         <OpenIdButton
-          inviteUrl={callbackUrl}
+          returnToUrl={returnToUrl}
           lastUsed={lastLoggedInWith === "OpenID"}
           text={t("auth.continue_with_oidc", { oidcDisplayName })}
           source={source}
         />
       )}
       {samlSsoEnabled && (
-        <SamlButton
-          inviteUrl={callbackUrl}
-          lastUsed={lastLoggedInWith === "Saml"}
-          samlTenant={samlTenant}
-          samlProduct={samlProduct}
-          source={source}
-        />
+        <SamlButton returnToUrl={returnToUrl} lastUsed={lastLoggedInWith === "Saml"} source={source} />
       )}
     </div>
   );

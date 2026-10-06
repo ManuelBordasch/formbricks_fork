@@ -1,7 +1,8 @@
-import { Prisma } from "@prisma/client";
-import { describe, expect, test, vi } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
+import { reconcileTeamWorkspaceRelationships } from "@/lib/authzed/team-workspace";
 import { deleteTeam, getTeam, updateTeam } from "../teams";
 
 vi.mock("@formbricks/database", () => ({
@@ -14,15 +15,23 @@ vi.mock("@formbricks/database", () => ({
   },
 }));
 
+vi.mock("@/lib/authzed/team-workspace", () => ({
+  reconcileTeamWorkspaceRelationships: vi.fn(),
+}));
+
 // Define a mock team
 const mockTeam = {
   id: "team123",
   organizationId: "org456",
   name: "Test Team",
-  projectTeams: [{ projectId: "proj1" }, { projectId: "proj2" }],
+  workspaceTeams: [{ workspaceId: "proj1" }, { workspaceId: "proj2" }],
 };
 
 describe("Teams Lib", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   describe("getTeam", () => {
     test("returns the team when found", async () => {
       (prisma.team.findUnique as any).mockResolvedValueOnce(mockTeam);
@@ -64,9 +73,10 @@ describe("Teams Lib", () => {
       const result = await deleteTeam("org456", "team123");
       expect(prisma.team.delete).toHaveBeenCalledWith({
         where: { id: "team123", organizationId: "org456" },
-        include: { projectTeams: { select: { projectId: true } } },
+        include: { workspaceTeams: { select: { workspaceId: true } } },
       });
       expect(result.ok).toBe(true);
+      expect(reconcileTeamWorkspaceRelationships).toHaveBeenCalledWith({ teamIds: ["team123"] });
       if (result.ok) {
         expect(result.data).toEqual(mockTeam);
       }
@@ -75,7 +85,7 @@ describe("Teams Lib", () => {
     test("returns not_found error on known prisma error", async () => {
       (prisma.team.delete as any).mockRejectedValueOnce(
         new Prisma.PrismaClientKnownRequestError("Not found", {
-          code: PrismaErrorType.RecordDoesNotExist,
+          code: PrismaErrorType.RecordNotFound,
           clientVersion: "1.0.0",
           meta: {},
         })
@@ -110,9 +120,10 @@ describe("Teams Lib", () => {
       expect(prisma.team.update).toHaveBeenCalledWith({
         where: { id: "team123", organizationId: "org456" },
         data: updateInput,
-        include: { projectTeams: { select: { projectId: true } } },
+        include: { workspaceTeams: { select: { workspaceId: true } } },
       });
       expect(result.ok).toBe(true);
+      expect(reconcileTeamWorkspaceRelationships).toHaveBeenCalledWith({ teamIds: ["team123"] });
       if (result.ok) {
         expect(result.data).toEqual(updatedTeam);
       }
@@ -121,7 +132,7 @@ describe("Teams Lib", () => {
     test("returns not_found error when update fails due to missing team", async () => {
       (prisma.team.update as any).mockRejectedValueOnce(
         new Prisma.PrismaClientKnownRequestError("Not found", {
-          code: PrismaErrorType.RecordDoesNotExist,
+          code: PrismaErrorType.RecordNotFound,
           clientVersion: "1.0.0",
           meta: {},
         })

@@ -1,5 +1,10 @@
 import "server-only";
-import { AUDIT_LOG_ENABLED, IS_FORMBRICKS_CLOUD, IS_RECAPTCHA_CONFIGURED } from "@/lib/constants";
+import {
+  AUDIT_LOG_ENABLED,
+  CLOUD_HOBBY_WORKSPACE_LIMIT,
+  IS_FORMBRICKS_CLOUD,
+  IS_RECAPTCHA_CONFIGURED,
+} from "@/lib/constants";
 import { CLOUD_STRIPE_FEATURE_LOOKUP_KEYS } from "@/modules/billing/lib/stripe-catalog";
 import type { TEnterpriseLicenseFeatures } from "@/modules/ee/license-check/types/enterprise-license";
 import { hasOrganizationEntitlementWithLicenseGuard } from "@/modules/entitlements/lib/checks";
@@ -31,7 +36,13 @@ const getCustomPlanFeaturePermission = async (
   organizationId: string,
   featureKey: keyof Pick<
     TEnterpriseLicenseFeatures,
-    "accessControl" | "quotas" | "contacts" | "aiSmartTools" | "aiDataAnalysis"
+    | "accessControl"
+    | "quotas"
+    | "contacts"
+    | "aiSmartTools"
+    | "feedbackDirectories"
+    | "dashboards"
+    | "workflows"
   >
 ): Promise<boolean> => {
   if (IS_FORMBRICKS_CLOUD) {
@@ -40,7 +51,9 @@ const getCustomPlanFeaturePermission = async (
       quotas: CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.QUOTA_MANAGEMENT,
       contacts: CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.CONTACTS,
       aiSmartTools: CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.AI_SMART_TOOLS,
-      aiDataAnalysis: CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.AI_DATA_ANALYSIS,
+      feedbackDirectories: CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.FEEDBACK_DIRECTORIES,
+      dashboards: CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.DASHBOARDS,
+      workflows: CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.WORKFLOWS,
     };
     const lookupKey = featureLookupKeyMap[featureKey];
     if (lookupKey) {
@@ -82,12 +95,17 @@ export const getBiggerUploadFileSizePermission = async (organizationId: string):
   const entitlementsContext = await getOrganizationEntitlementsContext(organizationId);
 
   if (!IS_FORMBRICKS_CLOUD) {
-    return entitlementsContext.licenseStatus === "active";
+    // Any active enterprise license grants the bigger upload size — there is no license feature for
+    // it. `licenseActive` rather than the status string for the same reason as the workspace limit
+    // below: in grace the cached license is still active while the status already reads
+    // "unreachable" or "expired", and gating on the status would drop a licensed instance back to
+    // the standard 10 MB cap for the whole window.
+    return entitlementsContext.licenseActive;
   }
 
   const hasPaidCloudCapacity =
-    entitlementsContext.limits.projects === null ||
-    (typeof entitlementsContext.limits.projects === "number" && entitlementsContext.limits.projects > 1);
+    entitlementsContext.limits.workspaces === null ||
+    (typeof entitlementsContext.limits.workspaces === "number" && entitlementsContext.limits.workspaces > 1);
   const licenseAllowsUsage =
     entitlementsContext.licenseStatus === "active" || entitlementsContext.licenseStatus === "no-license";
 
@@ -116,10 +134,6 @@ export const getIsQuotasEnabled = async (organizationId: string): Promise<boolea
 
 export const getIsAISmartToolsEnabled = async (organizationId: string): Promise<boolean> => {
   return getCustomPlanFeaturePermission(organizationId, "aiSmartTools");
-};
-
-export const getIsAIDataAnalysisEnabled = async (organizationId: string): Promise<boolean> => {
-  return getCustomPlanFeaturePermission(organizationId, "aiDataAnalysis");
 };
 
 export const getIsAuditLogsEnabled = async (): Promise<boolean> => {
@@ -154,22 +168,50 @@ export const getAccessControlPermission = async (organizationId: string): Promis
   return getCustomPlanFeaturePermission(organizationId, "accessControl");
 };
 
-export const getOrganizationProjectsLimit = async (organizationId: string): Promise<number> => {
+export const getIsFeedbackDirectoriesEnabled = async (organizationId: string): Promise<boolean> => {
+  return getCustomPlanFeaturePermission(organizationId, "feedbackDirectories");
+};
+
+export const getIsDashboardsEnabled = async (organizationId: string): Promise<boolean> => {
+  return getCustomPlanFeaturePermission(organizationId, "dashboards");
+};
+
+export const getIsWorkflowsEnabled = async (organizationId: string): Promise<boolean> => {
+  return getCustomPlanFeaturePermission(organizationId, "workflows");
+};
+
+export const getBulkInvitePermission = async (organizationId: string): Promise<boolean> => {
+  // Bulk invite is gated only on Formbricks Cloud (anti-spam, multi-tenant concern). Self-hosted
+  // keeps the original unrestricted behavior for every tier, including community.
+  if (!IS_FORMBRICKS_CLOUD) {
+    return true;
+  }
+
+  return hasOrganizationEntitlementWithLicenseGuard(
+    organizationId,
+    CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.BULK_INVITE
+  );
+};
+
+export const getOrganizationWorkspacesLimit = async (organizationId: string): Promise<number> => {
   const entitlementsContext = await getOrganizationEntitlementsContext(organizationId);
 
   if (IS_FORMBRICKS_CLOUD) {
     const cloudLicenseAllowsLimits =
       entitlementsContext.licenseStatus === "active" || entitlementsContext.licenseStatus === "no-license";
-    if (!cloudLicenseAllowsLimits) return 3;
-    return entitlementsContext.limits.projects ?? Infinity;
+    if (!cloudLicenseAllowsLimits) return CLOUD_HOBBY_WORKSPACE_LIMIT;
+    return entitlementsContext.limits.workspaces ?? Infinity;
   }
 
-  if (
-    entitlementsContext.licenseStatus === "active" &&
-    entitlementsContext.licenseFeatures?.projects != null
-  ) {
-    return entitlementsContext.licenseFeatures.projects;
-  }
-
-  return 3;
+  // Self-hosted limits are already resolved by the entitlements provider, which reads the license's
+  // cached `active` flag rather than the narrower live status string. That distinction is the whole
+  // point: `getFallbackLevel` (license.ts) enters the grace period documented in
+  // `docs/self-hosting/advanced/license-activation.mdx` whenever the live check returns anything but
+  // "active" while the cached license is still active and under three days old. So the status can
+  // read "unreachable" (the check never completed) or "expired" (it completed and the key has
+  // lapsed) while the instance is still active on its cached license. Deriving the limit from the
+  // status here would drop that instance to the Community Edition cap for the whole grace window.
+  // `null` means unlimited, and an instance with no usable license is resolved to the community cap
+  // by the provider.
+  return entitlementsContext.limits.workspaces ?? Infinity;
 };

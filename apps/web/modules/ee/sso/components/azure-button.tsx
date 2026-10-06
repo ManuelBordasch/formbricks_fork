@@ -1,33 +1,46 @@
 "use client";
 
-import { signIn } from "next-auth/react";
 import { useCallback, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { FORMBRICKS_LOGGED_IN_WITH_LS } from "@/lib/localStorage";
-import { getCallbackUrl } from "@/modules/ee/sso/lib/utils";
+import { authClient } from "@/modules/auth/lib/auth-client";
+import { getSsoReturnToUrl } from "@/modules/ee/sso/lib/utils";
 import { Button } from "@/modules/ui/components/button";
 import { MicrosoftIcon } from "@/modules/ui/components/icons";
 
 interface AzureButtonProps {
-  inviteUrl?: string;
+  returnToUrl?: string;
   directRedirect?: boolean;
   lastUsed?: boolean;
+  variant?: "default" | "secondary";
   source: "signin" | "signup";
 }
 
-export const AzureButton = ({ inviteUrl, directRedirect = false, lastUsed, source }: AzureButtonProps) => {
+export const AzureButton = ({
+  returnToUrl,
+  directRedirect = false,
+  lastUsed,
+  variant = "secondary",
+  source,
+}: Readonly<AzureButtonProps>) => {
   const { t } = useTranslation();
   const handleLogin = useCallback(async () => {
     if (typeof window !== "undefined") {
       localStorage.setItem(FORMBRICKS_LOGGED_IN_WITH_LS, "Azure");
     }
-    const callbackUrlWithSource = getCallbackUrl(inviteUrl, source);
+    const returnToUrlWithSource = getSsoReturnToUrl(returnToUrl, source);
 
-    await signIn("azure-ad", {
-      redirect: true,
-      callbackUrl: callbackUrlWithSource,
+    // Better Auth 1.7 rebuilt genericOAuth onto the built-in social path (ENG-2343), so
+    // signIn.oauth2({ providerId }) became signIn.social({ provider }). The callback URL is
+    // NOT affected: better-auth-providers.ts pins `redirectURI` to /api/auth/oauth2/callback/azuread,
+    // the URL already registered at every customer IdP, and legacy-sso-callback.ts serves it.
+    await authClient.signIn.social({
+      provider: "azuread",
+      callbackURL: returnToUrlWithSource,
+      // OAuth failures redirect here so the login page's existing ?error= UX surfaces them (parity).
+      errorCallbackURL: "/auth/login",
     });
-  }, [inviteUrl, source]);
+  }, [returnToUrl, source]);
 
   useEffect(() => {
     if (directRedirect) {
@@ -39,11 +52,11 @@ export const AzureButton = ({ inviteUrl, directRedirect = false, lastUsed, sourc
     <Button
       type="button"
       onClick={handleLogin}
-      variant="secondary"
-      className="relative w-full justify-center">
-      {t("auth.continue_with_azure")}
+      variant={variant}
+      className="h-11 w-full min-w-0 justify-center sm:h-9">
+      <span className="truncate">{t("auth.continue_with_azure")}</span>
       <MicrosoftIcon />
-      {lastUsed && <span className="absolute right-3 text-xs opacity-50">{t("auth.last_used")}</span>}
+      {lastUsed && <span className="shrink-0 text-xs opacity-50">{t("auth.last_used")}</span>}
     </Button>
   );
 };

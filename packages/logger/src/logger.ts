@@ -1,8 +1,24 @@
-import Pino, { type Logger, type LoggerOptions, stdSerializers } from "pino";
-import { type TLogLevel, ZLogLevel } from "../types/logger";
+import Pino, { type Logger, type LoggerOptions, symbols as pinoSymbols, stdSerializers } from "pino";
+import { type TLogLevel, ZLogLevel } from "./types/logger";
 
 const IS_PRODUCTION = !process.env.NODE_ENV || process.env.NODE_ENV === "production";
 const IS_BUILD = process.env.NEXT_PHASE === "phase-production-build";
+const PROCESS_GLOBAL_KEY = "process";
+const PROCESS_HANDLERS_ATTACHED_KEY = Symbol.for("@formbricks/logger/process-handlers-attached");
+const NEXT_STANDALONE_APP_DIR_PATTERN = /[/\\]apps[/\\]web$/;
+const OTEL_TRANSPORT_PACKAGE_PATH =
+  "node_modules/pino-opentelemetry-transport/lib/pino-opentelemetry-transport.js";
+
+interface TransportStream {
+  on?: (event: "error", listener: (error: unknown) => void) => void;
+}
+
+const getNodeProcess = (): typeof process => globalThis[PROCESS_GLOBAL_KEY];
+
+const getOtelTransportTarget = (): string => {
+  const runtimeRoot = getNodeProcess().cwd().replace(NEXT_STANDALONE_APP_DIR_PATTERN, "");
+  return `${runtimeRoot}/${OTEL_TRANSPORT_PACKAGE_PATH}`;
+};
 
 const getLogLevel = (): TLogLevel => {
   let logLevel: TLogLevel = "info";
@@ -42,20 +58,24 @@ const baseLoggerConfig: LoggerOptions = {
  * Build transport configuration based on environment.
  * - Development: pino-pretty for readable console output
  * - Production: JSON to stdout (default Pino behavior)
- * - Both: optional pino-opentelemetry-transport for SigNoz log correlation when OTEL is configured
+ * - Both: optional pino-opentelemetry-transport for SigNoz logs when OTEL_LOGS_ENABLED=1
  */
 const buildTransport = (): LoggerOptions["transport"] => {
   const isEdgeRuntime = process.env.NEXT_RUNTIME === "edge";
 
-  const hasOtelEndpoint =
-    process.env.NEXT_RUNTIME === "nodejs" && Boolean(process.env.OTEL_EXPORTER_OTLP_ENDPOINT);
+  const hasOtelLogTransport =
+    process.env.NEXT_RUNTIME === "nodejs" &&
+    process.env.OTEL_LOGS_ENABLED === "1" &&
+    Boolean(process.env.OTEL_EXPORTER_OTLP_ENDPOINT);
 
   const serviceName = process.env.OTEL_SERVICE_NAME ?? "formbricks";
   const serviceVersion = process.env.npm_package_version ?? "0.0.0";
 
-  const otelTarget = {
-    target: "pino-opentelemetry-transport",
+  const buildOtelTarget = (): Pino.TransportTargetOptions => ({
+    target: getOtelTransportTarget(),
     options: {
+      loggerName: serviceName,
+      serviceVersion,
       resourceAttributes: {
         "service.name": serviceName,
         "service.version": serviceVersion,
@@ -63,7 +83,7 @@ const buildTransport = (): LoggerOptions["transport"] => {
       },
     },
     level: getLogLevel(),
-  };
+  });
 
   const prettyTarget = {
     target: "pino-pretty",
@@ -85,20 +105,20 @@ const buildTransport = (): LoggerOptions["transport"] => {
     }
 
     // Development: pretty print + optional OTEL
-    if (hasOtelEndpoint) {
-      return { targets: [prettyTarget, otelTarget] };
+    if (hasOtelLogTransport) {
+      return { targets: [prettyTarget, buildOtelTarget()] };
     }
     return { target: prettyTarget.target, options: prettyTarget.options };
   }
 
   // Production: stdout JSON + optional OTEL
-  if (hasOtelEndpoint) {
+  if (hasOtelLogTransport) {
     const fileTarget = {
       target: "pino/file",
       options: { destination: 1 }, // stdout
       level: getLogLevel(),
     };
-    return { targets: [fileTarget, otelTarget] };
+    return { targets: [fileTarget, buildOtelTarget()] };
   }
 
   return undefined; // Default JSON to stdout
@@ -122,6 +142,20 @@ const loggerConfig: LoggerOptions = {
 };
 
 const pinoLogger: Logger = Pino(loggerConfig);
+
+const reportTransportError = (error: unknown): void => {
+  const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
+  getNodeProcess().stderr.write(`[logger] Pino transport error: ${message}\n`);
+};
+
+const attachTransportErrorHandler = (logger: Logger): void => {
+  if (process.env.NEXT_RUNTIME !== "nodejs") return;
+
+  const stream = (logger as unknown as Record<symbol, TransportStream | undefined>)[pinoSymbols.streamSym];
+  stream?.on?.("error", reportTransportError);
+};
+
+attachTransportErrorHandler(pinoLogger);
 
 // Ensure all log levels are properly bound
 const boundLogger = {
@@ -157,20 +191,32 @@ const handleShutdown = (event: string, err?: Error): void => {
 
 // Create a separate function for attaching Node.js process handlers
 const attachNodeProcessHandlers = (): void => {
-  // Only attach handlers if we're in a Node.js environment with full process support
-  if (process.env.NEXT_RUNTIME === "nodejs") {
-    process.on("uncaughtException", (err) => {
-      handleShutdown("uncaughtException", err);
-    });
-    process.on("unhandledRejection", (err) => {
-      handleShutdown("unhandledRejection", err as Error);
-    });
-    process.on("SIGTERM", () => {
-      handleShutdown("SIGTERM");
-    });
-    process.on("SIGINT", () => {
-      handleShutdown("SIGINT");
-    });
+  if (process.env.NEXT_RUNTIME !== "nodejs") return;
+
+  // Next.js can evaluate bundled copies of this module in one process.
+  const nodeProcess = process as typeof process & { [key: symbol]: boolean | undefined };
+  if (nodeProcess[PROCESS_HANDLERS_ATTACHED_KEY]) return;
+
+  nodeProcess[PROCESS_HANDLERS_ATTACHED_KEY] = true;
+  const removeAttachedHandlers: Array<() => void> = [];
+  const handleUncaughtException = (err: Error): void => handleShutdown("uncaughtException", err);
+  const handleUnhandledRejection = (err: unknown): void => handleShutdown("unhandledRejection", err as Error);
+  const handleSigterm = (): void => handleShutdown("SIGTERM");
+  const handleSigint = (): void => handleShutdown("SIGINT");
+
+  try {
+    process.on("uncaughtException", handleUncaughtException);
+    removeAttachedHandlers.push(() => process.off("uncaughtException", handleUncaughtException));
+    process.on("unhandledRejection", handleUnhandledRejection);
+    removeAttachedHandlers.push(() => process.off("unhandledRejection", handleUnhandledRejection));
+    process.on("SIGTERM", handleSigterm);
+    removeAttachedHandlers.push(() => process.off("SIGTERM", handleSigterm));
+    process.on("SIGINT", handleSigint);
+    removeAttachedHandlers.push(() => process.off("SIGINT", handleSigint));
+  } catch (error) {
+    removeAttachedHandlers.reverse().forEach((removeHandler) => removeHandler());
+    Reflect.deleteProperty(nodeProcess, PROCESS_HANDLERS_ATTACHED_KEY);
+    throw error;
   }
 };
 

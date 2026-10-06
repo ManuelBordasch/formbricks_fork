@@ -20,7 +20,6 @@ interface EndScreenFormProps {
   endingCardIndex: number;
   isInvalid: boolean;
   selectedLanguageCode: string;
-  setSelectedLanguageCode: (languageCode: string) => void;
   updateSurvey: (
     input: Partial<TSurveyEndScreenCard & { _forceUpdate?: boolean }> | Partial<TSurveyRedirectUrlCard>
   ) => void;
@@ -35,7 +34,6 @@ export const EndScreenForm = ({
   endingCardIndex,
   isInvalid,
   selectedLanguageCode,
-  setSelectedLanguageCode,
   updateSurvey,
   endingCard,
   locale,
@@ -56,6 +54,10 @@ export const EndScreenForm = ({
       (!!getLocalizedValue(endingCard.buttonLabel, selectedLanguageCode) || !!endingCard.buttonLink)
   );
 
+  // The checkmark only renders when the card carries no media, so the toggle is meaningless once an
+  // image or video is set.
+  const hasMedia = Boolean(endingCard.imageUrl ?? endingCard.videoUrl);
+
   return (
     <form>
       <ElementFormInput
@@ -66,8 +68,6 @@ export const EndScreenForm = ({
         elementIdx={questions.length + endingCardIndex}
         isInvalid={isInvalid}
         updateSurvey={updateSurvey}
-        selectedLanguageCode={selectedLanguageCode}
-        setSelectedLanguageCode={setSelectedLanguageCode}
         locale={locale}
         isStorageConfigured={isStorageConfigured}
         autoFocus={!endingCard.headline?.default || endingCard.headline.default.trim() === ""}
@@ -85,8 +85,6 @@ export const EndScreenForm = ({
                 elementIdx={questions.length + endingCardIndex}
                 isInvalid={isInvalid}
                 updateSurvey={updateSurvey}
-                selectedLanguageCode={selectedLanguageCode}
-                setSelectedLanguageCode={setSelectedLanguageCode}
                 locale={locale}
                 isStorageConfigured={isStorageConfigured}
                 autoFocus={!endingCard.subheader?.default || endingCard.subheader.default.trim() === ""}
@@ -109,13 +107,34 @@ export const EndScreenForm = ({
                 _forceUpdate: true,
               });
             }}>
-            <PlusIcon className="mr-1 h-4 w-4" />
-            {t("environments.surveys.edit.add_description")}
+            <PlusIcon className="mr-1 size-4" />
+            {t("workspace.surveys.edit.add_description")}
           </Button>
         )}
       </div>
+      {!hasMedia && (
+        <div className="mt-4 flex items-center gap-x-1">
+          <Switch
+            id="showCheckmarkIcon"
+            checked={!endingCard.hideDefaultIcon}
+            onCheckedChange={(checked) => {
+              updateSurvey({ hideDefaultIcon: checked ? undefined : true });
+            }}
+          />
+          <Label htmlFor="showCheckmarkIcon" className="cursor-pointer">
+            <div className="ml-2">
+              <h3 className="text-sm font-semibold text-slate-700">
+                {t("workspace.surveys.edit.show_checkmark_icon")}
+              </h3>
+              <p className="text-xs font-normal text-slate-500">
+                {t("workspace.surveys.edit.show_checkmark_icon_description")}
+              </p>
+            </div>
+          </Label>
+        </div>
+      )}
       <div className="mt-4">
-        <div className="flex items-center space-x-1">
+        <div className="flex items-center gap-x-1">
           <Switch
             id="showButton"
             checked={showEndingCardCTA}
@@ -124,8 +143,9 @@ export const EndScreenForm = ({
                 updateSurvey({ buttonLabel: undefined, buttonLink: undefined });
               } else {
                 updateSurvey({
-                  buttonLabel: { default: t("environments.surveys.edit.create_your_own_survey") },
-                  buttonLink: "https://formbricks.com",
+                  buttonLabel: { default: t("workspace.surveys.edit.create_your_own_survey") },
+                  buttonLink:
+                    "https://formbricks.com?utm_source=formbricks-app&utm_medium=survey&utm_campaign=default_ending_cta",
                 });
               }
               setshowEndingCardCTA(!showEndingCardCTA);
@@ -134,10 +154,10 @@ export const EndScreenForm = ({
           <Label htmlFor="showButton" className="cursor-pointer">
             <div className="ml-2">
               <h3 className="text-sm font-semibold text-slate-700">
-                {t("environments.surveys.edit.show_button")}
+                {t("workspace.surveys.edit.show_button")}
               </h3>
               <p className="text-xs font-normal text-slate-500">
-                {t("environments.surveys.edit.send_your_respondents_to_a_page_of_your_choice")}
+                {t("workspace.surveys.edit.send_your_respondents_to_a_page_of_your_choice")}
               </p>
             </div>
           </Label>
@@ -147,22 +167,20 @@ export const EndScreenForm = ({
             <div className="space-y-2">
               <ElementFormInput
                 id="buttonLabel"
-                label={t("environments.surveys.edit.button_label")}
-                placeholder={t("environments.surveys.edit.create_your_own_survey")}
+                label={t("workspace.surveys.edit.button_label")}
+                placeholder={t("workspace.surveys.edit.create_your_own_survey")}
                 className="rounded-md"
                 value={endingCard.buttonLabel}
                 localSurvey={localSurvey}
                 elementIdx={questions.length + endingCardIndex}
                 isInvalid={isInvalid}
                 updateSurvey={updateSurvey}
-                selectedLanguageCode={selectedLanguageCode}
-                setSelectedLanguageCode={setSelectedLanguageCode}
                 locale={locale}
                 isStorageConfigured={isStorageConfigured}
               />
             </div>
             <div className="space-y-2">
-              <Label>{t("environments.surveys.edit.button_url")}</Label>
+              <Label>{t("workspace.surveys.edit.button_url")}</Label>
               <div className="rounded-md bg-white">
                 <RecallWrapper
                   value={endingCard.buttonLink ?? ""}
@@ -187,7 +205,7 @@ export const EndScreenForm = ({
                       <div className="group relative">
                         {/* The highlight container is absolutely positioned behind the input */}
                         <div
-                          className={`no-scrollbar absolute top-0 z-0 mt-0.5 flex h-10 w-full overflow-scroll whitespace-nowrap px-3 py-2 text-center text-sm text-transparent`}
+                          className={`absolute top-0 z-0 mt-0.5 flex h-10 w-full no-scrollbar overflow-scroll px-3 py-2 text-center text-sm whitespace-nowrap text-transparent`}
                           dir="auto"
                           key={highlightedJSX.toString()}>
                           {highlightedJSX}
@@ -219,7 +237,7 @@ export const EndScreenForm = ({
               </div>
               {!isExternalUrlsAllowed && (
                 <p className="text-xs text-slate-500">
-                  {t("environments.surveys.edit.external_urls_paywall_tooltip")}
+                  {t("workspace.surveys.edit.external_urls_paywall_tooltip")}
                 </p>
               )}
             </div>

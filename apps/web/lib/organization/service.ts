@@ -1,7 +1,7 @@
 import "server-only";
-import { Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { logger } from "@formbricks/logger";
 import { ZId, ZOptionalNumber, ZString } from "@formbricks/types/common";
@@ -14,11 +14,18 @@ import {
   ZOrganizationCreateInput,
 } from "@formbricks/types/organizations";
 import { TUserNotificationSettings } from "@formbricks/types/user";
+import { lookupAuthorizedOrganizationIds } from "@/lib/authorization/resource-list";
+import { reconcileApiKeyRelationships } from "@/lib/authzed/api-key";
+import { reconcileFeedbackDirectoryRelationships } from "@/lib/authzed/feedback-directory";
+import { deleteOrganizationRelationships } from "@/lib/authzed/organization-membership";
+import { runPostCommitProjection } from "@/lib/authzed/projection-boundary";
+import { reconcileTeamWorkspaceRelationships } from "@/lib/authzed/team-workspace";
 import { IS_FORMBRICKS_CLOUD, ITEMS_PER_PAGE } from "@/lib/constants";
-import { getProjects } from "@/lib/project/service";
 import { updateUser } from "@/lib/user/service";
 import { getBillingUsageCycleWindow } from "@/lib/utils/billing";
+import { getWorkspaces } from "@/lib/workspace/service";
 import { cleanupStripeCustomer } from "@/modules/ee/billing/lib/organization-billing";
+import { deleteHubTenantData } from "@/modules/hub/service";
 import { validateInputs } from "../utils/validate";
 
 export const select = {
@@ -35,17 +42,19 @@ export const select = {
     },
   },
   isAISmartToolsEnabled: true,
-  isAIDataAnalysisEnabled: true,
   whitelabel: true,
+  displayTimeZone: true,
 } satisfies Prisma.OrganizationSelect;
 
 type TOrganizationWithBilling = Prisma.OrganizationGetPayload<{ select: typeof select }>;
 
 const getDefaultOrganizationBilling = (): TOrganizationBilling => ({
   limits: {
-    projects: IS_FORMBRICKS_CLOUD ? 1 : 3,
+    workspaces: IS_FORMBRICKS_CLOUD ? 1 : 3,
     monthly: {
       responses: IS_FORMBRICKS_CLOUD ? 250 : 1500,
+      // No included workflow runs by default (ENG-1936); the Scale entitlement grants the volume.
+      workflowRuns: null,
     },
   },
   stripeCustomerId: null,
@@ -63,7 +72,7 @@ const mapOrganizationBilling = (billing: TOrganizationWithBilling["billing"]): T
     stripeCustomerId: billing.stripeCustomerId,
     limits: billing.limits,
     usageCycleAnchor: billing.usageCycleAnchor,
-    ...(billing.stripe === undefined ? {} : { stripe: billing.stripe }),
+    ...(billing.stripe == null ? {} : { stripe: billing.stripe }),
   };
 };
 
@@ -74,27 +83,24 @@ const mapOrganization = (organization: TOrganizationWithBilling): TOrganization 
   name: organization.name,
   billing: mapOrganizationBilling(organization.billing),
   isAISmartToolsEnabled: organization.isAISmartToolsEnabled,
-  isAIDataAnalysisEnabled: organization.isAIDataAnalysisEnabled,
   whitelabel: organization.whitelabel as TOrganization["whitelabel"],
+  displayTimeZone: organization.displayTimeZone,
 });
 
 export const getOrganizationsTag = (organizationId: string) => `organizations-${organizationId}`;
 export const getOrganizationsByUserIdCacheTag = (userId: string) => `users-${userId}-organizations`;
-export const getOrganizationByEnvironmentIdCacheTag = (environmentId: string) =>
-  `environments-${environmentId}-organization`;
 
 export const getOrganizationsByUserId = reactCache(
   async (userId: string, page?: number): Promise<TOrganization[]> => {
     validateInputs([userId, ZString], [page, ZOptionalNumber]);
 
     try {
+      const organizationIds = await lookupAuthorizedOrganizationIds({ type: "user", id: userId });
+      if (organizationIds.length === 0) return [];
+
       const organizations = await prisma.organization.findMany({
         where: {
-          memberships: {
-            some: {
-              userId,
-            },
-          },
+          id: { in: [...organizationIds] },
         },
         select,
         take: page ? ITEMS_PER_PAGE : undefined,
@@ -114,30 +120,26 @@ export const getOrganizationsByUserId = reactCache(
   }
 );
 
-export const getOrganizationByEnvironmentId = reactCache(
-  async (environmentId: string): Promise<TOrganization | null> => {
-    validateInputs([environmentId, ZId]);
+export const getOrganizationByWorkspaceId = reactCache(
+  async (workspaceId: string): Promise<TOrganization | null> => {
+    validateInputs([workspaceId, ZId]);
 
     try {
       const organization = await prisma.organization.findFirst({
         where: {
-          projects: {
+          workspaces: {
             some: {
-              environments: {
-                some: {
-                  id: environmentId,
-                },
-              },
+              id: workspaceId,
             },
           },
         },
-        select: { ...select, memberships: true }, // include memberships
+        select: { ...select, memberships: true },
       });
 
       return organization ? mapOrganization(organization) : null;
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError) {
-        logger.error(error, "Error getting organization by environment id");
+        logger.error(error, "Error getting organization by workspace id");
         throw new DatabaseError(error.message);
       }
 
@@ -249,7 +251,7 @@ export const updateOrganization = async (
         where: {
           id: organizationId,
         },
-        select: { ...select, memberships: true, projects: { select: { environments: true } } }, // include memberships & environments
+        select: { ...select, memberships: true, workspaces: { select: { id: true } } }, // include memberships & workspaces
       });
     });
 
@@ -260,14 +262,14 @@ export const updateOrganization = async (
     const organization = {
       ...mapOrganization(updatedOrganization),
       memberships: undefined,
-      projects: undefined,
+      workspaces: undefined,
     };
 
     return organization;
   } catch (error) {
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
-      error.code === PrismaErrorType.RecordDoesNotExist
+      error.code === PrismaErrorType.RecordNotFound
     ) {
       throw new ResourceNotFoundError("Organization", organizationId);
     }
@@ -295,22 +297,66 @@ export const deleteOrganization = async (organizationId: string) => {
             userId: true,
           },
         },
-        projects: {
+        workspaces: {
           select: {
             id: true,
-            environments: {
-              select: {
-                id: true,
-              },
-            },
+          },
+        },
+        teams: {
+          select: {
+            id: true,
+          },
+        },
+        apiKeys: {
+          select: {
+            id: true,
+          },
+        },
+        feedbackDirectories: {
+          select: {
+            id: true,
+            workspaces: { select: { workspaceId: true } },
           },
         },
       },
     });
 
+    await runPostCommitProjection("organization_delete_relationship_cleanup", () =>
+      deleteOrganizationRelationships(organizationId)
+    );
+    await runPostCommitProjection("organization_delete_team_workspace_cleanup", () =>
+      reconcileTeamWorkspaceRelationships({
+        teamIds: deletedOrganization.teams.map(({ id }) => id),
+        workspaceIds: deletedOrganization.workspaces.map(({ id }) => id),
+      })
+    );
+    await runPostCommitProjection("organization_delete_api_key_cleanup", () =>
+      reconcileApiKeyRelationships({
+        apiKeyIds: deletedOrganization.apiKeys.map(({ id }) => id),
+      })
+    );
+    await runPostCommitProjection("organization_delete_feedback_directory_cleanup", () =>
+      reconcileFeedbackDirectoryRelationships({
+        assignments: deletedOrganization.feedbackDirectories.flatMap((directory) =>
+          directory.workspaces.map(({ workspaceId }) => ({
+            feedbackDirectoryId: directory.id,
+            workspaceId,
+          }))
+        ),
+        feedbackDirectoryIds: deletedOrganization.feedbackDirectories.map(({ id }) => id),
+      })
+    );
+
     const stripeCustomerId = deletedOrganization.billing?.stripeCustomerId;
     if (IS_FORMBRICKS_CLOUD && stripeCustomerId) {
       await cleanupStripeCustomer(stripeCustomerId);
+    }
+
+    // Best-effort: purge Hub-owned data (feedback records, embeddings, webhooks) for each
+    // directory tenant. Failures are logged inside the gateway and do not roll back the
+    // local delete.
+    for (const directory of deletedOrganization.feedbackDirectories) {
+      await deleteHubTenantData(directory.id);
     }
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
@@ -333,18 +379,18 @@ export const getMonthlyOrganizationResponseCount = reactCache(
 
       const usageCycleWindow = getBillingUsageCycleWindow(organization.billing);
 
-      // Get all environment IDs for the organization
-      const projects = await getProjects(organizationId);
-      const environmentIds = projects.flatMap((project) => project.environments.map((env) => env.id));
+      // Get all workspace IDs for the organization
+      const workspaces = await getWorkspaces(organizationId);
+      const workspaceIds = workspaces.map((workspace) => workspace.id);
 
-      // Use Prisma's aggregate to count responses for all environments
+      // Use Prisma's aggregate to count responses for all workspaces
       const responseAggregations = await prisma.response.aggregate({
         _count: {
           id: true,
         },
         where: {
           AND: [
-            { survey: { environmentId: { in: environmentIds } } },
+            { survey: { workspaceId: { in: workspaceIds } } },
             { createdAt: { gte: usageCycleWindow.start, lt: usageCycleWindow.end } },
           ],
         },
@@ -362,40 +408,80 @@ export const getMonthlyOrganizationResponseCount = reactCache(
   }
 );
 
+export const getMonthlyOrganizationWorkflowRunCount = reactCache(
+  async (organizationId: string): Promise<number> => {
+    validateInputs([organizationId, ZId]);
+
+    try {
+      const organization = await getOrganization(organizationId);
+      if (!organization) {
+        throw new ResourceNotFoundError("Organization", organizationId);
+      }
+
+      const usageCycleWindow = getBillingUsageCycleWindow(organization.billing);
+
+      const workspaces = await getWorkspaces(organizationId);
+      const workspaceIds = workspaces.map((workspace) => workspace.id);
+
+      // Mirror the metered usage: count only non-dry runs in the current billing cycle, scoped to the
+      // organization's workspaces. Dry runs are excluded from billing, so they must not show as usage.
+      const workflowRunAggregations = await prisma.workflowRun.aggregate({
+        _count: {
+          id: true,
+        },
+        where: {
+          AND: [
+            { workspaceId: { in: workspaceIds } },
+            { isDryRun: false },
+            { createdAt: { gte: usageCycleWindow.start, lt: usageCycleWindow.end } },
+          ],
+        },
+      });
+
+      return workflowRunAggregations._count.id;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError) {
+        throw new DatabaseError(error.message);
+      }
+
+      throw error;
+    }
+  }
+);
+
 export const subscribeOrganizationMembersToSurveyResponses = async (
   surveyId: string,
   createdBy: string,
   organizationId: string
 ): Promise<void> => {
-  try {
-    const surveyCreator = await prisma.user.findUnique({
-      where: {
-        id: createdBy,
-      },
-    });
+  const surveyCreator = await prisma.user.findUnique({
+    where: {
+      id: createdBy,
+    },
+  });
 
-    if (!surveyCreator) {
-      throw new ResourceNotFoundError("User", createdBy);
-    }
-
-    if (surveyCreator.notificationSettings?.unsubscribedOrganizationIds?.includes(organizationId)) {
-      return;
-    }
-
-    const defaultSettings = { alert: {} };
-    const updatedNotificationSettings: TUserNotificationSettings = {
-      ...defaultSettings,
-      ...surveyCreator.notificationSettings,
-    };
-
-    updatedNotificationSettings.alert[surveyId] = true;
-
-    await updateUser(surveyCreator.id, {
-      notificationSettings: updatedNotificationSettings,
-    });
-  } catch (error) {
-    throw error;
+  if (!surveyCreator) {
+    throw new ResourceNotFoundError("User", createdBy);
   }
+
+  if (surveyCreator.notificationSettings?.unsubscribedOrganizationIds?.includes(organizationId)) {
+    return;
+  }
+
+  const defaultSettings = { alert: {} as NonNullable<TUserNotificationSettings["alert"]> };
+  const updatedNotificationSettings: TUserNotificationSettings = {
+    ...defaultSettings,
+    ...surveyCreator.notificationSettings,
+    alert: surveyCreator.notificationSettings?.alert
+      ? { ...surveyCreator.notificationSettings.alert }
+      : defaultSettings.alert,
+  };
+
+  updatedNotificationSettings.alert[surveyId] = true;
+
+  await updateUser(surveyCreator.id, {
+    notificationSettings: updatedNotificationSettings,
+  });
 };
 
 export const getOrganizationsWhereUserIsSingleOwner = reactCache(

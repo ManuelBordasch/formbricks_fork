@@ -1,12 +1,37 @@
 import preact from "@preact/preset-vite";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadEnv } from "vite";
-import dts from "vite-plugin-dts";
+import { visualizer } from "rollup-plugin-visualizer";
+import { type Plugin, loadEnv } from "vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 import { defineConfig } from "vitest/config";
 import { copyCompiledAssetsPlugin } from "../vite-plugins/copy-compiled-assets";
-import { visualizer } from "rollup-plugin-visualizer";
+
+// Stubs the @formbricks/survey-ui/styles?inline import during vitest runs so that
+// tests do not require packages/survey-ui to be built first. The plugin only
+// activates when VITEST is set, leaving production builds untouched.
+const stubSurveyUiStylesForVitest = (): Plugin => {
+  const stubId = "\0virtual:survey-ui-styles-stub";
+  return {
+    name: "formbricks:stub-survey-ui-styles-in-tests",
+    enforce: "pre",
+    apply() {
+      return process.env.VITEST === "true";
+    },
+    resolveId(source) {
+      if (source === "@formbricks/survey-ui/styles?inline") {
+        return stubId;
+      }
+      return null;
+    },
+    load(id) {
+      if (id === stubId) {
+        return 'export default "";';
+      }
+      return null;
+    },
+  };
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -39,7 +64,6 @@ const config = ({ mode }) => {
       ...sharedConfig,
       build: {
         emptyOutDir: false,
-        minify: "terser",
         lib: {
           entry: resolve(__dirname, "src/index.ts"),
           name: "formbricksSurveys",
@@ -62,16 +86,33 @@ const config = ({ mode }) => {
   return defineConfig({
     ...sharedConfig,
     test: {
-      name: "surveys",
-      environment: "node",
-      environmentMatchGlobs: [
-        ["**/*.test.tsx", "jsdom"],
-        ["**/lib/**/*.test.ts", "jsdom"],
-      ],
       setupFiles: ["./vitestSetup.ts"],
-      include: ["**/*.test.ts", "**/*.test.tsx"],
       exclude: ["dist/**", "node_modules/**"],
       env: env,
+      // Environment selection (ENG-1680): Vitest 4 removed `environmentMatchGlobs`, so environments
+      // are assigned via projects. *.test.tsx (component tests) run in happy-dom automatically;
+      // *.test.ts default to node — the few DOM-dependent .ts tests keep their per-file
+      // `@vitest-environment happy-dom` pragma.
+      projects: [
+        {
+          extends: true,
+          test: {
+            name: "surveys-unit",
+            environment: "node",
+            include: ["**/*.test.ts"],
+            exclude: ["dist/**", "node_modules/**"],
+          },
+        },
+        {
+          extends: true,
+          test: {
+            name: "surveys-components",
+            environment: "happy-dom",
+            include: ["**/*.test.tsx"],
+            exclude: ["dist/**", "node_modules/**"],
+          },
+        },
+      ],
       coverage: {
         provider: "v8",
         reporter: ["text", "html", "lcov"],
@@ -82,7 +123,6 @@ const config = ({ mode }) => {
     },
     build: {
       emptyOutDir: false,
-      minify: "terser",
       lib: {
         entry: {
           index: resolve(__dirname, "src/index.ts"),
@@ -103,13 +143,15 @@ const config = ({ mode }) => {
     },
     plugins: [
       ...sharedConfig.plugins,
-      dts({
-        rollupTypes: false,
-        // Generate separate .d.ts files for each entry point
-        entryRoot: "src",
-      }),
+      stubSurveyUiStylesForVitest(),
       copyCompiledAssetsPlugin({ filename: "surveys", distDir: resolve(__dirname, "dist") }),
-      process.env.ANALYZE === "true" && visualizer({ filename: resolve(__dirname, "stats.html"), open: false, gzipSize: true, brotliSize: true }),
+      process.env.ANALYZE === "true" &&
+        visualizer({
+          filename: resolve(__dirname, "stats.html"),
+          open: false,
+          gzipSize: true,
+          brotliSize: true,
+        }),
     ],
   });
 };

@@ -6,7 +6,10 @@ import { SubmitHandler, useForm } from "react-hook-form";
 import { toast } from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
-import { INVALID_PASSWORD_RESET_TOKEN_ERROR_CODE } from "@formbricks/types/errors";
+import {
+  INVALID_PASSWORD_RESET_TOKEN_ERROR_CODE,
+  PASSWORD_COMPROMISED_ERROR_CODE,
+} from "@formbricks/types/errors";
 import { ZUserPassword } from "@formbricks/types/user";
 import { getFormattedErrorMessage } from "@/lib/utils/helper";
 import { resetPasswordAction } from "@/modules/auth/forgot-password/reset/actions";
@@ -26,8 +29,7 @@ const passwordInputProps = {
   autoComplete: "new-password",
   placeholder: "*******",
   required: true,
-  className:
-    "focus:border-brand-dark focus:ring-brand-dark mt-2 block w-full rounded-md border-slate-300 shadow-sm sm:text-sm",
+  className: "focus:border-brand-dark focus:ring-brand-dark mt-2 block w-full rounded-md shadow-xs",
 };
 
 export const ResetPasswordForm = () => {
@@ -58,6 +60,10 @@ export const ResetPasswordForm = () => {
       router.push("/auth/forgot-password/reset/success");
     } else {
       const errorMessage = getFormattedErrorMessage(resetPasswordResponse);
+      if (errorMessage === PASSWORD_COMPROMISED_ERROR_CODE) {
+        toast.error(t("auth.password_compromised"));
+        return;
+      }
       toast.error(
         errorMessage === INVALID_PASSWORD_RESET_TOKEN_ERROR_CODE
           ? t("c.link_expired_description")
@@ -97,7 +103,7 @@ export const ResetPasswordForm = () => {
         <Button
           type="submit"
           disabled={!form.formState.isValid}
-          className="w-full justify-center"
+          className="h-11 w-full justify-center sm:h-9"
           loading={form.formState.isSubmitting}>
           {t("auth.forgot-password.reset_password")}
         </Button>

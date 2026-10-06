@@ -1,73 +1,84 @@
 "use client";
 
-import { Project } from "@prisma/client";
 import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
-import { ZProjectConfigChannel, ZProjectConfigIndustry } from "@formbricks/types/project";
-import { TSurveyCreateInput, TSurveyType } from "@formbricks/types/surveys/types";
-import { TTemplate, TTemplateFilter, ZTemplateRole } from "@formbricks/types/templates";
-import { templates } from "@/app/lib/templates";
-import { getFormattedErrorMessage } from "@/lib/utils/helper";
-import { createSurveyAction } from "./actions";
+import type { Workspace } from "@formbricks/database/prisma-browser";
+import type { TSurveyType } from "@formbricks/types/surveys/types";
+import { type TTemplate, type TTemplateFilter, ZTemplateRole } from "@formbricks/types/templates";
+import type { TUserLocale } from "@formbricks/types/user";
+import { ZWorkspaceConfigChannel, ZWorkspaceConfigIndustry } from "@formbricks/types/workspace";
+import { CUSTOM_SURVEY_TEMPLATE_ID, templates } from "@/app/lib/templates";
+import type { TAIUnavailableReason } from "@/lib/ai/service";
+import { IS_DEVELOPMENT_BUILD } from "@/lib/env-client";
+import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import { CreateWithAITemplate } from "./components/create-with-ai-template";
 import { StartFromScratchTemplate } from "./components/start-from-scratch-template";
 import { Template } from "./components/template";
 import { TemplateFilters } from "./components/template-filters";
+import { useCreateSurveyFromTemplate } from "./hooks/use-create-survey-from-template";
 
 interface TemplateListProps {
-  userId: string;
-  environmentId: string;
-  project: Project;
+  workspaceId: string;
+  workspace: Workspace;
+  /** The language the created survey is authored in — see `resolveDefaultSurveyLanguage`. */
+  defaultLanguage: string;
   templateSearch?: string;
   showFilters?: boolean;
   onTemplateClick?: (template: TTemplate) => void;
   noPreview?: boolean; // single click to create survey
+  showAICreateCard?: boolean;
+  /** The creator's dashboard locale. AI generation is capped to the languages the dashboard has. */
+  language: TUserLocale;
+  isAIAvailable?: boolean;
+  aiUnavailableReason?: TAIUnavailableReason;
 }
 
 export const TemplateList = ({
-  userId,
-  project,
-  environmentId,
+  workspace,
+  workspaceId,
+  defaultLanguage,
   showFilters = true,
   templateSearch,
   onTemplateClick = () => {},
   noPreview,
-}: TemplateListProps) => {
+  showAICreateCard = false,
+  language,
+  isAIAvailable = false,
+  aiUnavailableReason,
+}: Readonly<TemplateListProps>) => {
+  const workspaceBasePath = `/workspaces/${workspace.id}`;
   const { t } = useTranslation();
   const router = useRouter();
   const [activeTemplate, setActiveTemplate] = useState<TTemplate | null>(null);
-  const [loading, setLoading] = useState(false);
   const [selectedFilter, setSelectedFilter] = useState<TTemplateFilter[]>([null, null, null]);
+  const createSurveyMutation = useCreateSurveyFromTemplate();
   const surveyType: TSurveyType = useMemo(() => {
-    if (project.config.channel) {
-      if (project.config.channel === "website") {
+    if (workspace.config.channel) {
+      if (workspace.config.channel === "website") {
         return "app";
       }
 
-      return project.config.channel;
+      return workspace.config.channel;
     }
 
     return "link";
-  }, [project.config.channel]);
+  }, [workspace.config.channel]);
 
   const createSurvey = async (activeTemplate: TTemplate) => {
-    setLoading(true);
-    const augmentedTemplate: TSurveyCreateInput = {
-      ...activeTemplate.preset,
-      type: surveyType,
-      createdBy: userId,
-    };
-    const createSurveyResponse = await createSurveyAction({
-      environmentId: environmentId,
-      surveyBody: augmentedTemplate,
-    });
+    try {
+      const survey = await createSurveyMutation.mutateAsync({
+        workspaceId,
+        templateId: activeTemplate.id,
+        source: activeTemplate.id === CUSTOM_SURVEY_TEMPLATE_ID ? "custom" : "catalog",
+        surveyType,
+        defaultLanguage,
+      });
 
-    if (createSurveyResponse?.data) {
-      router.push(`/environments/${environmentId}/surveys/${createSurveyResponse.data.id}/edit`);
-    } else {
-      const errorMessage = getFormattedErrorMessage(createSurveyResponse);
-      toast.error(errorMessage);
+      router.push(`${workspaceBasePath}/surveys/${survey.id}/edit`);
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
     }
   };
 
@@ -78,8 +89,8 @@ export const TemplateList = ({
       }
 
       // Parse and validate the filters
-      const channelParseResult = ZProjectConfigChannel.nullable().safeParse(selectedFilter[0]);
-      const industryParseResult = ZProjectConfigIndustry.nullable().safeParse(selectedFilter[1]);
+      const channelParseResult = ZWorkspaceConfigChannel.nullable().safeParse(selectedFilter[0]);
+      const industryParseResult = ZWorkspaceConfigIndustry.nullable().safeParse(selectedFilter[1]);
       const roleParseResult = ZTemplateRole.nullable().safeParse(selectedFilter[2]);
 
       // Ensure all validations are successful
@@ -103,7 +114,7 @@ export const TemplateList = ({
   };
 
   return (
-    <main className="relative z-0 flex-1 overflow-y-auto px-6 pb-6 pt-2 focus:outline-none">
+    <main className="relative z-0 flex-1 overflow-y-auto px-6 pt-2 pb-6 focus:outline-hidden">
       {showFilters && !templateSearch && (
         <TemplateFilters
           selectedFilter={selectedFilter}
@@ -116,23 +127,31 @@ export const TemplateList = ({
           activeTemplate={activeTemplate}
           setActiveTemplate={setActiveTemplate}
           onTemplateClick={onTemplateClick}
-          project={project}
+          workspace={workspace}
           createSurvey={createSurvey}
-          loading={loading}
+          loading={createSurveyMutation.isPending}
           noPreview={noPreview}
         />
-        {(process.env.NODE_ENV === "development" ? [...filteredTemplates()] : filteredTemplates()).map(
+        {showAICreateCard && (
+          <CreateWithAITemplate
+            workspaceId={workspaceId}
+            language={language}
+            isAIAvailable={isAIAvailable}
+            aiUnavailableReason={aiUnavailableReason}
+          />
+        )}
+        {(IS_DEVELOPMENT_BUILD ? [...filteredTemplates()] : filteredTemplates()).map(
           (template: TTemplate) => {
             return (
               <Template
-                key={template.name}
+                key={template.id}
                 template={template}
                 activeTemplate={activeTemplate}
                 setActiveTemplate={setActiveTemplate}
                 onTemplateClick={onTemplateClick}
-                project={project}
+                workspace={workspace}
                 createSurvey={createSurvey}
-                loading={loading}
+                loading={createSurveyMutation.isPending}
                 selectedFilter={selectedFilter}
                 noPreview={noPreview}
               />

@@ -24,8 +24,11 @@ export const isEntitlementFeature = (feature: string): feature is TEntitlementFe
 };
 
 export type TEntitlementLimits = {
-  projects: number | null;
+  workspaces: number | null;
   monthlyResponses: number | null;
+  // Included monthly workflow runs (ENG-1936). null = not metered / unlimited (e.g. self-hosted,
+  // where workflows are gated by the boolean license feature rather than metered).
+  monthlyWorkflowRuns: number | null;
 };
 
 export type TOrganizationEntitlementsContext = {
@@ -33,6 +36,11 @@ export type TOrganizationEntitlementsContext = {
   source: TEntitlementSource;
   features: TEntitlementFeature[];
   limits: TEntitlementLimits;
+  // The cached license's `active` flag, which stays true for the whole grace window while
+  // `licenseStatus` already reports "unreachable" or "expired" (see getFallbackLevel in
+  // license.ts). Gate self-hosted entitlements on this, never on `licenseStatus` — the status
+  // string drops a licensed instance to Community Edition for the whole window.
+  licenseActive: boolean;
   licenseStatus: TLicenseStatus;
   licenseFeatures: TEnterpriseLicenseFeatures | null;
   stripeCustomerId: string | null;

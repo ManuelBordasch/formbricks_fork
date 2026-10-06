@@ -1,15 +1,17 @@
 "use client";
 
-import { useAutoAnimate } from "@formkit/auto-animate/react";
 import { createId } from "@paralleldrive/cuid2";
-import { Project } from "@prisma/client";
 import * as Collapsible from "@radix-ui/react-collapsible";
 import { PlusIcon } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Workspace } from "@formbricks/database/prisma-browser";
 import { cn } from "@/lib/cn";
 import {
+  type TElement,
+  type TElementCategoryMeta,
   getCXElementTypes,
+  getElementCategories,
   getElementDefaults,
   getElementTypes,
   universalElementPresets,
@@ -17,16 +19,70 @@ import {
 
 interface AddElementButtonProps {
   addElement: (element: any) => void;
-  project: Project;
+  workspace: Workspace;
   isCxMode: boolean;
 }
 
-export const AddElementButton = ({ addElement, project, isCxMode }: AddElementButtonProps) => {
+export const AddElementButton = ({ addElement, workspace, isCxMode }: AddElementButtonProps) => {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
-  const [hoveredElementId, setHoveredElementId] = useState<string | null>(null);
   const availableElementTypes = isCxMode ? getCXElementTypes(t) : getElementTypes(t);
-  const [parent] = useAutoAnimate();
+  const categories = getElementCategories(t);
+
+  const handleAddElement = (elementType: TElement) => {
+    addElement({
+      ...universalElementPresets,
+      ...getElementDefaults(elementType.id, workspace, t),
+      id: createId(),
+      type: elementType.id,
+    });
+    setOpen(false);
+  };
+
+  // Group the available element types by category while keeping their defined order.
+  const elementsByCategory = new Map<string, TElement[]>();
+  for (const elementType of availableElementTypes) {
+    const group = elementsByCategory.get(elementType.category) ?? [];
+    group.push(elementType);
+    elementsByCategory.set(elementType.category, group);
+  }
+
+  // Only render categories that actually contain elements (CX mode uses a subset).
+  const visibleCategories = categories.filter(
+    (category) => (elementsByCategory.get(category.id)?.length ?? 0) > 0
+  );
+
+  const renderCategory = (category: TElementCategoryMeta) => {
+    const elements = elementsByCategory.get(category.id) ?? [];
+    return (
+      <div key={category.id} className="mb-1">
+        <p
+          className={cn(
+            "px-2 pt-3 pb-1 text-xs font-semibold tracking-wide uppercase",
+            category.labelClassName
+          )}>
+          {category.label}
+        </p>
+        {elements.map((elementType) => (
+          <button
+            type="button"
+            key={elementType.id}
+            title={elementType.description}
+            className="group flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-sm font-medium text-slate-700 hover:bg-slate-100 hover:text-slate-900"
+            onClick={() => handleAddElement(elementType)}>
+            <span
+              className={cn(
+                "flex size-7 shrink-0 items-center justify-center rounded-md",
+                category.iconClassName
+              )}>
+              <elementType.icon className="size-4" aria-hidden="true" />
+            </span>
+            <span>{elementType.label}</span>
+          </button>
+        ))}
+      </div>
+    );
+  };
 
   return (
     <Collapsible.Root
@@ -34,50 +90,35 @@ export const AddElementButton = ({ addElement, project, isCxMode }: AddElementBu
       onOpenChange={setOpen}
       className={cn(
         open ? "shadow-lg" : "shadow-md",
-        "group w-full space-y-2 rounded-lg border border-slate-300 bg-white duration-200 hover:cursor-pointer hover:bg-slate-50"
+        "group w-full overflow-hidden rounded-lg border border-slate-300 bg-white duration-200 hover:cursor-pointer hover:bg-slate-50"
       )}>
-      <Collapsible.CollapsibleTrigger asChild className="group h-full w-full">
-        <div className="inline-flex">
-          <div className="flex w-10 items-center justify-center rounded-l-lg bg-brand-dark group-aria-expanded:rounded-bl-none group-aria-expanded:rounded-br">
-            <PlusIcon className="h-5 w-5 text-white" />
+      {/* Not `asChild` with a `div`: Radix forwards the click handler and aria state to the child but
+          adds no role and no tabIndex, so the control was unreachable by keyboard — a user could not
+          open the element picker at all. Letting Radix render its own `<button>` fixes that and
+          gives tests a real button role; the data-testid keeps them off the rendered copy, which
+          also appears in the live preview. */}
+      <Collapsible.CollapsibleTrigger
+        className="group h-full w-full text-left"
+        data-testid="add-element-trigger">
+        <div className="flex">
+          <div className="flex w-10 items-center justify-center rounded-l-[7px] bg-brand-dark group-aria-expanded:rounded-br group-aria-expanded:rounded-bl-none">
+            <PlusIcon className="size-5 text-white" />
           </div>
           <div className="px-4 py-3">
-            <p className="text-sm font-semibold">{t("environments.surveys.edit.add_block")}</p>
+            <p className="text-sm font-semibold">{t("workspace.surveys.edit.add_block")}</p>
             <p className="mt-1 text-xs text-slate-500">
-              {t("environments.surveys.edit.choose_the_first_question_on_your_block")}
+              {t("workspace.surveys.edit.choose_the_first_question_on_your_block")}
             </p>
           </div>
         </div>
       </Collapsible.CollapsibleTrigger>
-      <Collapsible.CollapsibleContent className="justify-left flex flex-col" ref={parent}>
-        {availableElementTypes.map((elementType) => (
-          <button
-            type="button"
-            key={elementType.id}
-            className="group relative mx-2 inline-flex items-center justify-between rounded p-0.5 px-4 py-2 text-sm font-medium text-slate-700 last:mb-2 hover:bg-slate-100 hover:text-slate-800"
-            onClick={() => {
-              addElement({
-                ...universalElementPresets,
-                ...getElementDefaults(elementType.id, project, t),
-                id: createId(),
-                type: elementType.id,
-              });
-              setOpen(false);
-            }}
-            onMouseEnter={() => setHoveredElementId(elementType.id)}
-            onMouseLeave={() => setHoveredElementId(null)}>
-            <div className="flex items-center">
-              <elementType.icon className="-ml-0.5 mr-2 h-4 w-4 text-brand-dark" aria-hidden="true" />
-              {elementType.label}
-            </div>
-            <div
-              className={`absolute right-4 text-xs font-light text-slate-500 transition-opacity duration-200 ${
-                hoveredElementId === elementType.id ? "opacity-100" : "opacity-0"
-              }`}>
-              {elementType.description}
-            </div>
-          </button>
-        ))}
+      <Collapsible.CollapsibleContent
+        data-testid="add-element-picker"
+        className="overflow-hidden data-[state=closed]:animate-collapsible-up data-[state=open]:animate-collapsible-down">
+        <div className="grid grid-cols-1 gap-x-6 px-3 pb-3 sm:grid-cols-2">
+          <div>{visibleCategories.filter((category) => category.column === 1).map(renderCategory)}</div>
+          <div>{visibleCategories.filter((category) => category.column === 2).map(renderCategory)}</div>
+        </div>
       </Collapsible.CollapsibleContent>
     </Collapsible.Root>
   );

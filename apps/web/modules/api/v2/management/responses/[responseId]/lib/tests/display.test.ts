@@ -1,7 +1,7 @@
 import { displayId, mockDisplay } from "./__mocks__/display.mock";
-import { Prisma } from "@prisma/client";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { deleteDisplay } from "../display";
 
@@ -40,7 +40,7 @@ describe("Display Lib", () => {
   test("return a not_found error when the display is not found", async () => {
     vi.mocked(prisma.display.delete).mockRejectedValue(
       new Prisma.PrismaClientKnownRequestError("Display not found", {
-        code: PrismaErrorType.RelatedRecordDoesNotExist,
+        code: PrismaErrorType.RecordNotFound,
         clientVersion: "1.0.0",
         meta: {
           cause: "Display not found",

@@ -1,6 +1,7 @@
 import { createTransport } from "nodemailer";
 import type SMTPTransport from "nodemailer/lib/smtp-transport";
 import {
+  renderAccountDeletionEmail,
   renderEmailCustomizationPreviewEmail,
   renderEmbedSurveyPreviewEmail,
   renderForgotPasswordEmail,
@@ -10,6 +11,7 @@ import {
   renderNewEmailVerification,
   renderPasswordResetNotifyEmail,
   renderResponseFinishedEmail,
+  renderSsoRecoveryFactorsRemovedEmail,
   renderVerificationEmail,
 } from "@formbricks/email";
 import { TEmailTemplateLegalProps } from "@formbricks/email/src/types/email";
@@ -24,6 +26,7 @@ import {
   DEBUG,
   IMPRINT_ADDRESS,
   IMPRINT_URL,
+  IS_SMTP_CONFIGURED,
   MAIL_FROM,
   MAIL_FROM_NAME,
   PRIVACY_URL,
@@ -38,13 +41,21 @@ import {
   WEBAPP_URL,
 } from "@/lib/constants";
 import { getPublicDomain } from "@/lib/getPublicUrl";
-import { createEmailChangeToken, createInviteToken, createToken, createTokenForLinkSurvey } from "@/lib/jwt";
-import { getOrganizationByEnvironmentId } from "@/lib/organization/service";
-import { getElementResponseMapping } from "@/lib/responses";
+import {
+  createEmailChangeToken,
+  createEmailToken,
+  createInviteToken,
+  createToken,
+  createTokenForLinkSurvey,
+} from "@/lib/jwt";
+import { getOrganizationByWorkspaceId } from "@/lib/organization/service";
+import { TElementResponseMappingSurvey, getElementResponseMapping } from "@/lib/responses";
 import { getTranslate } from "@/lingodotdev/server";
+import { TVerificationRequestPurpose, buildVerificationLinks } from "@/modules/auth/lib/verification-links";
+import { buildVerifiedLinkSurveyUrl } from "@/modules/email/lib/verified-link-survey-url";
 import { resolveStorageUrl } from "@/modules/storage/utils";
 
-export const IS_SMTP_CONFIGURED = Boolean(SMTP_HOST && SMTP_PORT);
+export { IS_SMTP_CONFIGURED };
 
 const legalProps: TEmailTemplateLegalProps = {
   privacyUrl: PRIVACY_URL || undefined,
@@ -55,11 +66,19 @@ const legalProps: TEmailTemplateLegalProps = {
 
 interface SendEmailDataProps {
   to: string;
+  from?: string;
   replyTo?: string;
   subject: string;
   text?: string;
   html: string;
+  /** Optional RFC 5322 Message-ID; nodemailer emits it as the `Message-ID` header. */
+  messageId?: string;
 }
+
+export type TResponseFinishedEmailSurvey = TElementResponseMappingSurvey &
+  // `variables` / `hiddenFields` are the resolver's fallback; `embeddedFields` carries the joined
+  // EmbeddedData rows the template resolves definitions through (ENG-1837).
+  Pick<TSurvey, "id" | "name" | "variables" | "hiddenFields" | "embeddedFields">;
 
 export const sendEmail = async (emailData: SendEmailDataProps): Promise<boolean> => {
   if (!IS_SMTP_CONFIGURED) {
@@ -90,7 +109,11 @@ export const sendEmail = async (emailData: SendEmailDataProps): Promise<boolean>
     const emailDefaults = {
       from: `${MAIL_FROM_NAME ?? "Formbricks"} <${MAIL_FROM ?? "noreply@formbricks.com"}>`,
     };
-    await transporter.sendMail({ ...emailDefaults, ...emailData });
+    await transporter.sendMail({
+      ...emailDefaults,
+      ...emailData,
+      from: emailData.from ?? emailDefaults.from,
+    });
 
     return true;
   } catch (error) {
@@ -106,7 +129,7 @@ export const sendVerificationNewEmail = async (
 ): Promise<boolean> => {
   try {
     const t = await getTranslate(locale);
-    const token = createEmailChangeToken(id, email);
+    const token = await createEmailChangeToken(id, email);
     const verifyLink = `${WEBAPP_URL}/verify-email-change?token=${encodeURIComponent(token)}`;
 
     const html = await renderNewEmailVerification({ verifyLink, t, ...legalProps });
@@ -126,18 +149,28 @@ export const sendVerificationEmail = async ({
   id,
   email,
   locale,
+  callbackUrl,
+  purpose = "email_verification",
 }: {
   id: string;
   email: TUserEmail;
   locale: TUserLocale;
+  callbackUrl?: string;
+  purpose?: TVerificationRequestPurpose;
 }): Promise<boolean> => {
   try {
     const t = await getTranslate(locale);
     const token = createToken(id, {
       expiresIn: "1d",
+      purpose,
     });
-    const verifyLink = `${WEBAPP_URL}/auth/verify?token=${encodeURIComponent(token)}`;
-    const verificationRequestLink = `${WEBAPP_URL}/auth/verification-requested?token=${encodeURIComponent(token)}`;
+    const { verifyLink, verificationRequestLink } = buildVerificationLinks({
+      token,
+      webAppUrl: WEBAPP_URL,
+      callbackUrl,
+      purpose,
+      verificationRequestToken: createEmailToken(email),
+    });
 
     const html = await renderVerificationEmail({
       verificationRequestLink,
@@ -177,6 +210,48 @@ export const sendPasswordResetLinkEmail = async (user: {
   });
 };
 
+export const sendDeleteAccountConfirmationEmail = async (data: {
+  email: TUserEmail;
+  locale: TUserLocale;
+  deleteLink: string;
+  linkValidityInMinutes: number;
+}): Promise<boolean> => {
+  const t = await getTranslate(data.locale);
+  const html = await renderAccountDeletionEmail({
+    deleteLink: data.deleteLink,
+    linkValidityInMinutes: data.linkValidityInMinutes,
+    t,
+    ...legalProps,
+  });
+  return await sendEmail({
+    to: data.email,
+    subject: t("emails.delete_account_email_subject"),
+    html,
+  });
+};
+
+export const sendVerificationLinkEmail = async (data: {
+  email: TUserEmail;
+  locale: TUserLocale;
+  verifyLink: string;
+}): Promise<boolean> => {
+  const t = await getTranslate(data.locale);
+  const html = await renderVerificationEmail({
+    // Better Auth supplies a single verification link; the resend CTA reuses it. Wiring
+    // verificationRequestLink to a dedicated Better Auth resend endpoint is a post-cutover
+    // refinement tracked in the ENG-1054 runbook, not a blocker for this flow.
+    verificationRequestLink: data.verifyLink,
+    verifyLink: data.verifyLink,
+    t,
+    ...legalProps,
+  });
+  return await sendEmail({
+    to: data.email,
+    subject: t("emails.verification_email_subject"),
+    html,
+  });
+};
+
 export const sendPasswordResetNotifyEmail = async (user: {
   email: string;
   locale: TUserLocale;
@@ -186,6 +261,43 @@ export const sendPasswordResetNotifyEmail = async (user: {
   return await sendEmail({
     to: user.email,
     subject: t("emails.password_reset_notify_email_subject"),
+    html,
+  });
+};
+
+/**
+ * Tell a user that SSO recovery removed the local sign-in factors from their account (ENG-2633).
+ *
+ * Recovery strips the password and any second factor from an account whose address was never proven,
+ * because marking it verified would otherwise leave an attacker who registered on someone else's
+ * address holding a live credential. No signal separates that attacker from an owner who simply never
+ * clicked a verification link, so the strip is unconditional and this mail is what keeps the
+ * legitimate case from being a silent downgrade: it names what went and links to re-enrolment.
+ */
+export const sendSsoRecoveryFactorsRemovedEmail = async ({
+  email,
+  locale,
+  passwordRemoved,
+  twoFactorRemoved,
+}: {
+  email: string;
+  locale: TUserLocale;
+  passwordRemoved: boolean;
+  twoFactorRemoved: boolean;
+}): Promise<boolean> => {
+  const t = await getTranslate(locale);
+  const html = await renderSsoRecoveryFactorsRemovedEmail({
+    passwordRemoved,
+    twoFactorRemoved,
+    // The account profile page is where both factors this mail can name are re-enrolled — the password
+    // form and the 2FA card both live there. There is no separate /settings/security route.
+    securitySettingsLink: `${WEBAPP_URL}/account/settings/profile`,
+    t,
+    ...legalProps,
+  });
+  return await sendEmail({
+    to: email,
+    subject: t("emails.sso_recovery_factors_removed_email_subject"),
     html,
   });
 };
@@ -229,14 +341,14 @@ export const sendInviteAcceptedEmail = async (
 export const sendResponseFinishedEmail = async (
   email: string,
   locale: TUserLocale,
-  environmentId: string,
-  survey: TSurvey,
+  workspaceId: string,
+  survey: TResponseFinishedEmailSurvey,
   response: TResponse,
   responseCount: number
 ): Promise<void> => {
   const t = await getTranslate(locale);
   const personEmail = response.contactAttributes?.email;
-  const organization = await getOrganizationByEnvironmentId(environmentId);
+  const organization = await getOrganizationByWorkspaceId(workspaceId);
 
   if (!organization) {
     throw new ResourceNotFoundError("Organization", null);
@@ -261,28 +373,33 @@ export const sendResponseFinishedEmail = async (
     return element;
   });
 
+  // The whitelabel logo is stored as a relative `/storage/...` path, which an email client cannot
+  // resolve — it has no origin to resolve against, so the `<img>` renders broken. Resolve it to an
+  // absolute URL here, exactly like every other email sender does.
+  const logoUrl = organization.whitelabel?.logoUrl
+    ? resolveStorageUrl(organization.whitelabel.logoUrl)
+    : undefined;
+
   const html = await renderResponseFinishedEmail({
     survey,
     responseCount,
     response,
     WEBAPP_URL,
-    environmentId,
+    workspaceId,
     organization,
     elements: elementsWithResolvedUrls,
+    logoUrl,
     t,
     ...legalProps,
   });
 
   await sendEmail({
     to: email,
-    subject: personEmail
-      ? t("emails.response_finished_email_subject_with_email", {
-          personEmail,
-          surveyName: survey.name,
-        })
-      : t("emails.response_finished_email_subject", {
-          surveyName: survey.name,
-        }),
+    // Never put the respondent's email address in the subject — it's PII that ends up in
+    // notification previews and mailbox lists; replying still reaches them via replyTo.
+    subject: t("emails.response_finished_email_subject", {
+      surveyName: survey.name,
+    }),
     replyTo: personEmail?.toString() ?? MAIL_FROM,
     html,
   });
@@ -291,7 +408,7 @@ export const sendResponseFinishedEmail = async (
 export const sendEmbedSurveyPreviewEmail = async (
   to: string,
   innerHtml: string,
-  environmentId: string,
+  workspaceId: string,
   locale: TUserLocale,
   logoUrl?: string
 ): Promise<boolean> => {
@@ -300,7 +417,7 @@ export const sendEmbedSurveyPreviewEmail = async (
   const resolvedLogoUrl = logoUrl ? resolveStorageUrl(logoUrl) : undefined;
   const html = await renderEmbedSurveyPreviewEmail({
     html: innerHtml,
-    environmentId,
+    workspaceId,
     logoUrl: resolvedLogoUrl,
     t,
     ...legalProps,
@@ -340,17 +457,19 @@ export const sendLinkSurveyToVerifiedEmail = async (data: TLinkSurveyEmailData):
   const email = data.email;
   const surveyName = data.surveyName;
   const singleUseId = data.suId;
+  const singleUseToken = data.suToken;
   // Resolve relative storage URLs to absolute URLs for email rendering
   const logoUrl = data.logoUrl ? resolveStorageUrl(data.logoUrl) : "";
   const token = createTokenForLinkSurvey(surveyId, email);
   const t = await getTranslate(data.locale);
-  const getSurveyLink = (): string => {
-    if (singleUseId) {
-      return `${getPublicDomain()}/s/${surveyId}?verify=${encodeURIComponent(token)}&suId=${singleUseId}`;
-    }
-    return `${getPublicDomain()}/s/${surveyId}?verify=${encodeURIComponent(token)}`;
-  };
-  const surveyLink = getSurveyLink();
+  const surveyLink = buildVerifiedLinkSurveyUrl({
+    publicDomain: getPublicDomain(),
+    surveyId,
+    token,
+    singleUseId,
+    singleUseToken,
+    surveyLanguageCode: data.surveyLanguageCode,
+  });
 
   const html = await renderLinkSurveyEmail({ surveyName, surveyLink, logoUrl, t, ...legalProps });
   return await sendEmail({

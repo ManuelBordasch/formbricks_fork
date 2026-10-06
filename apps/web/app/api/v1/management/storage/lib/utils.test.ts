@@ -1,9 +1,7 @@
-import { Session } from "next-auth";
 import { describe, expect, test, vi } from "vitest";
-import { TAuthenticationApiKey } from "@formbricks/types/auth";
+import type { Session, TAuthenticationApiKey } from "@formbricks/types/auth";
 import { responses } from "@/app/lib/api/response";
-import { hasUserEnvironmentAccess } from "@/lib/environment/auth";
-import { hasPermission } from "@/modules/organization/settings/api-keys/lib/utils";
+import { can } from "@/lib/authorization";
 import { checkAuth } from "./utils";
 
 // Create mock response objects
@@ -11,13 +9,7 @@ const mockBadRequestResponse = new Response("Bad Request", { status: 400 });
 const mockNotAuthenticatedResponse = new Response("Not authenticated", { status: 401 });
 const mockUnauthorizedResponse = new Response("Unauthorized", { status: 401 });
 
-vi.mock("@/lib/environment/auth", () => ({
-  hasUserEnvironmentAccess: vi.fn(),
-}));
-
-vi.mock("@/modules/organization/settings/api-keys/lib/utils", () => ({
-  hasPermission: vi.fn(),
-}));
+vi.mock("@/lib/authorization", () => ({ can: vi.fn() }));
 
 vi.mock("@/app/lib/api/response", () => ({
   responses: {
@@ -28,17 +20,17 @@ vi.mock("@/app/lib/api/response", () => ({
 }));
 
 describe("checkAuth", () => {
-  const environmentId = "env-123";
+  const workspaceId = "workspace-123";
 
   test("returns notAuthenticatedResponse when authentication is null", async () => {
-    const result = await checkAuth(null, environmentId);
+    const result = await checkAuth(null, workspaceId);
 
     expect(responses.notAuthenticatedResponse).toHaveBeenCalled();
     expect(result).toBe(mockNotAuthenticatedResponse);
   });
 
   test("returns notAuthenticatedResponse when authentication is undefined", async () => {
-    const result = await checkAuth(undefined as any, environmentId);
+    const result = await checkAuth(undefined as any, workspaceId);
 
     expect(responses.notAuthenticatedResponse).toHaveBeenCalled();
     expect(result).toBe(mockNotAuthenticatedResponse);
@@ -47,13 +39,11 @@ describe("checkAuth", () => {
   test("returns unauthorizedResponse when API key authentication lacks POST permission", async () => {
     const mockAuthentication: TAuthenticationApiKey = {
       type: "apiKey",
-      environmentPermissions: [
+      workspacePermissions: [
         {
-          environmentId: "env-123",
           permission: "read",
-          environmentType: "development",
-          projectId: "project-1",
-          projectName: "Project 1",
+          workspaceId: "workspace-123",
+          workspaceName: "Workspace 1",
         },
       ],
       apiKeyId: "hashed-key",
@@ -63,15 +53,14 @@ describe("checkAuth", () => {
       },
     };
 
-    vi.mocked(hasPermission).mockReturnValue(false);
+    vi.mocked(can).mockResolvedValue(false);
 
-    const result = await checkAuth(mockAuthentication, environmentId);
+    const result = await checkAuth(mockAuthentication, workspaceId);
 
-    expect(hasPermission).toHaveBeenCalledWith(
-      mockAuthentication.environmentPermissions,
-      environmentId,
-      "POST"
-    );
+    expect(can).toHaveBeenCalledWith({ type: "apiKey", id: "hashed-key" }, "workspace.write", {
+      type: "workspace",
+      id: workspaceId,
+    });
     expect(responses.unauthorizedResponse).toHaveBeenCalled();
     expect(result).toBe(mockUnauthorizedResponse);
   });
@@ -79,13 +68,11 @@ describe("checkAuth", () => {
   test("returns undefined when API key authentication has POST permission", async () => {
     const mockAuthentication: TAuthenticationApiKey = {
       type: "apiKey",
-      environmentPermissions: [
+      workspacePermissions: [
         {
-          environmentId: "env-123",
           permission: "write",
-          environmentType: "development",
-          projectId: "project-1",
-          projectName: "Project 1",
+          workspaceId: "workspace-123",
+          workspaceName: "Workspace 1",
         },
       ],
       apiKeyId: "hashed-key",
@@ -95,19 +82,18 @@ describe("checkAuth", () => {
       },
     };
 
-    vi.mocked(hasPermission).mockReturnValue(true);
+    vi.mocked(can).mockResolvedValue(true);
 
-    const result = await checkAuth(mockAuthentication, environmentId);
+    const result = await checkAuth(mockAuthentication, workspaceId);
 
-    expect(hasPermission).toHaveBeenCalledWith(
-      mockAuthentication.environmentPermissions,
-      environmentId,
-      "POST"
-    );
+    expect(can).toHaveBeenCalledWith({ type: "apiKey", id: "hashed-key" }, "workspace.write", {
+      type: "workspace",
+      id: workspaceId,
+    });
     expect(result).toBeUndefined();
   });
 
-  test("returns unauthorizedResponse when session exists but user lacks environment access", async () => {
+  test("returns unauthorizedResponse when session exists but user lacks workspace access", async () => {
     const mockSession: Session = {
       user: {
         id: "user-123",
@@ -115,16 +101,19 @@ describe("checkAuth", () => {
       expires: "2024-12-31T23:59:59.999Z",
     };
 
-    vi.mocked(hasUserEnvironmentAccess).mockResolvedValue(false);
+    vi.mocked(can).mockResolvedValue(false);
 
-    const result = await checkAuth(mockSession, environmentId);
+    const result = await checkAuth(mockSession, workspaceId);
 
-    expect(hasUserEnvironmentAccess).toHaveBeenCalledWith("user-123", environmentId);
+    expect(can).toHaveBeenCalledWith({ type: "user", id: "user-123" }, "workspace.write", {
+      type: "workspace",
+      id: workspaceId,
+    });
     expect(responses.unauthorizedResponse).toHaveBeenCalled();
     expect(result).toBe(mockUnauthorizedResponse);
   });
 
-  test("returns undefined when session exists and user has environment access", async () => {
+  test("returns undefined when session exists and user has workspace access", async () => {
     const mockSession: Session = {
       user: {
         id: "user-123",
@@ -132,18 +121,21 @@ describe("checkAuth", () => {
       expires: "2024-12-31T23:59:59.999Z",
     };
 
-    vi.mocked(hasUserEnvironmentAccess).mockResolvedValue(true);
+    vi.mocked(can).mockResolvedValue(true);
 
-    const result = await checkAuth(mockSession, environmentId);
+    const result = await checkAuth(mockSession, workspaceId);
 
-    expect(hasUserEnvironmentAccess).toHaveBeenCalledWith("user-123", environmentId);
+    expect(can).toHaveBeenCalledWith({ type: "user", id: "user-123" }, "workspace.write", {
+      type: "workspace",
+      id: workspaceId,
+    });
     expect(result).toBeUndefined();
   });
 
   test("returns notAuthenticatedResponse when authentication object is neither session nor API key", async () => {
     const invalidAuth = { someProperty: "value" } as any;
 
-    const result = await checkAuth(invalidAuth, environmentId);
+    const result = await checkAuth(invalidAuth, workspaceId);
 
     expect(responses.notAuthenticatedResponse).toHaveBeenCalled();
     expect(result).toBe(mockNotAuthenticatedResponse);

@@ -1,6 +1,6 @@
-import { Prisma } from "@prisma/client";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { ResourceNotFoundError } from "@formbricks/types/errors";
 import { TUser } from "@formbricks/types/user";
@@ -66,7 +66,7 @@ describe("updateUser", () => {
 
   test("throws ResourceNotFoundError when user does not exist", async () => {
     const prismaError = new Prisma.PrismaClientKnownRequestError("Record not found", {
-      code: PrismaErrorType.RecordDoesNotExist,
+      code: PrismaErrorType.RecordNotFound,
       clientVersion: "1.0.0",
     });
 

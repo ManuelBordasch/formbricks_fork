@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ResourceNotFoundError } from "@formbricks/types/errors";
+import { verifySsoRelinkIntent } from "@/lib/jwt";
+import { auth } from "@/modules/auth/lib/auth";
 import { getUserByEmail } from "@/modules/auth/lib/user";
 // Import mocked functions
 import { applyIPRateLimit } from "@/modules/core/rate-limit/helpers";
@@ -29,6 +31,47 @@ vi.mock("@/modules/email", () => ({
   sendVerificationEmail: vi.fn(),
 }));
 
+// Email verification resends now go through Better Auth's native endpoint (ENG-1054).
+vi.mock("@/modules/auth/lib/auth", () => ({
+  auth: { api: { sendVerificationEmail: vi.fn() } },
+}));
+
+const cookieMocks = vi.hoisted(() => ({
+  get: vi.fn(),
+  set: vi.fn(),
+}));
+
+vi.mock("next/headers", () => ({
+  headers: vi.fn(() => Promise.resolve(new Headers())),
+  cookies: vi.fn(() => Promise.resolve(cookieMocks)),
+}));
+
+// The intent-cookie refresh (ENG-2562): classify/mint are unit-tested in signup-intent.test.ts; here
+// only the action's decision — refresh iff the browser already proves this user — is under test.
+const signupIntentMocks = vi.hoisted(() => ({
+  classifySignupIntent: vi.fn(),
+  createSignupIntentToken: vi.fn(),
+}));
+
+vi.mock("@/modules/auth/lib/signup-intent", () => ({
+  SIGNUP_INTENT_COOKIE_NAME: "formbricks.signup_intent",
+  SIGNUP_INTENT_COOKIE_OPTIONS: { httpOnly: true, secure: false, path: "/", sameSite: "lax", maxAge: 3600 },
+  classifySignupIntent: signupIntentMocks.classifySignupIntent,
+  createSignupIntentToken: signupIntentMocks.createSignupIntentToken,
+}));
+
+vi.mock("@/lib/jwt", () => ({
+  verifySsoRelinkIntent: vi.fn(),
+}));
+
+vi.mock("@/lib/constants", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/constants")>();
+  return {
+    ...actual,
+    WEBAPP_URL: "http://localhost:3000",
+  };
+});
+
 vi.mock("@/modules/ee/audit-logs/lib/handler", () => ({
   withAuditLogging: vi.fn((_type: string, _object: string, fn: Function) => fn),
 }));
@@ -54,7 +97,7 @@ describe("resendVerificationEmailAction", () => {
   const mockVerifiedUser = {
     id: "user123",
     email: "test@example.com",
-    emailVerified: new Date(),
+    emailVerified: true, // boolean post-cutover (ENG-1054); keep fixtures off the legacy Date contract
     name: "Test User",
   };
 
@@ -67,6 +110,12 @@ describe("resendVerificationEmailAction", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    vi.mocked(verifySsoRelinkIntent).mockImplementation(() => {
+      throw new Error("invalid");
+    });
+    cookieMocks.get.mockReturnValue(undefined);
+    signupIntentMocks.classifySignupIntent.mockReturnValue("absent");
+    signupIntentMocks.createSignupIntentToken.mockReturnValue("fresh-intent-token");
   });
 
   afterEach(() => {
@@ -133,7 +182,7 @@ describe("resendVerificationEmailAction", () => {
 
   describe("Verification Email Resend Flow", () => {
     test("should send verification email when user exists and email is not verified", async () => {
-      vi.mocked(applyIPRateLimit).mockResolvedValue();
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
       vi.mocked(getUserByEmail).mockResolvedValue(mockUser as any);
 
       const result = await resendVerificationEmailAction({
@@ -143,12 +192,52 @@ describe("resendVerificationEmailAction", () => {
 
       expect(applyIPRateLimit).toHaveBeenCalled();
       expect(getUserByEmail).toHaveBeenCalledWith(validInput.email);
-      expect(sendVerificationEmail).toHaveBeenCalledWith(mockUser);
+      expect(auth.api.sendVerificationEmail).toHaveBeenCalledWith({
+        body: { email: mockUser.email, callbackURL: undefined },
+        headers: expect.any(Headers),
+      });
+      expect(sendVerificationEmail).not.toHaveBeenCalled();
       expect(result).toEqual({ success: true });
     });
 
+    test("should preserve a valid callback URL when resending the verification email", async () => {
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
+      vi.mocked(getUserByEmail).mockResolvedValue(mockUser as any);
+
+      await resendVerificationEmailAction({
+        ctx: mockCtx,
+        parsedInput: {
+          ...validInput,
+          callbackUrl: "http://localhost:3000/invite?token=invite-token",
+        },
+      } as any);
+
+      expect(auth.api.sendVerificationEmail).toHaveBeenCalledWith({
+        body: { email: mockUser.email, callbackURL: "http://localhost:3000/invite?token=invite-token" },
+        headers: expect.any(Headers),
+      });
+    });
+
+    test("should discard invalid callback URLs when resending the verification email", async () => {
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
+      vi.mocked(getUserByEmail).mockResolvedValue(mockUser as any);
+
+      await resendVerificationEmailAction({
+        ctx: mockCtx,
+        parsedInput: {
+          ...validInput,
+          callbackUrl: "https://evil.example/phish",
+        },
+      } as any);
+
+      expect(auth.api.sendVerificationEmail).toHaveBeenCalledWith({
+        body: { email: mockUser.email, callbackURL: undefined },
+        headers: expect.any(Headers),
+      });
+    });
+
     test("should return success without sending email when user email is already verified", async () => {
-      vi.mocked(applyIPRateLimit).mockResolvedValue();
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
       vi.mocked(getUserByEmail).mockResolvedValue(mockVerifiedUser as any);
 
       const result = await resendVerificationEmailAction({
@@ -162,8 +251,146 @@ describe("resendVerificationEmailAction", () => {
       expect(result).toEqual({ success: true });
     });
 
+    test("should resend an SSO recovery email for a verified user", async () => {
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
+      const verifiedUserWithLocale: NonNullable<Awaited<ReturnType<typeof getUserByEmail>>> = {
+        ...mockVerifiedUser,
+        emailVerified: true,
+        locale: "en-US",
+        identityProvider: "email",
+        isActive: true,
+      };
+      vi.mocked(getUserByEmail).mockResolvedValue(verifiedUserWithLocale);
+      vi.mocked(verifySsoRelinkIntent).mockReturnValue({
+        callbackUrl: "http://localhost:3000",
+        email: mockVerifiedUser.email,
+        provider: "google",
+        providerAccountId: "provider_123",
+        userId: mockVerifiedUser.id,
+      });
+
+      const result = await resendVerificationEmailAction({
+        ctx: mockCtx,
+        parsedInput: {
+          ...validInput,
+          callbackUrl: "http://localhost:3000/api/auth/sso/recovery/complete?intent=test-intent",
+        },
+      } as any);
+
+      expect(sendVerificationEmail).toHaveBeenCalledWith({
+        id: mockVerifiedUser.id,
+        email: mockVerifiedUser.email,
+        locale: "en-US",
+        callbackUrl: "http://localhost:3000/api/auth/sso/recovery/complete?intent=test-intent",
+        purpose: "sso_recovery",
+      });
+      expect(result).toEqual({ success: true });
+    });
+
+    test("should not treat a client-supplied recovery callback as recovery without a valid intent", async () => {
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
+      const verifiedUserWithLocale: NonNullable<Awaited<ReturnType<typeof getUserByEmail>>> = {
+        ...mockVerifiedUser,
+        emailVerified: true,
+        locale: "en-US",
+        identityProvider: "email",
+        isActive: true,
+      };
+      vi.mocked(getUserByEmail).mockResolvedValue(verifiedUserWithLocale);
+
+      const result = await resendVerificationEmailAction({
+        ctx: mockCtx,
+        parsedInput: {
+          ...validInput,
+          callbackUrl: "http://localhost:3000/api/auth/sso/recovery/complete?intent=forged-intent",
+        },
+      } as any);
+
+      expect(sendVerificationEmail).not.toHaveBeenCalled();
+      expect(result).toEqual({ success: true });
+    });
+
+    test("should fall back to a normal verification email when the relink intent belongs to a different email", async () => {
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
+      vi.mocked(getUserByEmail).mockResolvedValue(mockUser as any);
+      vi.mocked(verifySsoRelinkIntent).mockReturnValue({
+        callbackUrl: "http://localhost:3000",
+        email: "other@example.com",
+        provider: "google",
+        providerAccountId: "provider_123",
+        userId: "user_123",
+      });
+
+      const result = await resendVerificationEmailAction({
+        ctx: mockCtx,
+        parsedInput: {
+          ...validInput,
+          callbackUrl: "http://localhost:3000/api/auth/sso/recovery/complete?intent=test-intent",
+        },
+      } as any);
+
+      expect(auth.api.sendVerificationEmail).toHaveBeenCalledWith({
+        body: {
+          email: mockUser.email,
+          callbackURL: "http://localhost:3000/api/auth/sso/recovery/complete?intent=test-intent",
+        },
+        headers: expect.any(Headers),
+      });
+      expect(result).toEqual({ success: true });
+    });
+
+    // ENG-2562: a resent link gets a fresh hour while the intent cookie's clock started at sign-up, so
+    // the action re-pairs the cookie with the new link — but only for a browser that already holds a
+    // valid cookie naming this user. Anything weaker would let an unauthenticated caller arm sign-up
+    // proof for an arbitrary account by asking for a resend.
+    describe("Sign-up intent cookie refresh (ENG-2562)", () => {
+      beforeEach(() => {
+        vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true } as never);
+        vi.mocked(getUserByEmail).mockResolvedValue(mockUser as never);
+        cookieMocks.get.mockReturnValue({ value: "existing-intent-cookie" });
+      });
+
+      test("re-issues the cookie when the browser already holds a valid one for this user", async () => {
+        signupIntentMocks.classifySignupIntent.mockReturnValue("valid");
+
+        await resendVerificationEmailAction({ ctx: mockCtx, parsedInput: validInput } as never);
+
+        expect(signupIntentMocks.classifySignupIntent).toHaveBeenCalledWith(
+          "existing-intent-cookie",
+          mockUser.id
+        );
+        expect(signupIntentMocks.createSignupIntentToken).toHaveBeenCalledWith(mockUser.id);
+        expect(cookieMocks.set).toHaveBeenCalledWith(
+          "formbricks.signup_intent",
+          "fresh-intent-token",
+          expect.objectContaining({ httpOnly: true, maxAge: 3600 })
+        );
+      });
+
+      test.each([["absent"], ["invalid"], ["other_user"]])(
+        "does not mint a cookie when the browser's proof classifies as %s",
+        async (classification) => {
+          signupIntentMocks.classifySignupIntent.mockReturnValue(classification as never);
+
+          await resendVerificationEmailAction({ ctx: mockCtx, parsedInput: validInput } as never);
+
+          expect(signupIntentMocks.createSignupIntentToken).not.toHaveBeenCalled();
+          expect(cookieMocks.set).not.toHaveBeenCalled();
+        }
+      );
+
+      test("does not touch the cookie when the user is already verified (no email sent)", async () => {
+        vi.mocked(getUserByEmail).mockResolvedValue(mockVerifiedUser as never);
+        signupIntentMocks.classifySignupIntent.mockReturnValue("valid");
+
+        await resendVerificationEmailAction({ ctx: mockCtx, parsedInput: validInput } as never);
+
+        expect(cookieMocks.set).not.toHaveBeenCalled();
+      });
+    });
+
     test("should throw ResourceNotFoundError when user doesn't exist", async () => {
-      vi.mocked(applyIPRateLimit).mockResolvedValue();
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
       vi.mocked(getUserByEmail).mockResolvedValue(null);
 
       await expect(
@@ -187,7 +414,7 @@ describe("resendVerificationEmailAction", () => {
     });
 
     test("should set audit context userId when sending verification email", async () => {
-      vi.mocked(applyIPRateLimit).mockResolvedValue();
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
       vi.mocked(getUserByEmail).mockResolvedValue(mockUser as any);
 
       const testCtx = {
@@ -207,7 +434,7 @@ describe("resendVerificationEmailAction", () => {
     });
 
     test("should not set audit context userId when email is already verified", async () => {
-      vi.mocked(applyIPRateLimit).mockResolvedValue();
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
       vi.mocked(getUserByEmail).mockResolvedValue(mockVerifiedUser as any);
 
       const testCtx = {
@@ -241,7 +468,7 @@ describe("resendVerificationEmailAction", () => {
     });
 
     test("should handle user lookup errors after rate limiting", async () => {
-      vi.mocked(applyIPRateLimit).mockResolvedValue();
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
       vi.mocked(getUserByEmail).mockRejectedValue(new Error("Database error"));
 
       await expect(
@@ -255,9 +482,9 @@ describe("resendVerificationEmailAction", () => {
     });
 
     test("should handle email sending errors after rate limiting", async () => {
-      vi.mocked(applyIPRateLimit).mockResolvedValue();
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
       vi.mocked(getUserByEmail).mockResolvedValue(mockUser as any);
-      vi.mocked(sendVerificationEmail).mockRejectedValue(new Error("Email service error"));
+      vi.mocked(auth.api.sendVerificationEmail).mockRejectedValue(new Error("Email service error"));
 
       await expect(
         resendVerificationEmailAction({
@@ -277,7 +504,7 @@ describe("resendVerificationEmailAction", () => {
 
       // This would be caught by the Zod schema validation in the actual action
       // but we test the behavior if it somehow gets through
-      vi.mocked(applyIPRateLimit).mockResolvedValue();
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
       vi.mocked(getUserByEmail).mockResolvedValue(null);
 
       await expect(
@@ -293,7 +520,7 @@ describe("resendVerificationEmailAction", () => {
 
       // This would be caught by the Zod schema validation in the actual action
       // but we test the behavior if it somehow gets through
-      vi.mocked(applyIPRateLimit).mockResolvedValue();
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
       vi.mocked(getUserByEmail).mockResolvedValue(null);
 
       await expect(
@@ -320,7 +547,7 @@ describe("resendVerificationEmailAction", () => {
     });
 
     test("should not leak information about user existence through different error messages", async () => {
-      vi.mocked(applyIPRateLimit).mockResolvedValue();
+      vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
       vi.mocked(getUserByEmail).mockResolvedValue(null);
 
       // Both non-existent users should throw the same ResourceNotFoundError

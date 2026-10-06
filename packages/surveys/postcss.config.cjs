@@ -1,5 +1,13 @@
-// basic regex -- [whitespace](number)(rem)[whitespace or ;]
-const REM_REGEX = /\b(\d+(\.\d+)?)(rem)\b/gi;
+// The three #fbjs-scoping plugins (stripLayerProperties, scopeLayerTheme,
+// replaceAtPropertyWithScoped) are shared with @formbricks/survey-ui so the
+// scoping logic stays identical across both CSS bundles that ship together in
+// the injected <style>. See packages/vite-plugins/postcss-scope-fbjs.cjs and
+// https://github.com/formbricks/js/issues/46.
+const { scopeFbjsPlugins } = require("../vite-plugins/postcss-scope-fbjs.cjs");
+
+// Matches a CSS numeric value followed by "rem" — e.g. "1rem", "1.5rem", "16rem".
+// Single character-class + single quantifier: no nested quantifiers, no backtracking risk.
+const REM_REGEX = /([\d.]+)(rem)/gi; // NOSONAR -- single character-class quantifier on trusted CSS input; no backtracking risk
 const PROCESSED = Symbol("processed");
 
 const remtoEm = (opts = {}) => {
@@ -27,5 +35,5 @@ const remtoEm = (opts = {}) => {
 };
 
 module.exports = {
-  plugins: [require("@tailwindcss/postcss"), require("autoprefixer"), remtoEm()],
+  plugins: [require("@tailwindcss/postcss"), require("autoprefixer"), remtoEm(), ...scopeFbjsPlugins()],
 };

@@ -51,15 +51,14 @@ export const DataTableToolbar = <T,>({
       ) : (
         <div>{leftContent}</div>
       )}
-      <div className="flex space-x-2">
-        {type === "contact" && onRefresh ? (
-          <TooltipRenderer
-            tooltipContent={t("environments.contacts.contacts_table_refresh")}
-            shouldRender={true}>
+      <div className="flex gap-x-2">
+        {onRefresh ? (
+          <TooltipRenderer tooltipContent={t("common.refresh")} shouldRender={true}>
             <button
+              type="button"
               onClick={async () => {
                 await onRefresh();
-                toast.success(t("environments.contacts.contacts_table_refresh_success"));
+                toast.success(t("common.data_refreshed_successfully"));
               }}
               className="cursor-pointer rounded-md border bg-white hover:border-slate-400">
               <RefreshCcwIcon strokeWidth={1.5} className={cn("m-1 h-6 w-6 p-0.5")} />
@@ -68,22 +67,27 @@ export const DataTableToolbar = <T,>({
         ) : null}
 
         <TooltipRenderer tooltipContent={t("common.table_settings")} shouldRender={true}>
+          {/* Icon-only, so it needs an accessible name of its own: the tooltip is not one, and this is
+              the only way to reach the column-visibility settings. */}
           <button
+            type="button"
+            aria-label={t("common.table_settings")}
             onClick={() => setIsTableSettingsModalOpen(true)}
             className="cursor-pointer rounded-md border bg-white hover:border-slate-400">
-            <SettingsIcon strokeWidth={1.5} className="m-1 h-6 w-6 p-0.5" />
+            <SettingsIcon strokeWidth={1.5} className="m-1 size-6 p-0.5" />
           </button>
         </TooltipRenderer>
         <TooltipRenderer
           tooltipContent={isExpanded ? t("common.collapse_rows") : t("common.expand_rows")}
           shouldRender={true}>
           <button
+            type="button"
             onClick={() => setIsExpanded(!isExpanded)}
             className={cn(
               "cursor-pointer rounded-md border bg-white hover:border-slate-400",
               isExpanded && "bg-black text-white"
             )}>
-            <MoveVerticalIcon strokeWidth={1.5} className="m-1 h-6 w-6 p-0.5" />
+            <MoveVerticalIcon strokeWidth={1.5} className="m-1 size-6 p-0.5" />
           </button>
         </TooltipRenderer>
       </div>

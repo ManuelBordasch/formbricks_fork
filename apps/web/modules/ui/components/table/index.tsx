@@ -12,15 +12,16 @@ Table.displayName = "Table";
 
 const TableHeader = React.forwardRef<HTMLTableSectionElement, React.HTMLAttributes<HTMLTableSectionElement>>(
   ({ className, ...props }, ref) => (
-    <thead
-      ref={ref}
-      className={cn("pointer-events-none text-slate-800 [&_tr]:border-b", className)}
-      {...props}
-    />
+    <thead ref={ref} className={cn("text-slate-800 [&_tr]:border-b", className)} {...props} />
   )
 );
 TableHeader.displayName = "TableHeader";
 
+/**
+ * The last row draws no bottom border, on the assumption that a frame around the table closes it.
+ * Several consumers re-add `[&_tr:last-child]:border-b` because their container has a radius but no
+ * border, so nothing else draws that line; they lose the override once they gain a real frame.
+ */
 const TableBody = React.forwardRef<HTMLTableSectionElement, React.HTMLAttributes<HTMLTableSectionElement>>(
   ({ className, ...props }, ref) => (
     <tbody ref={ref} className={cn("[&_tr:last-child]:border-0", className)} {...props} />
@@ -30,7 +31,7 @@ TableBody.displayName = "TableBody";
 
 const TableFooter = React.forwardRef<HTMLTableSectionElement, React.HTMLAttributes<HTMLTableSectionElement>>(
   ({ className, ...props }, ref) => (
-    <tfoot ref={ref} className={cn("border-t [&>tr]:last:border-b-0", className)} {...props} />
+    <tfoot ref={ref} className={cn("border-t last:[&>tr]:border-b-0", className)} {...props} />
   )
 );
 TableFooter.displayName = "TableFooter";
@@ -40,7 +41,7 @@ const TableRow = React.forwardRef<HTMLTableRowElement, React.HTMLAttributes<HTML
     <tr
       ref={ref}
       className={cn(
-        "border-b bg-white transition-colors hover:bg-slate-100 data-[state=selected]:bg-slate-100",
+        "border-b border-slate-200 bg-white transition-colors data-[state=selected]:bg-slate-100",
         className
       )}
       {...props}
@@ -53,7 +54,7 @@ const TableHead = React.forwardRef<HTMLTableCellElement, React.ThHTMLAttributes<
   ({ className, ...props }, ref) => (
     <th
       ref={ref}
-      className={cn("h-12 px-4 text-left align-middle [&:has([role=checkbox])]:pr-0", className)}
+      className={cn("h-12 px-4 text-left align-middle has-[[role=checkbox]]:pr-0", className)}
       {...props}
     />
   )
@@ -62,7 +63,7 @@ TableHead.displayName = "TableHead";
 
 const TableCell = React.forwardRef<HTMLTableCellElement, React.TdHTMLAttributes<HTMLTableCellElement>>(
   ({ className, ...props }, ref) => (
-    <td ref={ref} className={cn("p-4 align-middle [&:has([role=checkbox])]:pr-0", className)} {...props} />
+    <td ref={ref} className={cn("p-4 align-middle has-[[role=checkbox]]:pr-0", className)} {...props} />
   )
 );
 TableCell.displayName = "TableCell";

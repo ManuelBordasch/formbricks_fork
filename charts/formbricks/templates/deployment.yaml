@@ -8,7 +8,7 @@ metadata:
     {{- if .Values.deployment.additionalLabels }}
     {{- toYaml .Values.deployment.additionalLabels | nindent 4 }}
     {{- end }}
-  {{- if or .Values.deployment.annotations .Values.deployment.reloadOnChange }}
+  {{- if or .Values.deployment.annotations .Values.deployment.reloadOnChange .Values.authzed.enabled }}
   annotations:
     {{- if .Values.deployment.annotations }}
     {{- toYaml .Values.deployment.annotations | nindent 4 }}
@@ -16,9 +16,14 @@ metadata:
   {{- if .Values.deployment.reloadOnChange }}
     reloader.stakater.com/auto: "true"
   {{- end }}
+  {{- if and .Values.authzed.enabled (not (hasKey (default dict .Values.deployment.annotations) "argocd.argoproj.io/sync-wave")) }}
+    # The release-matched AuthZed preparation runs at wave 1. This orders GitOps reconciliation without
+    # coupling the application process, startup, or probes to SpiceDB availability.
+    argocd.argoproj.io/sync-wave: "2"
+  {{- end }}
   {{- end }}
 spec:
-  {{- if .Values.deployment.replicas }}
+  {{- if and (not .Values.autoscaling.enabled) (not (kindIs "invalid" .Values.deployment.replicas)) }}
   replicas: {{ .Values.deployment.replicas }}
   {{- end }}
   selector:
@@ -79,7 +84,7 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.deployment.terminationGracePeriodSeconds | default 30 }}
       containers:
         - name: {{ template "formbricks.name" . }}
-          image: {{ .Values.deployment.image.repository }}:{{ .Values.deployment.image.tag | default .Chart.AppVersion | default "latest" }}
+          image: {{ include "formbricks.deploymentImage" . }}
           imagePullPolicy: {{ .Values.deployment.image.pullPolicy }}
           {{- if .Values.deployment.command }}
           command:
@@ -88,6 +93,10 @@ spec:
           {{- if .Values.deployment.args }}
           args:
             {{- toYaml .Values.deployment.args | nindent 12 }}
+          {{- end }}
+          {{- with .Values.deployment.lifecycle }}
+          lifecycle:
+            {{- toYaml . | nindent 12 }}
           {{- end }}
           {{- if .Values.deployment.ports }}
           ports:
@@ -131,17 +140,79 @@ spec:
             - name: SKIP_STARTUP_MIGRATION
               value: "true"
             {{- end }}
+            {{- if and .Values.formbricks.mcpOauthJwksUrl (not (hasKey .Values.deployment.env "MCP_OAUTH_JWKS_URL")) }}
+            - name: MCP_OAUTH_JWKS_URL
+              value: {{ .Values.formbricks.mcpOauthJwksUrl | quote }}
+            {{- end }}
+            {{- if .Values.authzed.enabled }}
+            {{- if not (hasKey .Values.deployment.env "AUTHZED_ENABLED") }}
+            - name: AUTHZED_ENABLED
+              value: "true"
+            {{- end }}
+            {{- if not (hasKey .Values.deployment.env "AUTHZED_ENDPOINT") }}
+            - name: AUTHZED_ENDPOINT
+              value: {{ include "formbricks.authzedEndpoint" . | quote }}
+            {{- end }}
+            {{- if not (hasKey .Values.deployment.env "AUTHZED_TOKEN") }}
+            - name: AUTHZED_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "formbricks.authzedAuthSecretName" . }}
+                  key: {{ .Values.authzed.auth.tokenKey }}
+            {{- end }}
+            {{- if not (hasKey .Values.deployment.env "AUTHZED_SYSTEM_KEY") }}
+            - name: AUTHZED_SYSTEM_KEY
+              value: {{ required "authzed.systemKey is required when AuthZed is enabled" .Values.authzed.systemKey | quote }}
+            {{- end }}
+            {{- if not (hasKey .Values.deployment.env "AUTHZED_INSECURE") }}
+            - name: AUTHZED_INSECURE
+              value: {{ include "formbricks.authzedInsecure" . | quote }}
+            {{- end }}
+            {{- if not (hasKey .Values.deployment.env "AUTHZED_CONSISTENCY") }}
+            - name: AUTHZED_CONSISTENCY
+              value: {{ .Values.authzed.consistency | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if not (hasKey .Values.deployment.env "HUB_API_URL") }}
+            - name: HUB_API_URL
+              value: "http://{{ include "formbricks.hubname" . }}:8080"
+            {{- end }}
+            {{- if and .Values.cube.enabled (not (hasKey .Values.deployment.env "CUBEJS_API_URL")) }}
+            - name: CUBEJS_API_URL
+              value: "http://{{ include "formbricks.cubeName" . }}:{{ .Values.cube.service.port }}"
+            {{- end }}
+            {{- if and .Values.llm.enabled .Values.llm.autoConfigureApp }}
+            {{- if not (hasKey .Values.deployment.env "AI_PROVIDER") }}
+            - name: AI_PROVIDER
+              value: "openai-compatible"
+            {{- end }}
+            {{- if not (hasKey .Values.deployment.env "AI_MODEL") }}
+            - name: AI_MODEL
+              value: {{ .Values.llm.formbricks.model | quote }}
+            {{- end }}
+            {{- if not (hasKey .Values.deployment.env "AI_OPENAI_COMPATIBLE_BASE_URL") }}
+            - name: AI_OPENAI_COMPATIBLE_BASE_URL
+              value: {{ include "formbricks.llmBaseUrl" . | quote }}
+            {{- end }}
+            {{- if not (hasKey .Values.deployment.env "AI_OPENAI_COMPATIBLE_PROVIDER_NAME") }}
+            - name: AI_OPENAI_COMPATIBLE_PROVIDER_NAME
+              value: {{ .Values.llm.formbricks.providerName | quote }}
+            {{- end }}
+            {{- if not (hasKey .Values.deployment.env "AI_OPENAI_COMPATIBLE_SUPPORTS_STRUCTURED_OUTPUTS") }}
+            - name: AI_OPENAI_COMPATIBLE_SUPPORTS_STRUCTURED_OUTPUTS
+              value: {{ .Values.llm.formbricks.supportsStructuredOutputs | quote }}
+            {{- end }}
+            {{- end }}
             {{- range $key, $value := .Values.deployment.env }}
-            - name: {{ include "formbricks.tplvalues.render" ( dict "value" $key "context" $ ) }}
-              {{- if kindIs "string" $value }}
-              value: {{ include "formbricks.tplvalues.render" ( dict "value" $value "context" $ ) | quote }}
-              {{- else }}
-              {{- toYaml $value | nindent 14 }}
-              {{- end }}
+            {{- include "formbricks.envVar" (dict "name" $key "value" $value "context" $) | nindent 12 }}
             {{- end }}
           {{- if .Values.deployment.resources }}
           resources:
               {{- toYaml .Values.deployment.resources | nindent 12 }}
+          {{- end }}
+          {{- with .Values.deployment.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
           {{- end }}
           {{- with .Values.deployment.probes }}
           {{- if .livenessProbe }}
@@ -157,3 +228,7 @@ spec:
             {{- toYaml .startupProbe | nindent 12 }}
           {{- end }}
           {{- end }}
+      {{- with .Values.deployment.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

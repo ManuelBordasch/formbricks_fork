@@ -1,7 +1,8 @@
-import { Prisma } from "@prisma/client";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { DatabaseError, InvalidInputError, ResourceNotFoundError } from "@formbricks/types/errors";
+import { reconcileTeamWorkspaceRelationships } from "@/lib/authzed/team-workspace";
 import { TTeamSettingsFormSchema } from "@/modules/ee/teams/team-list/types/team";
 import {
   createTeam,
@@ -28,9 +29,12 @@ vi.mock("@formbricks/database", () => ({
       findMany: vi.fn(),
     },
     membership: { findUnique: vi.fn(), count: vi.fn() },
-    project: { count: vi.fn() },
-    environment: { findMany: vi.fn() },
+    workspace: { count: vi.fn() },
   },
+}));
+
+vi.mock("@/lib/authzed/team-workspace", () => ({
+  reconcileTeamWorkspaceRelationships: vi.fn(),
 }));
 
 const mockTeams = [
@@ -74,7 +78,7 @@ const mockTeamDetails = {
     { userId: "u1", role: "admin", user: { name: "User 1" } },
     { userId: "u2", role: "member", user: { name: "User 2" } },
   ],
-  projectTeams: [{ projectId: "p1", project: { name: "Project 1" }, permission: "manage" }],
+  workspaceTeams: [{ workspaceId: "p1", workspace: { name: "Workspace 1" }, permission: "manage" }],
 };
 
 describe("getTeamsByOrganizationId", () => {
@@ -167,6 +171,7 @@ describe("createTeam", () => {
     });
     const result = await createTeam("org1", "Team 1");
     expect(result).toBe("t1");
+    expect(reconcileTeamWorkspaceRelationships).toHaveBeenCalledWith({ teamIds: ["t1"] });
   });
   test("throws InvalidInputError if team exists", async () => {
     vi.mocked(prisma.team.findFirst).mockResolvedValueOnce({
@@ -205,7 +210,7 @@ describe("getTeamDetails", () => {
         { userId: "u1", name: "User 1", role: "admin" },
         { userId: "u2", name: "User 2", role: "member" },
       ],
-      projects: [{ projectId: "p1", projectName: "Project 1", permission: "manage" }],
+      workspaces: [{ workspaceId: "p1", workspaceName: "Workspace 1", permission: "manage" }],
     });
   });
   test("returns null if team not found", async () => {
@@ -232,11 +237,12 @@ describe("deleteTeam", () => {
       name: "Team 1",
       createdAt: new Date(),
       updatedAt: new Date(),
-      projectTeams: [{ projectId: "p1" }],
+      workspaceTeams: [{ workspaceId: "p1" }],
     };
     vi.mocked(prisma.team.delete).mockResolvedValueOnce(mockTeam);
     const result = await deleteTeam("t1");
     expect(result).toBe(true);
+    expect(reconcileTeamWorkspaceRelationships).toHaveBeenCalledWith({ teamIds: ["t1"] });
   });
   test("throws DatabaseError on Prisma error", async () => {
     vi.mocked(prisma.team.delete).mockRejectedValueOnce(
@@ -250,7 +256,7 @@ describe("updateTeamDetails", () => {
   const data: TTeamSettingsFormSchema = {
     name: "Team 1 Updated",
     members: [{ userId: "u1", role: "admin" }],
-    projects: [{ projectId: "p1", permission: "manage" }],
+    workspaces: [{ workspaceId: "p1", permission: "manage" }],
   };
   beforeEach(() => {
     vi.clearAllMocks();
@@ -267,7 +273,7 @@ describe("updateTeamDetails", () => {
     vi.mocked(prisma.team.findMany).mockResolvedValueOnce(mockUserTeams);
 
     vi.mocked(prisma.membership.count).mockResolvedValueOnce(1);
-    vi.mocked(prisma.project.count).mockResolvedValueOnce(1);
+    vi.mocked(prisma.workspace.count).mockResolvedValueOnce(1);
     vi.mocked(prisma.team.update).mockResolvedValueOnce({
       id: "t1",
       name: "Team 1 Updated",
@@ -275,18 +281,33 @@ describe("updateTeamDetails", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     });
-    vi.mocked(prisma.environment.findMany).mockResolvedValueOnce([
-      {
-        id: "env1",
-        type: "production" as const,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        projectId: "p1",
-        appSetupCompleted: false,
-      },
-    ]);
     const result = await updateTeamDetails("t1", data);
     expect(result).toBe(true);
+    expect(reconcileTeamWorkspaceRelationships).toHaveBeenCalledWith({
+      teamIds: ["t1"],
+      teamMemberships: [
+        { teamId: "t1", userId: "u1" },
+        { teamId: "t1", userId: "u2" },
+      ],
+      workspaceTeamGrants: [{ teamId: "t1", workspaceId: "p1" }],
+    });
+  });
+  test("does not change a successful update result when projection unexpectedly rejects", async () => {
+    vi.mocked(prisma.team.findUnique)
+      .mockResolvedValueOnce({
+        id: "t1",
+        organizationId: "org1",
+        name: "Team 1",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .mockResolvedValueOnce(mockTeamDetails);
+    vi.mocked(prisma.membership.count).mockResolvedValueOnce(1);
+    vi.mocked(prisma.workspace.count).mockResolvedValueOnce(1);
+    vi.mocked(prisma.team.update).mockResolvedValueOnce({ id: "t1" } as never);
+    vi.mocked(reconcileTeamWorkspaceRelationships).mockRejectedValueOnce(new Error("private"));
+
+    await expect(updateTeamDetails("t1", data)).resolves.toBe(true);
   });
   test("throws ResourceNotFoundError if team not found", async () => {
     vi.mocked(prisma.team.findUnique).mockResolvedValueOnce(null);
@@ -318,12 +339,12 @@ describe("updateTeamDetails", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
       teamUsers: [],
-      projectTeams: [],
+      workspaceTeams: [],
     } as any);
     vi.mocked(prisma.membership.count).mockResolvedValueOnce(0);
     await expect(updateTeamDetails("t1", data)).rejects.toThrow();
   });
-  test("throws error if project not in org", async () => {
+  test("throws error if workspace not in org", async () => {
     vi.mocked(prisma.team.findUnique).mockResolvedValueOnce({
       id: "t1",
       organizationId: "org1",
@@ -338,15 +359,15 @@ describe("updateTeamDetails", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
       teamUsers: [],
-      projectTeams: [],
+      workspaceTeams: [],
     } as any);
     vi.mocked(prisma.membership.count).mockResolvedValueOnce(1);
-    vi.mocked(prisma.project.count).mockResolvedValueOnce(0);
+    vi.mocked(prisma.workspace.count).mockResolvedValueOnce(0);
     await expect(
       updateTeamDetails("t1", {
         name: "x",
         members: [],
-        projects: [{ projectId: "p1", permission: "manage" }],
+        workspaces: [{ workspaceId: "p1", permission: "manage" }],
       })
     ).rejects.toThrow();
   });

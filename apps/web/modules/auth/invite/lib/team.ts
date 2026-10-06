@@ -1,7 +1,9 @@
 import "server-only";
-import { Prisma } from "@prisma/client";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { DatabaseError } from "@formbricks/types/errors";
+import { runPostCommitProjection } from "@/lib/authzed/projection-boundary";
+import { reconcileTeamWorkspaceRelationships } from "@/lib/authzed/team-workspace";
 import { getAccessFlags } from "@/lib/membership/utils";
 import { CreateMembershipInvite } from "@/modules/auth/invite/types/invites";
 
@@ -10,8 +12,7 @@ export const createTeamMembership = async (invite: CreateMembershipInvite, userI
   const userMembershipRole = invite.role;
   const { isOwner, isManager } = getAccessFlags(userMembershipRole);
 
-  const validTeamIds: string[] = [];
-  const validProjectIds: string[] = [];
+  const committedTeamIds: string[] = [];
 
   const isOwnerOrManager = isOwner || isManager;
   try {
@@ -21,25 +22,29 @@ export const createTeamMembership = async (invite: CreateMembershipInvite, userI
           id: teamId,
         },
         select: {
-          projectTeams: {
-            select: {
-              projectId: true,
-            },
-          },
+          id: true,
         },
       });
 
       if (team) {
-        await prisma.teamUser.create({
-          data: {
+        await prisma.teamUser.upsert({
+          create: {
             teamId,
             userId,
             role: isOwnerOrManager ? "admin" : "contributor",
           },
+          update: {
+            role: isOwnerOrManager ? "admin" : "contributor",
+          },
+          where: {
+            teamId_userId: {
+              teamId,
+              userId,
+            },
+          },
         });
 
-        validTeamIds.push(teamId);
-        validProjectIds.push(...team.projectTeams.map((pt) => pt.projectId));
+        committedTeamIds.push(teamId);
       }
     }
   } catch (error) {
@@ -48,5 +53,11 @@ export const createTeamMembership = async (invite: CreateMembershipInvite, userI
     }
 
     throw error;
+  } finally {
+    await runPostCommitProjection("invite_team_membership_create", () =>
+      reconcileTeamWorkspaceRelationships({
+        teamMemberships: committedTeamIds.map((teamId) => ({ teamId, userId })),
+      })
+    );
   }
 };

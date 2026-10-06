@@ -1,9 +1,11 @@
 import { logger } from "@formbricks/logger";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
 import { getOrganizationIdFromSurveyId } from "@/lib/utils/helper";
 import { authenticatedApiClient } from "@/modules/api/v2/auth/authenticated-api-client";
 import { responses } from "@/modules/api/v2/lib/response";
 import { handleApiError } from "@/modules/api/v2/lib/utils";
-import { getEnvironmentId } from "@/modules/api/v2/management/lib/helper";
+import { getWorkspaceId } from "@/modules/api/v2/management/lib/helper";
 import { calculateExpirationDate } from "@/modules/api/v2/management/surveys/[surveyId]/contact-links/lib/utils";
 import { getContactsInSegment } from "@/modules/api/v2/management/surveys/[surveyId]/contact-links/segments/[segmentId]/lib/contact";
 import {
@@ -13,7 +15,6 @@ import {
 import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
 import { getContactSurveyLink } from "@/modules/ee/contacts/lib/contact-survey-link";
 import { getIsContactsEnabled } from "@/modules/ee/license-check/lib/utils";
-import { hasPermission } from "@/modules/organization/settings/api-keys/lib/utils";
 
 export const GET = async (
   request: Request,
@@ -36,6 +37,26 @@ export const GET = async (
         });
       }
 
+      const workspaceIdResult = await getWorkspaceId(params.surveyId, false);
+
+      if (!workspaceIdResult.ok) {
+        return handleApiError(request, workspaceIdResult.error);
+      }
+
+      const { workspaceId } = workspaceIdResult.data;
+
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("GET"),
+          { type: "workspace", id: workspaceId }
+        ))
+      ) {
+        return handleApiError(request, {
+          type: "unauthorized",
+        });
+      }
+
       const organizationId = await getOrganizationIdFromSurveyId(params.surveyId);
       const isContactsEnabled = await getIsContactsEnabled(organizationId);
       if (!isContactsEnabled) {
@@ -44,20 +65,6 @@ export const GET = async (
           details: [
             { field: "contacts", issue: "Contacts are only enabled for Enterprise Edition, please upgrade." },
           ],
-        });
-      }
-
-      const environmentIdResult = await getEnvironmentId(params.surveyId, false);
-
-      if (!environmentIdResult.ok) {
-        return handleApiError(request, environmentIdResult.error);
-      }
-
-      const environmentId = environmentIdResult.data;
-
-      if (!hasPermission(authentication.environmentPermissions, environmentId, "GET")) {
-        return handleApiError(request, {
-          type: "unauthorized",
         });
       }
 

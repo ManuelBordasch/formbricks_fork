@@ -1,9 +1,13 @@
 import { logger } from "@formbricks/logger";
 import { handleErrorResponse } from "@/app/api/v1/auth";
+import { RequestBodyTooLargeError, parseJsonBodyWithLimit } from "@/app/lib/api/request-body";
 import { responses } from "@/app/lib/api/response";
 import { transformErrorToDetails } from "@/app/lib/api/validator";
 import { TApiKeyAuthentication, THandlerParams, withV1ApiWrapper } from "@/app/lib/api/with-api-logging";
-import { hasPermission } from "@/modules/organization/settings/api-keys/lib/utils";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
+import { CONTACTS_API_V1_NOT_ENABLED_MESSAGE } from "@/modules/ee/contacts/lib/contacts-entitlement";
+import { getIsContactsEnabled } from "@/modules/ee/license-check/lib/utils";
 import {
   deleteContactAttributeKey,
   getContactAttributeKey,
@@ -13,15 +17,28 @@ import { ZContactAttributeKeyUpdateInput } from "./types/contact-attribute-keys"
 
 async function fetchAndAuthorizeContactAttributeKey(
   attributeKeyId: string,
-  environmentPermissions: NonNullable<TApiKeyAuthentication>["environmentPermissions"],
+  authentication: NonNullable<TApiKeyAuthentication>,
   requiredPermission: "GET" | "PUT" | "DELETE"
 ) {
+  // Entitlement first, matching the plural route: without the contacts feature the caller may
+  // not interact with attribute keys at all, regardless of workspace permissions.
+  const isContactsEnabled = await getIsContactsEnabled(authentication.organizationId);
+  if (!isContactsEnabled) {
+    return { error: responses.forbiddenResponse(CONTACTS_API_V1_NOT_ENABLED_MESSAGE) };
+  }
+
   const attributeKey = await getContactAttributeKey(attributeKeyId);
   if (!attributeKey) {
     return { error: responses.notFoundResponse("Attribute Key", attributeKeyId) };
   }
 
-  if (!hasPermission(environmentPermissions, attributeKey.environmentId, requiredPermission)) {
+  if (
+    !(await can(
+      { type: "apiKey", id: authentication.apiKeyId },
+      getWorkspaceAuthorizationActionForMethod(requiredPermission),
+      { type: "workspace", id: attributeKey.workspaceId }
+    ))
+  ) {
     return { error: responses.unauthorizedResponse() };
   }
 
@@ -41,7 +58,7 @@ export const GET = withV1ApiWrapper({
 
       const result = await fetchAndAuthorizeContactAttributeKey(
         params.contactAttributeKeyId,
-        authentication.environmentPermissions,
+        authentication,
         "GET"
       );
       if (result.error) {
@@ -54,17 +71,7 @@ export const GET = withV1ApiWrapper({
         response: responses.successResponse(result.attributeKey),
       };
     } catch (error) {
-      if (
-        error instanceof Error &&
-        error.message === "Contacts are only enabled for Enterprise Edition, please upgrade."
-      ) {
-        return {
-          response: responses.forbiddenResponse(error.message),
-        };
-      }
-      return {
-        response: handleErrorResponse(error),
-      };
+      return handleErrorResponse(error);
     }
   },
 });
@@ -86,7 +93,7 @@ export const DELETE = withV1ApiWrapper({
     try {
       const result = await fetchAndAuthorizeContactAttributeKey(
         params.contactAttributeKeyId,
-        authentication.environmentPermissions,
+        authentication,
         "DELETE"
       );
 
@@ -108,9 +115,7 @@ export const DELETE = withV1ApiWrapper({
         response: responses.successResponse(deletedContactAttributeKey),
       };
     } catch (error) {
-      return {
-        response: handleErrorResponse(error),
-      };
+      return handleErrorResponse(error);
     }
   },
   action: "deleted",
@@ -135,7 +140,7 @@ export const PUT = withV1ApiWrapper({
     try {
       const result = await fetchAndAuthorizeContactAttributeKey(
         params.contactAttributeKeyId,
-        authentication.environmentPermissions,
+        authentication,
         "PUT"
       );
       if (result.error) {
@@ -149,8 +154,14 @@ export const PUT = withV1ApiWrapper({
 
       let contactAttributeKeyUpdate;
       try {
-        contactAttributeKeyUpdate = await req.json();
+        contactAttributeKeyUpdate = await parseJsonBodyWithLimit(req);
       } catch (error) {
+        if (error instanceof RequestBodyTooLargeError) {
+          return {
+            response: responses.payloadTooLargeResponse("Payload Too Large", { error: error.message }),
+          };
+        }
+
         logger.error({ error, url: req.url }, "Error parsing JSON input");
         return {
           response: responses.badRequestResponse("Malformed JSON input, please check your request body"),
@@ -184,9 +195,7 @@ export const PUT = withV1ApiWrapper({
         ),
       };
     } catch (error) {
-      return {
-        response: handleErrorResponse(error),
-      };
+      return handleErrorResponse(error);
     }
   },
   action: "updated",

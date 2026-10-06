@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { TJsEnvironmentStateSurvey } from "@formbricks/types/js";
+import { TJsWorkspaceStateSurvey } from "@formbricks/types/js";
 import { TSegment } from "@formbricks/types/segment";
 import { TSurvey, TSurveyFilterCriteria, TSurveyStatus, TSurveyType } from "@formbricks/types/surveys/types";
 import { anySurveyHasFilters, buildOrderByClause, buildWhereClause, transformPrismaSurvey } from "./utils";
@@ -89,15 +89,15 @@ describe("Survey Utils", () => {
       expect(result.displayPercentage).toBeNull();
     });
 
-    test("should transform for TJsEnvironmentStateSurvey type", () => {
+    test("should transform for TJsWorkspaceStateSurvey type", () => {
       const surveyPrisma = {
         id: "surveyJs",
         name: "JS Survey",
         displayPercentage: "10.0",
         segment: null,
-        // other specific TJsEnvironmentStateSurvey properties if any
+        // other specific TJsWorkspaceStateSurvey properties if any
       };
-      const result = transformPrismaSurvey<TJsEnvironmentStateSurvey>(surveyPrisma);
+      const result = transformPrismaSurvey<TJsWorkspaceStateSurvey>(surveyPrisma);
       expect(result.displayPercentage).toBe(10.0);
       expect(result.segment).toBeNull();
       expect(result.id).toBe("surveyJs");
@@ -105,9 +105,31 @@ describe("Survey Utils", () => {
   });
 
   describe("buildWhereClause", () => {
-    test("should return an empty AND array if no filterCriteria is provided", () => {
+    test("should exclude archived surveys by default when no filterCriteria is provided", () => {
       const result = buildWhereClause();
-      expect(result).toEqual({ AND: [] });
+      expect(result).toEqual({ AND: [{ archivedAt: null }] });
+    });
+
+    test("should exclude archived surveys by default alongside a status filter", () => {
+      const filterCriteria: TSurveyFilterCriteria = { status: ["draft"] };
+      const result = buildWhereClause(filterCriteria);
+      expect(result.AND).toContainEqual({ archivedAt: null });
+      expect(result.AND).toContainEqual({ status: { in: ["draft"] } });
+    });
+
+    test("should return only archived surveys when includeArchived is set without a status filter", () => {
+      const filterCriteria: TSurveyFilterCriteria = { includeArchived: true };
+      const result = buildWhereClause(filterCriteria);
+      expect(result.AND).toContainEqual({ archivedAt: { not: null } });
+      expect(result.AND).not.toContainEqual({ archivedAt: null });
+    });
+
+    test("should OR active surveys of the selected status with all archived surveys", () => {
+      const filterCriteria: TSurveyFilterCriteria = { status: ["inProgress"], includeArchived: true };
+      const result = buildWhereClause(filterCriteria);
+      expect(result.AND).toContainEqual({
+        OR: [{ status: { in: ["inProgress"] }, archivedAt: null }, { archivedAt: { not: null } }],
+      });
     });
 
     test("should build where clause for name", () => {
@@ -165,6 +187,7 @@ describe("Survey Utils", () => {
       const result = buildWhereClause(filterCriteria);
       expect(result.AND).toEqual([
         { name: { contains: "Feedback Survey", mode: "insensitive" } },
+        { archivedAt: null },
         { status: { in: ["inProgress" as TSurveyStatus] } },
         { type: { in: ["app" as TSurveyType] } },
         { createdBy: "user456" },
@@ -239,9 +262,9 @@ describe("Survey Utils", () => {
       expect(anySurveyHasFilters(surveys)).toBe(false);
     });
 
-    test("should handle surveys that are not TSurvey but TJsEnvironmentStateSurvey (no segment)", () => {
+    test("should handle surveys that are not TSurvey but TJsWorkspaceStateSurvey (no segment)", () => {
       const surveys = [
-        { id: "js1", name: "JS Survey 1" }, // TJsEnvironmentStateSurvey like, no segment property
+        { id: "js1", name: "JS Survey 1" }, // TJsWorkspaceStateSurvey like, no segment property
       ] as any[]; // Using any[] to simulate mixed types or types without segment
       expect(anySurveyHasFilters(surveys)).toBe(false);
     });

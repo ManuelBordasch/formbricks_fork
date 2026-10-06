@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ElementError } from "@/components/general/element-error";
+import { ElementError, getElementErrorAria } from "@/components/general/element-error";
 import { ElementHeader } from "@/components/general/element-header";
 import { Input } from "@/components/general/input";
 import { Textarea } from "@/components/general/textarea";
@@ -67,12 +67,17 @@ function OpenText({
     );
   };
 
+  const descriptionId = description ? `${inputId}-description` : undefined;
+  const errorAria = getElementErrorAria(inputId, errorMessage);
+  const describedBy = [descriptionId, errorAria.ariaDescribedBy].filter(Boolean).join(" ");
+
   return (
     <div className="w-full space-y-4" id={elementId} dir={dir}>
       {/* Headline */}
       <ElementHeader
         headline={headline}
         description={description}
+        descriptionId={descriptionId}
         required={required}
         requiredLabel={requiredLabel}
         htmlFor={inputId}
@@ -80,7 +85,7 @@ function OpenText({
         videoUrl={videoUrl}
       />
       <div className="relative" data-element-input>
-        <ElementError errorMessage={errorMessage} />
+        <ElementError errorMessage={errorMessage} id={errorAria.errorId} />
         {/* Input or Textarea */}
         <div className="space-y-1">
           {longAnswer ? (
@@ -90,6 +95,8 @@ function OpenText({
               value={value}
               onChange={handleChange}
               aria-required={required}
+              aria-invalid={errorAria.ariaInvalid}
+              aria-describedby={describedBy || undefined}
               dir={dir}
               rows={rows}
               disabled={disabled}
@@ -105,6 +112,8 @@ function OpenText({
               value={value}
               onChange={handleChange}
               aria-required={required}
+              aria-invalid={errorAria.ariaInvalid}
+              aria-describedby={describedBy || undefined}
               dir={dir}
               disabled={disabled}
               errorMessage={errorMessage}

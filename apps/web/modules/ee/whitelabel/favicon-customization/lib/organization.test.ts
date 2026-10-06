@@ -1,6 +1,6 @@
-import { Prisma } from "@prisma/client";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { ResourceNotFoundError } from "@formbricks/types/errors";
 import { updateOrganizationFaviconUrl } from "./organization";
 
@@ -126,7 +126,7 @@ describe("favicon organization", () => {
       };
 
       const mockError = new Prisma.PrismaClientKnownRequestError("Record does not exist", {
-        code: "P2015", // PrismaErrorType.RecordDoesNotExist
+        code: "P2025", // PrismaErrorType.RecordNotFound
         clientVersion: "2.0.0",
       });
 

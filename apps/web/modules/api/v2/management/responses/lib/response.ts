@@ -1,15 +1,15 @@
 import "server-only";
-import { Prisma, Response } from "@prisma/client";
 import { prisma } from "@formbricks/database";
+import { Prisma, Response } from "@formbricks/database/prisma";
 import { TContactAttributes } from "@formbricks/types/contact-attribute";
 import { Result, err, ok } from "@formbricks/types/error-handlers";
 import { IS_FORMBRICKS_CLOUD } from "@/lib/constants";
-import { calculateTtcTotal } from "@/lib/response/utils";
+import { calculateTtcTotal, normalizeResponseLanguage } from "@/lib/response/utils";
 import { getContactByUserId } from "@/modules/api/v2/management/responses/lib/contact";
 import {
   getMonthlyOrganizationResponseCount,
   getOrganizationBilling,
-  getOrganizationIdFromEnvironmentId,
+  getOrganizationIdFromWorkspaceId,
 } from "@/modules/api/v2/management/responses/lib/organization";
 import { getResponsesQuery } from "@/modules/api/v2/management/responses/lib/utils";
 import { TGetResponsesFilter, TResponseInput } from "@/modules/api/v2/management/responses/types/responses";
@@ -18,11 +18,11 @@ import { ApiResponseWithMeta } from "@/modules/api/v2/types/api-success";
 import { evaluateResponseQuotas } from "@/modules/ee/quotas/lib/evaluation-service";
 
 export const getResponses = async (
-  environmentIds: string[],
+  workspaceIds: string[],
   params: TGetResponsesFilter
 ): Promise<Result<ApiResponseWithMeta<Response[]>, ApiErrorResponseV2>> => {
   try {
-    const query = getResponsesQuery(environmentIds, params);
+    const query = getResponsesQuery(workspaceIds, params);
     const whereClause = query.where;
 
     const [responses, totalCount] = await Promise.all([
@@ -49,7 +49,7 @@ export const getResponses = async (
 };
 
 export const createResponse = async (
-  environmentId: string,
+  workspaceId: string,
   responseInput: TResponseInput,
   tx?: Prisma.TransactionClient
 ): Promise<Result<Response, ApiErrorResponseV2>> => {
@@ -70,11 +70,33 @@ export const createResponse = async (
   } = responseInput;
 
   try {
+    // `displayId` is caller-supplied and was connected without any ownership check. Display↔Response is
+    // one-to-one, so naming another workspace's display either failed outright or moved that display
+    // onto this response, corrupting the other tenant's display and completion counts. A display always
+    // belongs to one survey, so matching it against this survey is the tightest check available.
+    if (displayId) {
+      const display = await (tx ?? prisma).display.findUnique({
+        where: { id: displayId },
+        select: { surveyId: true },
+      });
+
+      // Uniform not-found for "does not exist" and "exists but belongs elsewhere". Distinguishing the
+      // two would confirm that a display id is real, making this endpoint a cross-tenant existence
+      // oracle — the same reason the historical-response import raises not-found rather than forbidden
+      // (#8679). Matches the shape the sibling handlers already return for a foreign display.
+      if (display?.surveyId !== surveyId) {
+        return err({
+          type: "not_found",
+          details: [{ field: "display", issue: "not found" }],
+        });
+      }
+    }
+
     let contact: { id: string; attributes: TContactAttributes } | null = null;
 
     // If userId is provided, look up the contact by userId
     if (userId) {
-      const contactResult = await getContactByUserId(environmentId, userId);
+      const contactResult = await getContactByUserId(workspaceId, userId);
       if (!contactResult.ok) {
         return err(contactResult.error);
       }
@@ -107,7 +129,7 @@ export const createResponse = async (
       }),
       finished,
       data,
-      language,
+      language: normalizeResponseLanguage(language),
       meta,
       singleUseId,
       variables,
@@ -117,7 +139,7 @@ export const createResponse = async (
       endingId,
     };
 
-    const organizationIdResult = await getOrganizationIdFromEnvironmentId(environmentId);
+    const organizationIdResult = await getOrganizationIdFromWorkspaceId(workspaceId);
     if (!organizationIdResult.ok) {
       return err(organizationIdResult.error as ApiErrorResponseV2);
     }
@@ -154,11 +176,14 @@ export const createResponse = async (
 };
 
 export const createResponseWithQuotaEvaluation = async (
-  environmentId: string,
+  workspaceId: string,
   responseInput: TResponseInput
 ): Promise<Result<Response, ApiErrorResponseV2>> => {
+  // Canonicalize once so quota evaluation uses the same code persisted on the response (createResponse
+  // canonicalizes the stored value via the same helper). Keeps a request internally consistent.
+  const canonicalLanguage = normalizeResponseLanguage(responseInput.language);
   const txResponse = await prisma.$transaction<Result<Response, ApiErrorResponseV2>>(async (tx) => {
-    const responseResult = await createResponse(environmentId, responseInput, tx);
+    const responseResult = await createResponse(workspaceId, responseInput, tx);
     if (!responseResult.ok) {
       return responseResult;
     }
@@ -170,8 +195,10 @@ export const createResponseWithQuotaEvaluation = async (
       responseId: response.id,
       data: responseInput.data,
       variables: responseInput.variables,
-      language: responseInput.language || "default",
+      language: canonicalLanguage || "default",
       responseFinished: response.finished,
+      // The row just written, so `reserved` quota operands resolve (ENG-1840).
+      response,
       tx,
     });
 

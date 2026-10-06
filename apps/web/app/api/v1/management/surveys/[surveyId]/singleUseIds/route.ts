@@ -1,10 +1,11 @@
 import { handleErrorResponse } from "@/app/api/v1/auth";
 import { responses } from "@/app/lib/api/response";
 import { THandlerParams, withV1ApiWrapper } from "@/app/lib/api/with-api-logging";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
 import { getPublicDomain } from "@/lib/getPublicUrl";
 import { getSurvey } from "@/lib/survey/service";
-import { generateSurveySingleUseIds } from "@/lib/utils/single-use-surveys";
-import { hasPermission } from "@/modules/organization/settings/api-keys/lib/utils";
+import { generateSurveySingleUseLinkParamsList } from "@/lib/utils/single-use-surveys";
 
 export const GET = withV1ApiWrapper({
   handler: async ({
@@ -24,7 +25,18 @@ export const GET = withV1ApiWrapper({
           response: responses.notFoundResponse("Survey", params.surveyId),
         };
       }
-      if (!hasPermission(authentication.environmentPermissions, survey.environmentId, "GET")) {
+      // Checked at write level despite being a GET: this endpoint *mints* credentials rather than
+      // reading anything. Each returned link carries a fresh HMAC-signed suId/suToken pair that the
+      // unauthenticated POST /api/v1/client/{workspaceId}/responses accepts, so at "read" a
+      // reporting-only key — the level you would hand an external analyst or BI tool — could generate
+      // thousands of valid submission links and inject responses with them.
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("POST"),
+          { type: "workspace", id: survey.workspaceId }
+        ))
+      ) {
         return {
           response: responses.unauthorizedResponse(),
         };
@@ -56,21 +68,28 @@ export const GET = withV1ApiWrapper({
         };
       }
 
-      const singleUseIds = generateSurveySingleUseIds(limit, survey.singleUse.isEncrypted);
+      const singleUseLinkParams = generateSurveySingleUseLinkParamsList(
+        limit,
+        survey.id,
+        survey.singleUse.isEncrypted
+      );
 
       const publicDomain = getPublicDomain();
       // map single use ids to survey links
-      const surveyLinks = singleUseIds.map(
-        (singleUseId) => `${publicDomain}/s/${survey.id}?suId=${singleUseId}`
-      );
+      const surveyLinks = singleUseLinkParams.map(({ suId, suToken }) => {
+        const surveyLink = new URL(`${publicDomain}/s/${survey.id}`);
+        surveyLink.searchParams.set("suId", suId);
+        if (suToken) {
+          surveyLink.searchParams.set("suToken", suToken);
+        }
+        return surveyLink.toString();
+      });
 
       return {
         response: responses.successResponse(surveyLinks),
       };
     } catch (error) {
-      return {
-        response: handleErrorResponse(error),
-      };
+      return handleErrorResponse(error);
     }
   },
 });

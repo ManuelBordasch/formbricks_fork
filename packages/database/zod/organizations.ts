@@ -1,25 +1,22 @@
-import type { Organization, OrganizationBilling } from "@prisma/client";
 import { z } from "zod";
-import { extendZodWithOpenApi } from "zod-openapi";
-
-extendZodWithOpenApi(z);
+import type { Organization, OrganizationBilling } from "../src/prisma";
 
 export const ZOrganizationWhiteLabel = z.object({
   logoUrl: z.string().nullable(),
 });
 
 export const ZOrganizationBilling = z.object({
-  organizationId: z.string().cuid2(),
+  organizationId: z.cuid2(),
   stripeCustomerId: z.string().nullable(),
   limits: z
     .object({
-      projects: z.number().nullable(),
+      workspaces: z.number().nullable(),
       monthly: z.object({
         responses: z.number().nullable(),
       }),
     })
     .prefault({
-      projects: 3,
+      workspaces: 3,
       monthly: {
         responses: 1500,
       },
@@ -60,17 +57,17 @@ export const ZOrganizationBilling = z.object({
         .optional(),
     })
     .nullable()
-    .optional(),
+    .prefault(null),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date(),
 }) satisfies z.ZodType<OrganizationBilling>;
 
 export const ZOrganization = z.object({
-  id: z.string().cuid2(),
+  id: z.cuid2(),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date(),
   name: z.string(),
   whitelabel: ZOrganizationWhiteLabel,
   isAISmartToolsEnabled: z.boolean().default(false) as z.ZodType<Organization["isAISmartToolsEnabled"]>,
-  isAIDataAnalysisEnabled: z.boolean().default(false) as z.ZodType<Organization["isAIDataAnalysisEnabled"]>,
+  displayTimeZone: z.string().nullable(),
 }) satisfies z.ZodType<Organization>;

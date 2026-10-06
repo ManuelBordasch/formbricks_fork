@@ -1,11 +1,14 @@
 import { z } from "zod";
 import { sendToPipeline } from "@/app/lib/pipelines";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
+import { getWorkspaceLegacyStoragePrefixes } from "@/lib/workspace/service";
 import { formatValidationErrorsForV2Api, validateResponseData } from "@/modules/api/lib/validation";
 import { authenticatedApiClient } from "@/modules/api/v2/auth/authenticated-api-client";
 import { validateOtherOptionLengthForMultipleChoice } from "@/modules/api/v2/lib/element";
 import { responses } from "@/modules/api/v2/lib/response";
 import { handleApiError } from "@/modules/api/v2/lib/utils";
-import { getEnvironmentId } from "@/modules/api/v2/management/lib/helper";
+import { getWorkspaceId } from "@/modules/api/v2/management/lib/helper";
 import {
   deleteResponse,
   getResponse,
@@ -14,8 +17,7 @@ import {
 } from "@/modules/api/v2/management/responses/[responseId]/lib/response";
 import { getSurveyQuestions } from "@/modules/api/v2/management/responses/[responseId]/lib/survey";
 import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
-import { hasPermission } from "@/modules/organization/settings/api-keys/lib/utils";
-import { resolveStorageUrlsInObject, validateFileUploads } from "@/modules/storage/utils";
+import { resolveStorageUrlsInObject, validateClientFileUploads } from "@/modules/storage/utils";
 import { ZResponseIdSchema, ZResponseUpdateSchema } from "./types/responses";
 
 export const GET = async (request: Request, props: { params: Promise<{ responseId: string }> }) =>
@@ -35,12 +37,18 @@ export const GET = async (request: Request, props: { params: Promise<{ responseI
         });
       }
 
-      const environmentIdResult = await getEnvironmentId(params.responseId, true);
-      if (!environmentIdResult.ok) {
-        return handleApiError(request, environmentIdResult.error);
+      const workspaceIdResult = await getWorkspaceId(params.responseId, true);
+      if (!workspaceIdResult.ok) {
+        return handleApiError(request, workspaceIdResult.error);
       }
 
-      if (!hasPermission(authentication.environmentPermissions, environmentIdResult.data, "GET")) {
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("GET"),
+          { type: "workspace", id: workspaceIdResult.data.workspaceId }
+        ))
+      ) {
         return handleApiError(request, {
           type: "unauthorized",
         });
@@ -83,12 +91,18 @@ export const DELETE = async (request: Request, props: { params: Promise<{ respon
         );
       }
 
-      const environmentIdResult = await getEnvironmentId(params.responseId, true);
-      if (!environmentIdResult.ok) {
-        return handleApiError(request, environmentIdResult.error, auditLog);
+      const workspaceIdResult = await getWorkspaceId(params.responseId, true);
+      if (!workspaceIdResult.ok) {
+        return handleApiError(request, workspaceIdResult.error, auditLog);
       }
 
-      if (!hasPermission(authentication.environmentPermissions, environmentIdResult.data, "DELETE")) {
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("DELETE"),
+          { type: "workspace", id: workspaceIdResult.data.workspaceId }
+        ))
+      ) {
         return handleApiError(
           request,
           {
@@ -136,12 +150,18 @@ export const PUT = (request: Request, props: { params: Promise<{ responseId: str
         );
       }
 
-      const environmentIdResult = await getEnvironmentId(params.responseId, true);
-      if (!environmentIdResult.ok) {
-        return handleApiError(request, environmentIdResult.error, auditLog);
+      const workspaceIdResult = await getWorkspaceId(params.responseId, true);
+      if (!workspaceIdResult.ok) {
+        return handleApiError(request, workspaceIdResult.error, auditLog);
       }
 
-      if (!hasPermission(authentication.environmentPermissions, environmentIdResult.data, "PUT")) {
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("PUT"),
+          { type: "workspace", id: workspaceIdResult.data.workspaceId }
+        ))
+      ) {
         return handleApiError(
           request,
           {
@@ -163,12 +183,31 @@ export const PUT = (request: Request, props: { params: Promise<{ responseId: str
         return handleApiError(request, questionsResponse.error as ApiErrorResponseV2, auditLog);
       }
 
-      if (!validateFileUploads(body.data, questionsResponse.data.questions)) {
+      if (
+        !validateClientFileUploads({
+          data: body.data,
+          workspaceId: workspaceIdResult.data.workspaceId,
+          surveyId: existingResponse.data.surveyId,
+          blocks: questionsResponse.data.blocks,
+          questions: questionsResponse.data.questions,
+          // Management callers replay stored responses whose file URLs may predate the scoped shape;
+          // accept those against a prefix this workspace owns (ENG-1981 review).
+          legacyOwnedStoragePrefixes: await getWorkspaceLegacyStoragePrefixes(
+            workspaceIdResult.data.workspaceId
+          ),
+        })
+      ) {
         return handleApiError(
           request,
           {
             type: "bad_request",
-            details: [{ field: "response", issue: "Invalid file upload response" }],
+            details: [
+              {
+                field: "response",
+                issue:
+                  "Invalid file upload response: each file URL must reference a file uploaded to this survey's file-upload element",
+              },
+            ],
           },
           auditLog
         );
@@ -224,17 +263,17 @@ export const PUT = (request: Request, props: { params: Promise<{ responseId: str
       // Fetch updated response with relations for pipeline
       const updatedResponseForPipeline = await getResponseForPipeline(params.responseId);
       if (updatedResponseForPipeline.ok) {
-        sendToPipeline({
+        await sendToPipeline({
           event: "responseUpdated",
-          environmentId: environmentIdResult.data,
+          workspaceId: workspaceIdResult.data.workspaceId,
           surveyId: existingResponse.data.surveyId,
           response: updatedResponseForPipeline.data,
         });
 
         if (response.data.finished) {
-          sendToPipeline({
+          await sendToPipeline({
             event: "responseFinished",
-            environmentId: environmentIdResult.data,
+            workspaceId: workspaceIdResult.data.workspaceId,
             surveyId: existingResponse.data.surveyId,
             response: updatedResponseForPipeline.data,
           });

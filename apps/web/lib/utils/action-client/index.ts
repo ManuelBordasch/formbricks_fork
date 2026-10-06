@@ -1,13 +1,13 @@
 import * as Sentry from "@sentry/nextjs";
-import { getServerSession } from "next-auth";
 import { DEFAULT_SERVER_ERROR_MESSAGE, createSafeActionClient } from "next-safe-action";
 import { v4 as uuidv4 } from "uuid";
 import { logger } from "@formbricks/logger";
 import { AuthenticationError, AuthorizationError, isExpectedError } from "@formbricks/types/errors";
+import { withAuthorizationSurface } from "@/lib/authorization/context";
 import { AUDIT_LOG_ENABLED, AUDIT_LOG_GET_USER_IP } from "@/lib/constants";
 import { getUser } from "@/lib/user/service";
 import { getClientIpFromHeaders } from "@/lib/utils/client-ip";
-import { authOptions } from "@/modules/auth/lib/authOptions";
+import { getSession } from "@/modules/auth/lib/session";
 import { UNKNOWN_DATA } from "@/modules/ee/audit-logs/types/audit-log";
 import { ActionClientCtx } from "./types/context";
 
@@ -26,7 +26,6 @@ export const actionClient = createSafeActionClient({
       },
     });
 
-    // eslint-disable-next-line no-console -- This error needs to be logged for debugging server-side errors
     logger.withContext({ eventId }).error(e, "SERVER ERROR");
     return DEFAULT_SERVER_ERROR_MESSAGE;
   },
@@ -49,7 +48,7 @@ export const actionClient = createSafeActionClient({
 });
 
 export const authenticatedActionClient = actionClient.use(async ({ ctx, next }) => {
-  const session = await getServerSession(authOptions);
+  const session = await getSession();
   if (!session?.user) {
     throw new AuthenticationError("Not authenticated");
   }
@@ -61,5 +60,5 @@ export const authenticatedActionClient = actionClient.use(async ({ ctx, next }) 
     throw new AuthorizationError("User not found");
   }
 
-  return next({ ctx: { ...ctx, user } });
+  return withAuthorizationSurface("server_action", () => next({ ctx: { ...ctx, user } }));
 });

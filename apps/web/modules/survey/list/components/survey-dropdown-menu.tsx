@@ -1,11 +1,16 @@
 "use client";
 
+import { useQueryClient } from "@tanstack/react-query";
+import type { TFunction } from "i18next";
 import {
-  ArrowUpFromLineIcon,
+  ArchiveIcon,
+  ArchiveRestoreIcon,
+  ArrowRightLeftIcon,
   CopyIcon,
   EyeIcon,
   LinkIcon,
   MoreVertical,
+  PencilIcon,
   SquarePenIcon,
   TrashIcon,
 } from "lucide-react";
@@ -15,71 +20,158 @@ import { useMemo, useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { logger } from "@formbricks/logger";
+import type { TSurveyStatus } from "@formbricks/types/surveys/types";
+import { useWorkspace } from "@/app/(app)/workspaces/[workspaceId]/context/workspace-context";
 import { cn } from "@/lib/cn";
 import { getFormattedErrorMessage } from "@/lib/utils/helper";
+import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
 import { EditPublicSurveyAlertDialog } from "@/modules/survey/components/edit-public-survey-alert-dialog";
 import { copySurveyLink } from "@/modules/survey/lib/client-utils";
-import {
-  copySurveyToOtherEnvironmentAction,
-  deleteSurveyAction,
-  getSurveyAction,
-} from "@/modules/survey/list/actions";
-import { TSurvey } from "@/modules/survey/list/types/surveys";
+import { copySurveyToOtherWorkspaceAction } from "@/modules/survey/list/actions";
+import { CopySurveyModal } from "@/modules/survey/list/components/copy-survey-modal";
+import { RenameSurveyModal } from "@/modules/survey/list/components/rename-survey-modal";
+import { surveyKeys } from "@/modules/survey/list/lib/query";
+import { TSurveyListItem } from "@/modules/survey/list/types/survey-overview";
+import { ConfirmationModal } from "@/modules/ui/components/confirmation-modal";
 import { DeleteDialog } from "@/modules/ui/components/delete-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/modules/ui/components/dropdown-menu";
-import { CopySurveyModal } from "./copy-survey-modal";
+import { SurveyStatusIndicator } from "@/modules/ui/components/survey-status-indicator";
 
 interface SurveyDropDownMenuProps {
-  environmentId: string;
-  survey: TSurvey;
+  survey: TSurveyListItem;
   publicDomain: string;
   disabled?: boolean;
   isSurveyCreationDeletionDisabled?: boolean;
-  deleteSurvey: (surveyId: string) => void;
-  onSurveysCopied?: () => void;
+  isReadOnly: boolean;
+  deleteSurvey: (surveyId: string) => Promise<void>;
+  updateSurveyStatus: (surveyId: string, status: TSurveyStatus) => Promise<void>;
+  archiveSurvey: (surveyId: string) => Promise<void>;
+  restoreSurvey: (surveyId: string) => Promise<void>;
+  renameSurvey: (surveyId: string, name: string) => Promise<void>;
 }
 
+// Non-draft statuses that can be targeted by a status change from the list.
+const CHANGEABLE_STATUSES: TSurveyStatus[] = ["inProgress", "paused", "completed"];
+
 export const SurveyDropDownMenu = ({
-  environmentId,
   survey,
   publicDomain,
   disabled,
   isSurveyCreationDeletionDisabled,
+  isReadOnly,
   deleteSurvey,
-  onSurveysCopied,
-}: SurveyDropDownMenuProps) => {
+  updateSurveyStatus,
+  archiveSurvey,
+  restoreSurvey,
+  renameSurvey,
+}: Readonly<SurveyDropDownMenuProps>) => {
+  const { workspace } = useWorkspace();
+
   const { t } = useTranslation();
   const [isDeleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [isArchiveDialogOpen, setArchiveDialogOpen] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [isArchiving, setIsArchiving] = useState(false);
+  const [isDuplicating, setIsDuplicating] = useState(false);
   const [isDropDownOpen, setIsDropDownOpen] = useState(false);
-  const [isCopyFormOpen, setIsCopyFormOpen] = useState(false);
   const [isCautionDialogOpen, setIsCautionDialogOpen] = useState(false);
-
+  const [isCopyModalOpen, setIsCopyModalOpen] = useState(false);
+  const [isRenameModalOpen, setIsRenameModalOpen] = useState(false);
   const router = useRouter();
+  const queryClient = useQueryClient();
 
-  const surveyLink = useMemo(() => publicDomain + "/s/" + survey.id, [survey.id, publicDomain]);
+  const editHref = `/workspaces/${workspace?.id}/surveys/${survey.id}/edit`;
+
+  const surveyLink = useMemo(() => `${publicDomain}/s/${survey.id}`, [publicDomain, survey.id]);
   const isSingleUseEnabled = survey.singleUse?.enabled ?? false;
+  const isArchived = survey.archivedAt !== null;
+  const canManageSurvey = !isSurveyCreationDeletionDisabled;
+  const canPreviewOrCopyLink = !isArchived && survey.type === "link" && survey.status !== "draft";
+  // Show the status submenu for non-draft surveys when the user has write access.
+  const canChangeStatus = !isArchived && !isReadOnly && survey.status !== "draft";
+  const isInProgress = survey.status === "inProgress";
+  const hasVisibleActions = isArchived
+    ? canManageSurvey
+    : canManageSurvey || canPreviewOrCopyLink || canChangeStatus;
+
+  const getStatusLabel = (t: TFunction, status: TSurveyStatus): string => {
+    switch (status) {
+      case "inProgress":
+        return t("common.in_progress");
+      case "paused":
+        return t("common.paused");
+      case "completed":
+        return t("common.completed");
+      case "draft":
+        return t("common.draft");
+      default:
+        return "";
+    }
+  };
+
+  const handleStatusChange = async (status: TSurveyStatus) => {
+    setIsDropDownOpen(false);
+    const toastId = toast.loading(t("workspace.surveys.status_updating"));
+    try {
+      await updateSurveyStatus(survey.id, status);
+      toast.success(t("workspace.surveys.status_updated_successfully"), { id: toastId });
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("workspace.surveys.error_updating_status")), {
+        id: toastId,
+      });
+    }
+  };
 
   const handleDeleteSurvey = async (surveyId: string) => {
     setLoading(true);
+
     try {
-      const result = await deleteSurveyAction({ surveyId });
-      if (result?.serverError) {
-        toast.error(getFormattedErrorMessage(result));
-        return;
-      }
-      deleteSurvey(surveyId);
-      toast.success(t("environments.surveys.survey_deleted_successfully"));
+      await deleteSurvey(surveyId);
+      toast.success(t("workspace.surveys.survey_deleted_successfully"));
     } catch (error) {
-      toast.error(t("environments.surveys.error_deleting_survey"));
+      toast.error(getV3ApiErrorMessage(error, t("workspace.surveys.error_deleting_survey")));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleArchiveSurvey = async () => {
+    setIsArchiving(true);
+    const toastId = toast.loading(t("workspace.surveys.archiving_survey"));
+    try {
+      await archiveSurvey(survey.id);
+      toast.success(t("workspace.surveys.survey_archived_successfully"), { id: toastId });
+      setArchiveDialogOpen(false);
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("workspace.surveys.error_archiving_survey")), {
+        id: toastId,
+      });
+    } finally {
+      setIsArchiving(false);
+    }
+  };
+
+  const handleRestoreSurvey = async () => {
+    setIsDropDownOpen(false);
+    const toastId = toast.loading(t("workspace.surveys.restoring_survey"));
+    try {
+      await restoreSurvey(survey.id);
+      toast.success(t("workspace.surveys.survey_restored_successfully"), { id: toastId });
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("workspace.surveys.error_restoring_survey")), {
+        id: toastId,
+      });
     }
   };
 
@@ -87,40 +179,12 @@ export const SurveyDropDownMenu = ({
     try {
       e.preventDefault();
       setIsDropDownOpen(false);
-      // For single-use surveys, this button is disabled, so we just copy the base link
-      const copiedLink = copySurveyLink(surveyLink);
-      navigator.clipboard.writeText(copiedLink);
+      await navigator.clipboard.writeText(copySurveyLink(surveyLink));
       toast.success(t("common.copied_to_clipboard"));
     } catch (error) {
       logger.error(error);
-      toast.error(t("environments.surveys.summary.failed_to_copy_link"));
+      toast.error(t("common.something_went_wrong_please_try_again"));
     }
-  };
-
-  const duplicateSurveyAndRefresh = async (surveyId: string) => {
-    setLoading(true);
-    try {
-      const duplicatedSurveyResponse = await copySurveyToOtherEnvironmentAction({
-        surveyId,
-        targetEnvironmentId: environmentId,
-      });
-
-      if (duplicatedSurveyResponse?.data) {
-        const transformedDuplicatedSurvey = await getSurveyAction({
-          surveyId: duplicatedSurveyResponse.data.id,
-        });
-        if (transformedDuplicatedSurvey?.data) {
-          onSurveysCopied?.();
-        }
-        toast.success(t("environments.surveys.survey_duplicated_successfully"));
-      } else {
-        const errorMessage = getFormattedErrorMessage(duplicatedSurveyResponse);
-        toast.error(errorMessage);
-      }
-    } catch (error) {
-      toast.error(t("environments.surveys.survey_duplication_error"));
-    }
-    setLoading(false);
   };
 
   const handleEditforActiveSurvey = (e: React.MouseEvent) => {
@@ -129,103 +193,197 @@ export const SurveyDropDownMenu = ({
     setIsCautionDialogOpen(true);
   };
 
+  const handleDuplicateSurvey = async () => {
+    if (!workspace?.id) return;
+    setIsDuplicating(true);
+    setIsDropDownOpen(false);
+    try {
+      const response = await copySurveyToOtherWorkspaceAction({
+        surveyId: survey.id,
+        targetWorkspaceId: workspace.id,
+      });
+      if (response?.data) {
+        toast.success(t("workspace.surveys.survey_duplicated_successfully"));
+        await queryClient.invalidateQueries({ queryKey: surveyKeys.lists() });
+        return;
+      }
+      toast.error(getFormattedErrorMessage(response));
+    } catch (error) {
+      logger.error(error);
+      toast.error(t("common.something_went_wrong_please_try_again"));
+    } finally {
+      setIsDuplicating(false);
+    }
+  };
+
+  if (!hasVisibleActions) {
+    return null;
+  }
+
   return (
     <div
       id={`${survey.name.toLowerCase().split(" ").join("-")}-survey-actions`}
       data-testid="survey-dropdown-menu">
       <DropdownMenu open={isDropDownOpen} onOpenChange={setIsDropDownOpen}>
         <DropdownMenuTrigger className="z-10" asChild disabled={disabled}>
-          <div
+          <button
+            type="button"
+            data-testid="survey-dropdown-trigger"
+            aria-label={t("workspace.surveys.open_options")}
             className={cn(
               "rounded-lg border bg-white p-2",
               disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer hover:bg-slate-50"
             )}>
-            <span className="sr-only">{t("environments.surveys.open_options")}</span>
-            <MoreVertical className="h-4 w-4" aria-hidden="true" />
-          </div>
+            <span className="sr-only">{t("workspace.surveys.open_options")}</span>
+            <MoreVertical className="size-4" aria-hidden="true" />
+          </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent className="inline-block w-auto min-w-max">
           <DropdownMenuGroup>
-            {!isSurveyCreationDeletionDisabled && (
-              <>
-                <DropdownMenuItem>
-                  <Link
-                    className="flex w-full items-center"
-                    href={`/environments/${environmentId}/surveys/${survey.id}/edit`}
-                    onClick={survey.responseCount > 0 ? handleEditforActiveSurvey : undefined}>
-                    <SquarePenIcon className="mr-2 size-4" />
-                    {t("common.edit")}
-                  </Link>
-                </DropdownMenuItem>
-
-                <DropdownMenuItem>
-                  <button
-                    type="button"
-                    className="flex w-full items-center"
-                    onClick={async (e) => {
-                      e.preventDefault();
-                      setIsDropDownOpen(false);
-                      duplicateSurveyAndRefresh(survey.id);
-                    }}>
-                    <CopyIcon className="mr-2 h-4 w-4" />
-                    {t("common.duplicate")}
-                  </button>
-                </DropdownMenuItem>
-              </>
+            {isArchived && canManageSurvey && (
+              <DropdownMenuItem
+                data-testid="restore-survey"
+                icon={<ArchiveRestoreIcon className="size-4" />}
+                onSelect={(e) => {
+                  e.preventDefault();
+                  void handleRestoreSurvey();
+                }}>
+                {t("workspace.surveys.restore")}
+              </DropdownMenuItem>
             )}
-            {!isSurveyCreationDeletionDisabled && (
+            {isArchived && canManageSurvey && (
+              <DropdownMenuItem
+                data-testid="delete-survey-forever"
+                className="text-red-600 focus:text-red-600"
+                icon={<TrashIcon className="size-4" />}
+                onSelect={(e) => {
+                  e.preventDefault();
+                  setIsDropDownOpen(false);
+                  setDeleteDialogOpen(true);
+                }}>
+                {t("common.delete")}
+              </DropdownMenuItem>
+            )}
+            {!isArchived && canManageSurvey && (
+              <DropdownMenuItem>
+                <Link
+                  className="flex w-full items-center"
+                  href={editHref}
+                  onClick={survey.responseCount > 0 ? handleEditforActiveSurvey : undefined}>
+                  <SquarePenIcon className="mr-2 size-4" />
+                  {t("common.edit")}
+                </Link>
+              </DropdownMenuItem>
+            )}
+            {!isArchived && canManageSurvey && (
+              <DropdownMenuItem
+                data-testid="rename-survey"
+                icon={<PencilIcon className="size-4" />}
+                onSelect={(e) => {
+                  e.preventDefault();
+                  setIsDropDownOpen(false);
+                  setIsRenameModalOpen(true);
+                }}>
+                {t("common.rename")}
+              </DropdownMenuItem>
+            )}
+            {!isArchived && canManageSurvey && (
               <DropdownMenuItem>
                 <button
                   type="button"
-                  className="flex w-full items-center"
-                  disabled={loading}
+                  data-testid="duplicate-survey"
+                  className={cn("flex w-full items-center", isDuplicating && "cursor-not-allowed opacity-50")}
+                  disabled={isDuplicating}
                   onClick={(e) => {
                     e.preventDefault();
-                    setIsDropDownOpen(false);
-                    setIsCopyFormOpen(true);
+                    void handleDuplicateSurvey();
                   }}>
-                  <ArrowUpFromLineIcon className="mr-2 h-4 w-4" />
-                  {t("common.copy")}...
+                  <CopyIcon className="mr-2 size-4" />
+                  {t("common.duplicate")}
                 </button>
               </DropdownMenuItem>
             )}
-            {survey.type === "link" && survey.status !== "draft" && (
-              <>
-                <DropdownMenuItem>
-                  <button
-                    type="button"
-                    className={cn(
-                      "flex w-full items-center",
-                      isSingleUseEnabled && "cursor-not-allowed opacity-50"
-                    )}
-                    disabled={isSingleUseEnabled}
-                    onClick={async (e) => {
-                      e.preventDefault();
-                      setIsDropDownOpen(false);
-                      const previewUrl = surveyLink + "?preview=true";
-                      window.open(previewUrl, "_blank");
+            {canChangeStatus && (
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger data-testid="survey-status-submenu" chevronSide="left">
+                  {t("workspace.surveys.change_status")}
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent sideOffset={8}>
+                  <DropdownMenuRadioGroup
+                    value={survey.status}
+                    onValueChange={(value) => {
+                      void handleStatusChange(value as TSurveyStatus);
                     }}>
-                    <EyeIcon className="mr-2 h-4 w-4" />
-                    {t("common.preview_survey")}
-                  </button>
-                </DropdownMenuItem>
-                <DropdownMenuItem>
-                  <button
-                    type="button"
-                    data-testid="copy-link"
-                    className={cn(
-                      "flex w-full items-center",
-                      isSingleUseEnabled && "cursor-not-allowed opacity-50"
-                    )}
-                    disabled={isSingleUseEnabled}
-                    onClick={async (e) => handleCopyLink(e)}>
-                    <LinkIcon className="mr-2 h-4 w-4" />
-                    {t("common.copy_link")}
-                  </button>
-                </DropdownMenuItem>
-              </>
+                    {CHANGEABLE_STATUSES.map((status) => (
+                      <DropdownMenuRadioItem
+                        key={status}
+                        value={status}
+                        data-testid={`survey-status-option-${status}`}
+                        onSelect={(e) => {
+                          // Prevent Radix from closing the menu before we do — we close it manually
+                          // in handleStatusChange so the loading toast plays in the page chrome.
+                          e.preventDefault();
+                        }}>
+                        <span className="flex items-center gap-2">
+                          <SurveyStatusIndicator status={status} />
+                          {getStatusLabel(t, status)}
+                        </span>
+                      </DropdownMenuRadioItem>
+                    ))}
+                  </DropdownMenuRadioGroup>
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
             )}
-            {!isSurveyCreationDeletionDisabled && (
+            {!isArchived && canManageSurvey && workspace?.organizationId && (
+              <DropdownMenuItem
+                data-testid="copy-to-workspace"
+                onSelect={(e) => {
+                  e.preventDefault();
+                  setIsDropDownOpen(false);
+                  setIsCopyModalOpen(true);
+                }}>
+                <ArrowRightLeftIcon className="size-4" />
+                {t("workspace.surveys.copy_to")}
+              </DropdownMenuItem>
+            )}
+            {canPreviewOrCopyLink && (
+              <DropdownMenuItem>
+                <button
+                  type="button"
+                  className={cn(
+                    "flex w-full items-center",
+                    isSingleUseEnabled && "cursor-not-allowed opacity-50"
+                  )}
+                  disabled={isSingleUseEnabled}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    setIsDropDownOpen(false);
+                    const previewUrl = new URL(surveyLink);
+                    previewUrl.searchParams.set("preview", "true");
+                    globalThis.window.open(previewUrl.toString(), "_blank");
+                  }}>
+                  <EyeIcon className="mr-2 size-4" />
+                  {t("common.preview")}
+                </button>
+              </DropdownMenuItem>
+            )}
+            {canPreviewOrCopyLink && (
+              <DropdownMenuItem>
+                <button
+                  type="button"
+                  data-testid="copy-link"
+                  className={cn(
+                    "flex w-full items-center",
+                    isSingleUseEnabled && "cursor-not-allowed opacity-50"
+                  )}
+                  disabled={isSingleUseEnabled}
+                  onClick={handleCopyLink}>
+                  <LinkIcon className="mr-2 size-4" />
+                  {t("common.copy_link")}
+                </button>
+              </DropdownMenuItem>
+            )}
+            {!isArchived && canManageSurvey && (
               <DropdownMenuItem>
                 <button
                   type="button"
@@ -235,45 +393,92 @@ export const SurveyDropDownMenu = ({
                     setIsDropDownOpen(false);
                     setDeleteDialogOpen(true);
                   }}>
-                  <TrashIcon className="mr-2 h-4 w-4" />
+                  <TrashIcon className="mr-2 size-4" />
                   {t("common.delete")}
                 </button>
+              </DropdownMenuItem>
+            )}
+            {!isArchived && canManageSurvey && (
+              <DropdownMenuItem
+                data-testid="archive-survey"
+                className="text-red-600 focus:text-red-600"
+                icon={<ArchiveIcon className="size-4" />}
+                onSelect={(e) => {
+                  e.preventDefault();
+                  setIsDropDownOpen(false);
+                  setArchiveDialogOpen(true);
+                }}>
+                {t("workspace.surveys.archive")}
               </DropdownMenuItem>
             )}
           </DropdownMenuGroup>
         </DropdownMenuContent>
       </DropdownMenu>
 
-      {!isSurveyCreationDeletionDisabled && (
+      {canManageSurvey && (
         <DeleteDialog
           deleteWhat={t("common.survey")}
           open={isDeleteDialogOpen}
           setOpen={setDeleteDialogOpen}
           onDelete={() => handleDeleteSurvey(survey.id)}
-          text={t("environments.surveys.delete_survey_and_responses_warning")}
+          text={t("workspace.surveys.delete_survey_and_responses_warning")}
           isDeleting={loading}
         />
       )}
 
-      {survey.responseCount > 0 && (
+      {!isArchived && canManageSurvey && (
+        <ConfirmationModal
+          open={isArchiveDialogOpen}
+          setOpen={setArchiveDialogOpen}
+          title={t("workspace.surveys.archive_survey")}
+          description={
+            isInProgress
+              ? t("workspace.surveys.archive_survey_description_in_progress")
+              : t("workspace.surveys.archive_survey_description")
+          }
+          body={t("workspace.surveys.archive_survey_warning")}
+          buttonText={isInProgress ? t("workspace.surveys.stop_and_archive") : t("common.archive")}
+          buttonVariant={isInProgress ? "destructive" : "default"}
+          buttonLoading={isArchiving}
+          onConfirm={handleArchiveSurvey}
+          hideCloseButton={isInProgress}
+          closeOnOutsideClick={!isInProgress}
+        />
+      )}
+
+      {!isArchived && canManageSurvey && (
+        <RenameSurveyModal
+          open={isRenameModalOpen}
+          setOpen={setIsRenameModalOpen}
+          surveyId={survey.id}
+          surveyName={survey.name}
+          renameSurvey={renameSurvey}
+        />
+      )}
+
+      {canManageSurvey && workspace?.id && workspace.organizationId && (
+        <CopySurveyModal
+          open={isCopyModalOpen}
+          setOpen={setIsCopyModalOpen}
+          surveyId={survey.id}
+          currentWorkspaceId={workspace.id}
+          organizationId={workspace.organizationId}
+        />
+      )}
+
+      {canManageSurvey && survey.responseCount > 0 && (
         <EditPublicSurveyAlertDialog
           open={isCautionDialogOpen}
           setOpen={setIsCautionDialogOpen}
           isLoading={loading}
           primaryButtonAction={async () => {
-            await duplicateSurveyAndRefresh(survey.id);
             setIsCautionDialogOpen(false);
+            router.push(editHref);
           }}
-          primaryButtonText={t("common.duplicate")}
-          secondaryButtonAction={() =>
-            router.push(`/environments/${environmentId}/surveys/${survey.id}/edit`)
-          }
-          secondaryButtonText={t("common.edit")}
+          primaryButtonText={t("common.edit")}
+          secondaryButtonAction={() => setIsCautionDialogOpen(false)}
+          secondaryButtonText={t("common.cancel")}
         />
-      )}
-
-      {isCopyFormOpen && (
-        <CopySurveyModal open={isCopyFormOpen} setOpen={setIsCopyFormOpen} survey={survey} />
       )}
     </div>
   );

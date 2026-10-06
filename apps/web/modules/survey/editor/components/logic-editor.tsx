@@ -2,20 +2,15 @@
 
 import { ArrowRightIcon } from "lucide-react";
 import { useMemo } from "react";
-import { useTranslation } from "react-i18next";
+import { Trans, useTranslation } from "react-i18next";
 import { TSurveyBlock, TSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { getTextContent } from "@formbricks/types/surveys/validation";
 import { recallToHeadline } from "@/lib/utils/recall";
 import { LogicEditorActions } from "@/modules/survey/editor/components/logic-editor-actions";
 import { LogicEditorConditions } from "@/modules/survey/editor/components/logic-editor-conditions";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/modules/ui/components/select";
+import { getBlockDisplayName } from "@/modules/survey/editor/lib/blocks";
+import { InputCombobox } from "@/modules/ui/components/input-combo-box";
 
 interface LogicEditorProps {
   localSurvey: TSurvey;
@@ -55,7 +50,7 @@ export function LogicEditor({
       const currentBlock = blocks[i];
 
       options.push({
-        label: currentBlock.name,
+        label: getBlockDisplayName(currentBlock, i, t),
         value: currentBlock.id,
       });
     }
@@ -67,8 +62,8 @@ export function LogicEditor({
             ? getTextContent(
                 recallToHeadline(ending.headline ?? { default: "" }, localSurvey, false, "default").default ??
                   ""
-              ) || t("environments.surveys.edit.end_screen_card")
-            : ending.label || t("environments.surveys.edit.redirect_thank_you_card"),
+              ) || t("workspace.surveys.edit.end_screen_card")
+            : ending.label || t("workspace.surveys.edit.redirect_thank_you_card"),
         value: ending.id,
       });
     });
@@ -99,32 +94,33 @@ export function LogicEditor({
       {isLast ? (
         <div className="flex items-center gap-x-2">
           <div className="flex w-10 shrink-0 items-center justify-end">
-            <ArrowRightIcon className="h-4 w-4 text-slate-500" />
+            <ArrowRightIcon className="size-4 text-slate-500" />
           </div>
-          <p className="text-nowrap font-medium text-slate-900">
-            {t("environments.surveys.edit.all_other_answers_will_continue_to")}
-          </p>
-          <Select
-            autoComplete="true"
-            defaultValue={blockLogicFallback || "defaultSelection"}
-            onValueChange={(val) => {
-              updateBlockLogicFallback(blockIdx, val === "defaultSelection" ? undefined : val);
-            }}>
-            <SelectTrigger className="w-auto bg-white">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem key="fallback_default_selection" value={"defaultSelection"}>
-                {t("environments.surveys.edit.next_block")}
-              </SelectItem>
-
-              {fallbackOptions.map((option) => (
-                <SelectItem key={`fallback_${option.value}`} value={option.value}>
-                  {option.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <div className="inline-flex items-center gap-x-2 font-medium text-nowrap text-slate-900">
+            <Trans
+              i18nKey="workspace.surveys.edit.all_other_answers_will_continue_to_fallback"
+              components={{
+                fallbackSelect: (
+                  <InputCombobox
+                    id={`logic-${logicIdx}-fallback`}
+                    showSearch={true}
+                    options={[
+                      { label: t("workspace.surveys.edit.next_block"), value: "defaultSelection" },
+                      ...fallbackOptions,
+                    ]}
+                    value={blockLogicFallback ?? "defaultSelection"}
+                    onChangeValue={(val) => {
+                      updateBlockLogicFallback(
+                        blockIdx,
+                        val === "defaultSelection" ? undefined : String(val)
+                      );
+                    }}
+                    comboboxClasses="w-fit min-w-40 bg-white"
+                  />
+                ),
+              }}
+            />
+          </div>
         </div>
       ) : null}
     </div>

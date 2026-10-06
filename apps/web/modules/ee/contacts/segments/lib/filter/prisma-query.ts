@@ -1,6 +1,6 @@
-import { Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { logger } from "@formbricks/logger";
 import { err, ok } from "@formbricks/types/error-handlers";
 import {
@@ -14,11 +14,13 @@ import {
   TSegmentFilterValue,
   TSegmentPersonFilter,
   TSegmentSegmentFilter,
+  TSegmentSurveyInteractionFilter,
   ZRelativeDateValue,
 } from "@formbricks/types/segment";
 import { isResourceFilter } from "@/modules/ee/contacts/segments/lib/utils";
 import { endOfDay, startOfDay, subtractTimeUnit } from "../date-utils";
 import { getSegment } from "../segments";
+import { SURVEY_INTERACTION_SEMANTICS, getSurveyInteractionWindowStart } from "./survey-interaction";
 
 // SQL operator mapping for number filters
 const SQL_OPERATORS: Record<string, string> = {
@@ -124,7 +126,7 @@ const buildDateAttributeFilterWhereClause = (filter: TSegmentAttributeFilter): P
  */
 const buildNumberAttributeFilterWhereClause = async (
   filter: TSegmentAttributeFilter,
-  environmentId: string
+  workspaceId: string
 ): Promise<Prisma.ContactWhereInput> => {
   const { root, qualifier, value } = filter;
   const { contactAttributeKey } = root;
@@ -164,7 +166,7 @@ const buildNumberAttributeFilterWhereClause = async (
     where: {
       attributeKey: {
         key: contactAttributeKey,
-        environmentId,
+        workspaceId,
         dataType: "number",
       },
       valueNumber: null,
@@ -183,7 +185,7 @@ const buildNumberAttributeFilterWhereClause = async (
     FROM "ContactAttribute" ca
     JOIN "ContactAttributeKey" cak ON ca."attributeKeyId" = cak.id
     WHERE cak.key = $1
-    AND cak."environmentId" = $4
+    AND cak."workspaceId" = $4
     AND cak."dataType" = 'number'
     AND ca."valueNumber" IS NULL
     AND ca.value ~ $3
@@ -192,7 +194,7 @@ const buildNumberAttributeFilterWhereClause = async (
     contactAttributeKey,
     numericValue,
     NUMBER_PATTERN_SQL,
-    environmentId
+    workspaceId
   );
 
   if (unmigratedMatchingIds.length === 0) {
@@ -211,7 +213,7 @@ const buildNumberAttributeFilterWhereClause = async (
  */
 const buildAttributeFilterWhereClause = async (
   filter: TSegmentAttributeFilter,
-  environmentId: string
+  workspaceId: string
 ): Promise<Prisma.ContactWhereInput> => {
   const { root, qualifier, value } = filter;
   const { contactAttributeKey } = root;
@@ -258,7 +260,7 @@ const buildAttributeFilterWhereClause = async (
 
   // Handle number operators
   if (["greaterThan", "greaterEqual", "lessThan", "lessEqual"].includes(operator)) {
-    return await buildNumberAttributeFilterWhereClause(filter, environmentId);
+    return await buildNumberAttributeFilterWhereClause(filter, workspaceId);
   }
 
   // For string operators, ensure value is a primitive (not an object or array)
@@ -297,7 +299,7 @@ const buildAttributeFilterWhereClause = async (
  */
 const buildPersonFilterWhereClause = async (
   filter: TSegmentPersonFilter,
-  environmentId: string
+  workspaceId: string
 ): Promise<Prisma.ContactWhereInput> => {
   const { personIdentifier } = filter.root;
 
@@ -309,7 +311,7 @@ const buildPersonFilterWhereClause = async (
         contactAttributeKey: personIdentifier,
       },
     };
-    return await buildAttributeFilterWhereClause(personFilter, environmentId);
+    return await buildAttributeFilterWhereClause(personFilter, workspaceId);
   }
 
   return {};
@@ -353,12 +355,41 @@ const buildDeviceFilterWhereClause = (
 };
 
 /**
+ * Builds a Prisma where clause from a survey interaction filter.
+ * "seen" maps to Display rows, "started responding to" maps to Response rows (any),
+ * "completed" maps to Response rows with finished=true. Negative operators wrap the
+ * positive clause in NOT, meaning "no matching interaction within the window".
+ * "any" scope omits the surveyId condition; "specific" scope constrains to the chosen ids.
+ *
+ * Operator semantics and the window boundary come from the shared spec in `survey-interaction.ts`,
+ * which the in-memory evaluator (contact-sync hot path) also uses — keeping the two paths identical.
+ */
+const buildSurveyInteractionFilterWhereClause = (
+  filter: TSegmentSurveyInteractionFilter
+): Prisma.ContactWhereInput => {
+  const { value } = filter;
+  const semantics = SURVEY_INTERACTION_SEMANTICS[filter.qualifier.operator];
+  const windowStart = getSurveyInteractionWindowStart(value, new Date());
+
+  const some = {
+    ...(value.surveyScope === "specific" ? { surveyId: { in: value.surveyIds } } : {}),
+    ...(semantics.requireFinished ? { finished: true } : {}),
+    createdAt: { gte: windowStart },
+  };
+
+  const relationClause: Prisma.ContactWhereInput =
+    semantics.source === "displays" ? { displays: { some } } : { responses: { some } };
+
+  return semantics.negate ? { NOT: relationClause } : relationClause;
+};
+
+/**
  * Builds a Prisma where clause from a segment filter
  */
 const buildSegmentFilterWhereClause = async (
   filter: TSegmentSegmentFilter,
   segmentPath: Set<string>,
-  environmentId: string,
+  workspaceId: string,
   deviceType?: "phone" | "desktop"
 ): Promise<Prisma.ContactWhereInput> => {
   const { root, qualifier } = filter;
@@ -379,10 +410,22 @@ const buildSegmentFilterWhereClause = async (
     return {};
   }
 
+  // `getSegment` looks up by id alone, and `segmentId` comes from a caller-authored filter tree. Without
+  // this check a user could nest another workspace's segment inside their own and have its filters
+  // evaluated against contacts they control — probing seeded attribute values against the resulting
+  // membership reveals the other team's targeting rules.
+  if (segment.workspaceId !== workspaceId) {
+    logger.error(
+      { segmentId, segmentWorkspaceId: segment.workspaceId, workspaceId },
+      "Refusing to resolve a segment filter referencing another workspace's segment"
+    );
+    return {};
+  }
+
   const newPath = new Set(segmentPath);
   newPath.add(segmentId);
 
-  const nestedWhereClause = await processFilters(segment.filters, newPath, environmentId, deviceType);
+  const nestedWhereClause = await processFilters(segment.filters, newPath, workspaceId, deviceType);
   const hasNestedConditions = Object.keys(nestedWhereClause).length > 0;
 
   if (qualifier.operator === "userIsIn") {
@@ -406,25 +449,27 @@ const buildSegmentFilterWhereClause = async (
 const processSingleFilter = async (
   filter: TSegmentFilter,
   segmentPath: Set<string>,
-  environmentId: string,
+  workspaceId: string,
   deviceType?: "phone" | "desktop"
 ): Promise<Prisma.ContactWhereInput> => {
   const { root } = filter;
 
   switch (root.type) {
     case "attribute":
-      return await buildAttributeFilterWhereClause(filter as TSegmentAttributeFilter, environmentId);
+      return await buildAttributeFilterWhereClause(filter as TSegmentAttributeFilter, workspaceId);
     case "person":
-      return await buildPersonFilterWhereClause(filter as TSegmentPersonFilter, environmentId);
+      return await buildPersonFilterWhereClause(filter as TSegmentPersonFilter, workspaceId);
     case "device":
       return buildDeviceFilterWhereClause(filter as TSegmentDeviceFilter, deviceType);
     case "segment":
       return await buildSegmentFilterWhereClause(
         filter as TSegmentSegmentFilter,
         segmentPath,
-        environmentId,
+        workspaceId,
         deviceType
       );
+    case "surveyInteraction":
+      return buildSurveyInteractionFilterWhereClause(filter as TSegmentSurveyInteractionFilter);
     default:
       return {};
   }
@@ -436,70 +481,78 @@ const processSingleFilter = async (
 const processFilters = async (
   filters: TBaseFilters,
   segmentPath: Set<string>,
-  environmentId: string,
+  workspaceId: string,
   deviceType?: "phone" | "desktop"
 ): Promise<Prisma.ContactWhereInput> => {
   if (filters.length === 0) return {};
 
-  const query: { AND: Prisma.ContactWhereInput[]; OR: Prisma.ContactWhereInput[] } = {
-    AND: [],
-    OR: [],
-  };
+  // AND-before-OR precedence, identical to the in-memory `combineFilterResults`: consecutive `and`
+  // connectors form one AND group, an `or` connector starts a new group, and the segment matches if
+  // ANY group matches. This produces `{ OR: [{ AND: [...] }, ...] }` rather than a flat
+  // `{ AND: [...], OR: [...] }` (which Prisma would AND together, giving `(A ∧ B) ∧ C` where the
+  // shared boolean evaluator gives `(A ∧ B) ∨ C`). Keeping both paths on the same precedence is the
+  // parity invariant survey-interaction filters rely on.
+  const andGroups: Prisma.ContactWhereInput[][] = [];
+  // `null` marks a started-but-still-empty group so an all-match-all group ("true") is not confused
+  // with "no group yet". An empty `{}` clause means match-all, which is the identity for AND, so it is
+  // dropped from its group; a group that ends up empty is therefore an unconditional match.
+  let currentGroup: Prisma.ContactWhereInput[] | null = null;
 
   for (let i = 0; i < filters.length; i++) {
     const { resource, connector } = filters[i];
-    let whereClause: Prisma.ContactWhereInput;
 
-    // Process the resource based on its type
-    if (isResourceFilter(resource)) {
-      // If it's a single filter, process it directly
-      whereClause = await processSingleFilter(resource, segmentPath, environmentId, deviceType);
-    } else {
-      // If it's a group of filters, process it recursively
-      whereClause = await processFilters(resource, segmentPath, environmentId, deviceType);
+    const whereClause = isResourceFilter(resource)
+      ? await processSingleFilter(resource, segmentPath, workspaceId, deviceType)
+      : await processFilters(resource, segmentPath, workspaceId, deviceType);
+
+    // The first filter's connector is `null` and always starts the first group; from then on an `or`
+    // connector opens a new AND group.
+    if (currentGroup === null || (i > 0 && connector === "or")) {
+      if (currentGroup !== null) andGroups.push(currentGroup);
+      currentGroup = [];
     }
 
-    if (Object.keys(whereClause).length === 0) continue;
-    if (filters.length === 1) query.AND = [whereClause];
-    else {
-      if (i === 0) {
-        if (filters[1].connector === "and") query.AND.push(whereClause);
-        else query.OR.push(whereClause);
-      } else {
-        if (connector === "and") query.AND.push(whereClause);
-        else query.OR.push(whereClause);
-      }
+    if (Object.keys(whereClause).length > 0) {
+      currentGroup.push(whereClause);
     }
   }
+  if (currentGroup !== null) andGroups.push(currentGroup);
 
-  return {
-    ...(query.AND.length > 0 ? { AND: query.AND } : {}),
-    ...(query.OR.length > 0 ? { OR: query.OR } : {}),
-  };
+  // Drop groups left empty after match-all clauses were skipped (e.g. a runtime device filter built
+  // without a deviceType, or a missing nested segment — non-constraining at build time). This mirrors
+  // the previous "skip empty clauses" behavior: an empty clause contributes nothing rather than
+  // collapsing an OR branch to match-all. Interaction filters always emit a concrete clause, so their
+  // OR-of-AND precedence is unaffected.
+  const nonEmptyGroups = andGroups.filter((group) => group.length > 0);
+
+  if (nonEmptyGroups.length === 0) return {};
+
+  // Single AND group (no `or` connectors, or a single filter): keep the historical `{ AND: [...] }`
+  // shape so pure-AND / single-filter segments are byte-identical to before — only genuinely mixed
+  // AND/OR segments change shape (from the old flat `{ AND, OR }` to correct OR-of-AND groups).
+  if (nonEmptyGroups.length === 1) return { AND: nonEmptyGroups[0] };
+
+  const groupClauses = nonEmptyGroups.map((group) => (group.length === 1 ? group[0] : { AND: group }));
+  return { OR: groupClauses };
 };
 
 /**
  * Transforms a segment filter into a Prisma query for contacts
  * @param segmentId - The segment ID being evaluated
  * @param filters - The segment filters
- * @param environmentId - The environment ID
+ * @param workspaceId - The workspace ID
  * @param deviceType - Optional device type for runtime device filter evaluation
  */
 export const segmentFilterToPrismaQuery = reactCache(
-  async (
-    segmentId: string,
-    filters: TBaseFilters,
-    environmentId: string,
-    deviceType?: "phone" | "desktop"
-  ) => {
+  async (segmentId: string, filters: TBaseFilters, workspaceId: string, deviceType?: "phone" | "desktop") => {
     try {
       const baseWhereClause = {
-        environmentId,
+        workspaceId,
       };
 
       // Initialize an empty stack for tracking the current evaluation path
       const segmentPath = new Set<string>([segmentId]);
-      const filtersWhereClause = await processFilters(filters, segmentPath, environmentId, deviceType);
+      const filtersWhereClause = await processFilters(filters, segmentPath, workspaceId, deviceType);
 
       const whereClause = {
         AND: [baseWhereClause, filtersWhereClause],
@@ -507,7 +560,7 @@ export const segmentFilterToPrismaQuery = reactCache(
 
       return ok({ whereClause });
     } catch (error) {
-      logger.error({ error, segmentId, environmentId }, "Error transforming segment filter to Prisma query");
+      logger.error({ error, segmentId, workspaceId }, "Error transforming segment filter to Prisma query");
       return err({
         type: "bad_request",
         message: "Failed to convert segment filters to Prisma query",

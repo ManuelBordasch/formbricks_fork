@@ -1,5 +1,9 @@
 import DOMPurify from "isomorphic-dompurify";
 
+// Sanitization that has to stay identical between the SDK bundle and the React
+// components lives in survey-ui; re-exported here so callers keep one import.
+export { sanitizeSurveyHtml } from "@formbricks/survey-ui";
+
 /**
  * Strip inline style attributes from HTML string to avoid CSP violations
  * Uses DOMPurify for secure, proper HTML parsing instead of regex
@@ -48,5 +52,22 @@ export const isValidHTML = (str: string): boolean => {
     return Array.from(doc.body.childNodes).some((node) => node.nodeType === 1);
   } catch {
     return false;
+  }
+};
+
+/**
+ * Extracts readable plain text from a possibly-HTML string, e.g. for an aria-label
+ * where raw markup would otherwise leak into the accessible name.
+ * @param value - The string (plain or HTML) to flatten
+ * @returns The text content; falls back to the original value outside the browser or on error
+ */
+export const htmlToPlainText = (value: string): string => {
+  // DOMParser is unavailable outside the browser (e.g. SSR); return the raw value there.
+  if (!value || !("DOMParser" in globalThis)) return value;
+
+  try {
+    return new DOMParser().parseFromString(value, "text/html").body.textContent?.trim() ?? value;
+  } catch {
+    return value;
   }
 };

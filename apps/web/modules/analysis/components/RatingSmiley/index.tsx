@@ -6,6 +6,8 @@ interface RatingSmileyProps {
   range: number;
   addColors?: boolean;
   baseUrl?: string;
+  size?: number;
+  centered?: boolean;
 }
 
 const getSmileyColor = (range: number, idx: number) => {
@@ -24,15 +26,28 @@ const getSmileyColor = (range: number, idx: number) => {
   }
 };
 
+interface GetSmileyParams {
+  iconIdx: number;
+  idx: number;
+  range: number;
+  active: boolean;
+  addColors: boolean;
+  baseUrl?: string;
+  size?: number;
+  centered?: boolean;
+}
+
 // Helper function to get smiley image URL based on index and range
-const getSmiley = (
-  iconIdx: number,
-  idx: number,
-  range: number,
-  active: boolean,
-  addColors: boolean,
-  baseUrl?: string
-): JSX.Element => {
+const getSmiley = ({
+  iconIdx,
+  idx,
+  range,
+  active,
+  addColors,
+  baseUrl,
+  size = 24,
+  centered = false,
+}: GetSmileyParams): JSX.Element => {
   const activeColor = "bg-rating-fill";
   const inactiveColor = addColors ? getSmileyColor(range, idx) : "bg-fill-none";
 
@@ -49,7 +64,10 @@ const getSmiley = (
     "grinning-squinting",
   ];
 
+  const containerSize = size * 2;
+
   const icon = (
+    // eslint-disable-next-line @next/next/no-img-element -- static smiley assets served from public/, no next/image optimization needed
     <img
       data-testid={faceIcons[iconIdx]}
       src={
@@ -58,21 +76,26 @@ const getSmiley = (
           : `/smiley-icons/${faceIcons[iconIdx]}-face.png`
       }
       alt={faceIcons[iconIdx]}
-      width={24}
-      height={24}
+      width={size}
+      height={size}
       className={`${active ? activeColor : inactiveColor} rounded-full`}
     />
   );
 
   return (
-    <table style={{ width: "48px", height: "48px" }}>
-      {" "}
-      {/* NOSONAR S5256 - Need table layout for email compatibility (gmail) */}
-      <tr>
-        <td align="center" valign="middle">
-          {icon}
-        </td>
-      </tr>
+    <table // NOSONAR S5256 - Need table layout for email compatibility (gmail)
+      style={{
+        width: `${containerSize}px`,
+        height: `${containerSize}px`,
+        ...(centered ? { marginLeft: "auto", marginRight: "auto" } : {}),
+      }}>
+      <tbody>
+        <tr>
+          <td align="center" valign="middle">
+            {icon}
+          </td>
+        </tr>
+      </tbody>
     </table>
   );
 };
@@ -83,6 +106,8 @@ export const RatingSmiley = ({
   range,
   addColors = false,
   baseUrl,
+  size,
+  centered = false,
 }: RatingSmileyProps): JSX.Element => {
   let iconsIdx: number[] = [];
   if (range === 10) iconsIdx = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -92,5 +117,5 @@ export const RatingSmiley = ({
   else if (range === 4) iconsIdx = [4, 5, 6, 7];
   else if (range === 3) iconsIdx = [4, 5, 7];
 
-  return getSmiley(iconsIdx[idx], idx, range, active, addColors, baseUrl);
+  return getSmiley({ iconIdx: iconsIdx[idx], idx, range, active, addColors, baseUrl, size, centered });
 };

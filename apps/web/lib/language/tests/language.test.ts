@@ -3,15 +3,20 @@ import {
   mockLanguageId,
   mockLanguageInput,
   mockLanguageUpdate,
-  mockProjectId,
   mockUpdatedLanguage,
+  mockWorkspaceId,
 } from "./__mocks__/data.mock";
-import { Prisma } from "@prisma/client";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
-import { DatabaseError, ValidationError } from "@formbricks/types/errors";
-import { TProject } from "@formbricks/types/project";
-import { getProject } from "@/lib/project/service";
+import { Prisma } from "@formbricks/database/prisma";
+import {
+  DatabaseError,
+  OperationNotAllowedError,
+  ResourceNotFoundError,
+  ValidationError,
+} from "@formbricks/types/errors";
+import { TWorkspace } from "@formbricks/types/workspace";
+import { getWorkspace } from "@/lib/workspace/service";
 import { createLanguage, deleteLanguage, updateLanguage } from "../service";
 
 vi.mock("@formbricks/database", () => ({
@@ -24,18 +29,19 @@ vi.mock("@formbricks/database", () => ({
   },
 }));
 
-// stub out project/service and caches
-vi.mock("@/lib/project/service", () => ({
-  getProject: vi.fn(),
+// stub out workspace/service and caches
+vi.mock("@/lib/workspace/service", () => ({
+  getWorkspace: vi.fn(),
 }));
 
-const fakeProject = {
-  id: mockProjectId,
-  environments: [{ id: "env1" }, { id: "env2" }],
-} as TProject;
+const fakeWorkspace = {
+  id: mockWorkspaceId,
+  languages: [],
+  config: {},
+} as unknown as TWorkspace;
 
 const testInputValidation = async (
-  service: (projectId: string, ...functionArgs: any[]) => Promise<any>,
+  service: (workspaceId: string, ...functionArgs: any[]) => Promise<any>,
   ...args: [string, ...any[]]
 ): Promise<void> => {
   test("throws ValidationError on bad input", async () => {
@@ -45,17 +51,41 @@ const testInputValidation = async (
 
 describe("createLanguage", () => {
   beforeEach(() => {
-    vi.mocked(getProject).mockResolvedValue(fakeProject);
+    vi.mocked(getWorkspace).mockResolvedValue(fakeWorkspace);
   });
 
   test("happy path creates a new Language", async () => {
     vi.mocked(prisma.language.create).mockResolvedValue(mockLanguage);
-    const result = await createLanguage(mockProjectId, mockLanguageInput);
+    const result = await createLanguage(mockWorkspaceId, mockLanguageInput);
     expect(result).toEqual(mockLanguage);
+  });
+
+  test("stores the canonical BCP-47 tag, normalizing a legacy code", async () => {
+    vi.mocked(prisma.language.create).mockResolvedValue(mockLanguage);
+    await createLanguage(mockWorkspaceId, { code: "de", alias: null });
+    expect(prisma.language.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ code: "de-DE" }) })
+    );
   });
 
   describe("sad path", () => {
     testInputValidation(createLanguage, "bad-id", {});
+
+    test("throws ValidationError on a malformed/unparseable code", async () => {
+      await expect(createLanguage(mockWorkspaceId, { code: "not a language", alias: null })).rejects.toThrow(
+        ValidationError
+      );
+      expect(prisma.language.create).not.toHaveBeenCalled();
+    });
+
+    test("throws ValidationError for a valid code outside the curated catalog (CLDR-only fallback)", async () => {
+      // `nso` normalizes to `nso-ZA` via the CLDR fallback, but that isn't in CANONICAL_LANGUAGE_CODES —
+      // accepting it would let stored rows drift from the catalog the app supports.
+      await expect(createLanguage(mockWorkspaceId, { code: "nso", alias: null })).rejects.toThrow(
+        ValidationError
+      );
+      expect(prisma.language.create).not.toHaveBeenCalled();
+    });
 
     test("throws DatabaseError when PrismaKnownRequestError", async () => {
       const err = new Prisma.PrismaClientKnownRequestError("dup", {
@@ -63,14 +93,14 @@ describe("createLanguage", () => {
         clientVersion: "1",
       });
       vi.mocked(prisma.language.create).mockRejectedValue(err);
-      await expect(createLanguage(mockProjectId, mockLanguageInput)).rejects.toThrow(DatabaseError);
+      await expect(createLanguage(mockWorkspaceId, mockLanguageInput)).rejects.toThrow(DatabaseError);
     });
   });
 });
 
 describe("updateLanguage", () => {
   beforeEach(() => {
-    vi.mocked(getProject).mockResolvedValue(fakeProject);
+    vi.mocked(getWorkspace).mockResolvedValue(fakeWorkspace);
   });
 
   test("happy path updates a language", async () => {
@@ -83,8 +113,26 @@ describe("updateLanguage", () => {
       ],
     };
     vi.mocked(prisma.language.update).mockResolvedValue(mockUpdatedLanguageWithSurveyLanguage);
-    const result = await updateLanguage(mockProjectId, mockLanguageId, mockLanguageUpdate);
+    const result = await updateLanguage(mockWorkspaceId, mockLanguageId, mockLanguageUpdate);
     expect(result).toEqual(mockUpdatedLanguage);
+  });
+
+  test("never writes `code` — only alias is mutable (invariant regardless of caller)", async () => {
+    const mockUpdatedLanguageWithSurveyLanguage = {
+      ...mockUpdatedLanguage,
+      surveyLanguages: [{ id: "surveyLanguageId" }],
+    };
+    vi.mocked(prisma.language.update).mockResolvedValue(mockUpdatedLanguageWithSurveyLanguage);
+    // Sneak a `code` into the runtime object (its declared type is alias-only) — it must be ignored so
+    // Language.code can't drift to an arbitrary, non-canonical value on update.
+    await updateLanguage(mockWorkspaceId, mockLanguageId, {
+      code: "anything-non-canonical",
+      alias: "New alias",
+    } as unknown as typeof mockLanguageUpdate);
+
+    const updateArg = vi.mocked(prisma.language.update).mock.calls[0][0];
+    expect(updateArg.data).toEqual({ alias: "New alias", updatedAt: expect.any(Date) });
+    expect(updateArg.data).not.toHaveProperty("code");
   });
 
   describe("sad path", () => {
@@ -96,7 +144,7 @@ describe("updateLanguage", () => {
         clientVersion: "1",
       });
       vi.mocked(prisma.language.update).mockRejectedValue(err);
-      await expect(updateLanguage(mockProjectId, mockLanguageId, mockLanguageUpdate)).rejects.toThrow(
+      await expect(updateLanguage(mockWorkspaceId, mockLanguageId, mockLanguageUpdate)).rejects.toThrow(
         DatabaseError
       );
     });
@@ -104,18 +152,24 @@ describe("updateLanguage", () => {
 });
 
 describe("deleteLanguage", () => {
+  const workspaceOwningLanguage = {
+    ...fakeWorkspace,
+    languages: [{ ...mockLanguage, id: mockLanguageId, code: "fr-FR" }],
+    config: {},
+  } as unknown as TWorkspace;
+
   beforeEach(() => {
-    vi.mocked(getProject).mockResolvedValue(fakeProject);
+    vi.mocked(getWorkspace).mockResolvedValue(workspaceOwningLanguage);
   });
 
   test("happy path deletes a language", async () => {
     vi.mocked(prisma.language.delete).mockResolvedValue(mockLanguage);
-    const result = await deleteLanguage(mockLanguageId, mockProjectId);
+    const result = await deleteLanguage(mockLanguageId, mockWorkspaceId);
     expect(result).toEqual(mockLanguage);
   });
 
   describe("sad path", () => {
-    testInputValidation(deleteLanguage, "bad-id", mockProjectId);
+    testInputValidation(deleteLanguage, "bad-id", mockWorkspaceId);
 
     test("throws DatabaseError on PrismaKnownRequestError", async () => {
       const err = new Prisma.PrismaClientKnownRequestError("dup", {
@@ -123,7 +177,48 @@ describe("deleteLanguage", () => {
         clientVersion: "1",
       });
       vi.mocked(prisma.language.delete).mockRejectedValue(err);
-      await expect(deleteLanguage(mockLanguageId, mockProjectId)).rejects.toThrow(DatabaseError);
+      await expect(deleteLanguage(mockLanguageId, mockWorkspaceId)).rejects.toThrow(DatabaseError);
+    });
+
+    test("refuses to delete a language that is not one of the workspace's own", async () => {
+      vi.mocked(getWorkspace).mockResolvedValue(fakeWorkspace);
+
+      await expect(deleteLanguage(mockLanguageId, mockWorkspaceId)).rejects.toThrow(ResourceNotFoundError);
+      expect(prisma.language.delete).not.toHaveBeenCalled();
+    });
+
+    // ENG-2816: the workspace default survey language must keep naming a language the workspace has.
+    test("refuses to delete the workspace default survey language", async () => {
+      vi.mocked(getWorkspace).mockResolvedValue({
+        ...fakeWorkspace,
+        languages: [{ ...mockLanguage, id: mockLanguageId, code: "de-DE" }],
+        config: { defaultSurveyLanguage: "de-DE" },
+      } as unknown as TWorkspace);
+
+      await expect(deleteLanguage(mockLanguageId, mockWorkspaceId)).rejects.toThrow(OperationNotAllowedError);
+      expect(prisma.language.delete).not.toHaveBeenCalled();
+    });
+
+    // A row stored under a legacy code is the same language as the canonical setting.
+    test("refuses to delete a legacy-coded row that is the default", async () => {
+      vi.mocked(getWorkspace).mockResolvedValue({
+        ...fakeWorkspace,
+        languages: [{ ...mockLanguage, id: mockLanguageId, code: "de" }],
+        config: { defaultSurveyLanguage: "de-DE" },
+      } as unknown as TWorkspace);
+
+      await expect(deleteLanguage(mockLanguageId, mockWorkspaceId)).rejects.toThrow(OperationNotAllowedError);
+    });
+
+    test("allows deleting a language that is not the default", async () => {
+      vi.mocked(getWorkspace).mockResolvedValue({
+        ...fakeWorkspace,
+        languages: [{ ...mockLanguage, id: mockLanguageId, code: "fr-FR" }],
+        config: { defaultSurveyLanguage: "de-DE" },
+      } as unknown as TWorkspace);
+      vi.mocked(prisma.language.delete).mockResolvedValue(mockLanguage);
+
+      await expect(deleteLanguage(mockLanguageId, mockWorkspaceId)).resolves.toEqual(mockLanguage);
     });
   });
 });

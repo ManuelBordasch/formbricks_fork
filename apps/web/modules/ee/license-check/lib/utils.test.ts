@@ -9,17 +9,20 @@ import { getEnterpriseLicense, getLicenseFeatures } from "./license";
 import {
   getAccessControlPermission,
   getBiggerUploadFileSizePermission,
-  getIsAIDataAnalysisEnabled,
+  getBulkInvitePermission,
   getIsAISmartToolsEnabled,
   getIsAuditLogsEnabled,
   getIsContactsEnabled,
+  getIsDashboardsEnabled,
+  getIsFeedbackDirectoriesEnabled,
   getIsMultiOrgEnabled,
   getIsQuotasEnabled,
   getIsSamlSsoEnabled,
   getIsSpamProtectionEnabled,
   getIsSsoEnabled,
   getIsTwoFactorAuthEnabled,
-  getOrganizationProjectsLimit,
+  getIsWorkflowsEnabled,
+  getOrganizationWorkspacesLimit,
   getRemoveBrandingPermission,
   getWhiteLabelPermission,
 } from "./utils";
@@ -49,7 +52,7 @@ vi.mock("./license", () => ({
 
 const defaultFeatures: TEnterpriseLicenseFeatures = {
   whitelabel: false,
-  projects: null,
+  workspaces: null,
   isMultiOrgEnabled: false,
   contacts: false,
   removeBranding: false,
@@ -58,10 +61,12 @@ const defaultFeatures: TEnterpriseLicenseFeatures = {
   saml: false,
   spamProtection: false,
   aiSmartTools: false,
-  aiDataAnalysis: false,
   auditLogs: false,
   accessControl: false,
   quotas: false,
+  feedbackDirectories: false,
+  dashboards: false,
+  workflows: false,
 };
 
 const defaultLicense = {
@@ -78,12 +83,15 @@ const defaultEntitlementsContext: TOrganizationEntitlementsContext = {
   source: "cloud_stripe",
   features: [],
   limits: {
-    projects: 3,
+    workspaces: 3,
     monthlyResponses: null,
+    monthlyWorkflowRuns: null,
   },
+  licenseActive: true,
   licenseStatus: "active",
   licenseFeatures: defaultFeatures,
   stripeCustomerId: "cus_123",
+  subscriptionStatus: null,
   usageCycleAnchor: new Date(),
 };
 
@@ -151,6 +159,39 @@ describe("License Utils", () => {
     });
   });
 
+  describe("getBulkInvitePermission", () => {
+    test("returns true on self-hosted without checking entitlements", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
+
+      const result = await getBulkInvitePermission("org_1");
+
+      expect(result).toBe(true);
+      expect(hasOrganizationEntitlementWithLicenseGuard).not.toHaveBeenCalled();
+    });
+
+    test("uses the cloud bulk-invite entitlement when entitled", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
+      vi.mocked(hasOrganizationEntitlementWithLicenseGuard).mockResolvedValueOnce(true);
+
+      const result = await getBulkInvitePermission("org_1");
+
+      expect(result).toBe(true);
+      expect(hasOrganizationEntitlementWithLicenseGuard).toHaveBeenCalledWith(
+        "org_1",
+        CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.BULK_INVITE
+      );
+    });
+
+    test("returns false on cloud when the bulk-invite entitlement is missing", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
+      vi.mocked(hasOrganizationEntitlementWithLicenseGuard).mockResolvedValueOnce(false);
+
+      const result = await getBulkInvitePermission("org_1");
+
+      expect(result).toBe(false);
+    });
+  });
+
   describe("custom plan guarded permissions", () => {
     test("uses cloud RBAC entitlement for access control", async () => {
       vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
@@ -211,79 +252,143 @@ describe("License Utils", () => {
       );
     });
 
-    test("uses cloud AI data analysis entitlement", async () => {
+    test("returns self-hosted AI smart tools from license", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
+      vi.mocked(getEnterpriseLicense).mockResolvedValue({
+        ...defaultLicense,
+        features: { ...defaultFeatures, aiSmartTools: true },
+      });
+
+      const result = await getIsAISmartToolsEnabled("org_1");
+      expect(result).toBe(true);
+    });
+
+    test("returns false for self-hosted AI smart tools when not enabled", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
+      vi.mocked(getEnterpriseLicense).mockResolvedValue({
+        ...defaultLicense,
+        features: { ...defaultFeatures, aiSmartTools: false },
+      });
+
+      const result = await getIsAISmartToolsEnabled("org_1");
+      expect(result).toBe(false);
+    });
+
+    test("uses cloud feedback record directories entitlement", async () => {
       vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
       vi.mocked(hasOrganizationEntitlementWithLicenseGuard).mockResolvedValueOnce(true);
 
-      const result = await getIsAIDataAnalysisEnabled("org_1");
+      const result = await getIsFeedbackDirectoriesEnabled("org_1");
 
       expect(result).toBe(true);
       expect(hasOrganizationEntitlementWithLicenseGuard).toHaveBeenCalledWith(
         "org_1",
-        CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.AI_DATA_ANALYSIS
+        CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.FEEDBACK_DIRECTORIES
       );
+      expect(getEnterpriseLicense).not.toHaveBeenCalled();
     });
 
-    test("returns self-hosted AI features from license", async () => {
+    test("uses cloud dashboards entitlement", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
+      vi.mocked(hasOrganizationEntitlementWithLicenseGuard).mockResolvedValueOnce(true);
+
+      const result = await getIsDashboardsEnabled("org_1");
+
+      expect(result).toBe(true);
+      expect(hasOrganizationEntitlementWithLicenseGuard).toHaveBeenCalledWith(
+        "org_1",
+        CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.DASHBOARDS
+      );
+      expect(getEnterpriseLicense).not.toHaveBeenCalled();
+    });
+
+    test("uses cloud workflows entitlement", async () => {
+      vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
+      vi.mocked(hasOrganizationEntitlementWithLicenseGuard).mockResolvedValueOnce(true);
+
+      const result = await getIsWorkflowsEnabled("org_1");
+
+      expect(result).toBe(true);
+      expect(hasOrganizationEntitlementWithLicenseGuard).toHaveBeenCalledWith(
+        "org_1",
+        CLOUD_STRIPE_FEATURE_LOOKUP_KEYS.WORKFLOWS
+      );
+      expect(getEnterpriseLicense).not.toHaveBeenCalled();
+    });
+
+    test("returns self-hosted FRD / dashboards / workflows from license", async () => {
       vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
       vi.mocked(getEnterpriseLicense).mockResolvedValue({
         ...defaultLicense,
         features: {
           ...defaultFeatures,
-          aiSmartTools: true,
-          aiDataAnalysis: true,
+          feedbackDirectories: true,
+          dashboards: true,
+          workflows: true,
         },
       });
 
-      const [smartTools, dataAnalysis] = await Promise.all([
-        getIsAISmartToolsEnabled("org_1"),
-        getIsAIDataAnalysisEnabled("org_1"),
+      const [frd, dashboards, workflows] = await Promise.all([
+        getIsFeedbackDirectoriesEnabled("org_1"),
+        getIsDashboardsEnabled("org_1"),
+        getIsWorkflowsEnabled("org_1"),
       ]);
 
-      expect(smartTools).toBe(true);
-      expect(dataAnalysis).toBe(true);
+      expect(frd).toBe(true);
+      expect(dashboards).toBe(true);
+      expect(workflows).toBe(true);
+      expect(hasOrganizationEntitlementWithLicenseGuard).not.toHaveBeenCalled();
     });
 
-    test("returns false for self-hosted AI features when not enabled", async () => {
+    test("returns false for self-hosted FRD / dashboards / workflows when not enabled", async () => {
       vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
       vi.mocked(getEnterpriseLicense).mockResolvedValue({
         ...defaultLicense,
-        features: {
-          ...defaultFeatures,
-          aiSmartTools: false,
-          aiDataAnalysis: false,
-        },
+        features: defaultFeatures,
       });
 
-      const [smartTools, dataAnalysis] = await Promise.all([
-        getIsAISmartToolsEnabled("org_1"),
-        getIsAIDataAnalysisEnabled("org_1"),
+      const [frd, dashboards, workflows] = await Promise.all([
+        getIsFeedbackDirectoriesEnabled("org_1"),
+        getIsDashboardsEnabled("org_1"),
+        getIsWorkflowsEnabled("org_1"),
       ]);
 
-      expect(smartTools).toBe(false);
-      expect(dataAnalysis).toBe(false);
+      expect(frd).toBe(false);
+      expect(dashboards).toBe(false);
+      expect(workflows).toBe(false);
+      expect(hasOrganizationEntitlementWithLicenseGuard).not.toHaveBeenCalled();
     });
   });
 
   describe("getBiggerUploadFileSizePermission", () => {
-    test("returns true for self-hosted active license status", async () => {
+    // Same grace-window split as the workspace limit below: the cached license stays active for the
+    // window while the status already reports how the live check went, so "active" is the ordinary
+    // case and the two others are a licensed instance mid-grace.
+    test.each(["active", "unreachable", "expired"] as const)(
+      "keeps the bigger upload size for self-hosted while the license is active and the status is %s",
+      async (licenseStatus) => {
+        vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
+        vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
+          ...defaultEntitlementsContext,
+          source: "self_hosted_license",
+          licenseActive: true,
+          licenseStatus,
+        });
+
+        const result = await getBiggerUploadFileSizePermission("org_1");
+
+        expect(result).toBe(true);
+      }
+    );
+
+    test("returns false for self-hosted once the license is no longer active", async () => {
       vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
       vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
         ...defaultEntitlementsContext,
         source: "self_hosted_license",
-        licenseStatus: "active",
-      });
-
-      const result = await getBiggerUploadFileSizePermission("org_1");
-
-      expect(result).toBe(true);
-    });
-
-    test("returns false for self-hosted non-active license status", async () => {
-      vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
-      vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
-        ...defaultEntitlementsContext,
-        source: "self_hosted_license",
+        // Past the grace window the provider resolves the license as inactive, and the standard
+        // upload cap applies again.
+        licenseActive: false,
         licenseStatus: "expired",
       });
 
@@ -297,7 +402,7 @@ describe("License Utils", () => {
       vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
         ...defaultEntitlementsContext,
         licenseStatus: "active",
-        limits: { ...defaultEntitlementsContext.limits, projects: 10 },
+        limits: { ...defaultEntitlementsContext.limits, workspaces: 10 },
       });
 
       const result = await getBiggerUploadFileSizePermission("org_1");
@@ -310,7 +415,7 @@ describe("License Utils", () => {
       vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
         ...defaultEntitlementsContext,
         licenseStatus: "active",
-        limits: { ...defaultEntitlementsContext.limits, projects: 1 },
+        limits: { ...defaultEntitlementsContext.limits, workspaces: 1 },
       });
 
       const result = await getBiggerUploadFileSizePermission("org_1");
@@ -323,7 +428,7 @@ describe("License Utils", () => {
       vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
         ...defaultEntitlementsContext,
         licenseStatus: "expired",
-        limits: { ...defaultEntitlementsContext.limits, projects: 10 },
+        limits: { ...defaultEntitlementsContext.limits, workspaces: 10 },
       });
 
       const result = await getBiggerUploadFileSizePermission("org_1");
@@ -431,73 +536,129 @@ describe("License Utils", () => {
     });
   });
 
-  describe("getOrganizationProjectsLimit", () => {
-    test("returns cloud projects limit when cloud license status allows usage", async () => {
+  describe("getOrganizationWorkspacesLimit", () => {
+    test("returns cloud workspaces limit when cloud license status allows usage", async () => {
       vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
       vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
         ...defaultEntitlementsContext,
         licenseStatus: "active",
-        limits: { ...defaultEntitlementsContext.limits, projects: 10 },
+        limits: { ...defaultEntitlementsContext.limits, workspaces: 10 },
       });
 
-      const result = await getOrganizationProjectsLimit("org_1");
+      const result = await getOrganizationWorkspacesLimit("org_1");
 
       expect(result).toBe(10);
     });
 
-    test("returns Infinity when cloud projects limit is unbounded", async () => {
+    test("returns Infinity when cloud workspaces limit is unbounded", async () => {
       vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
       vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
         ...defaultEntitlementsContext,
         licenseStatus: "no-license",
-        limits: { ...defaultEntitlementsContext.limits, projects: null },
+        limits: { ...defaultEntitlementsContext.limits, workspaces: null },
       });
 
-      const result = await getOrganizationProjectsLimit("org_1");
+      const result = await getOrganizationWorkspacesLimit("org_1");
 
       expect(result).toBe(Infinity);
     });
 
-    test("returns 3 when cloud license status does not allow usage", async () => {
+    test("falls back to the cloud Hobby limit when the license status does not allow usage", async () => {
       vi.mocked(constants).IS_FORMBRICKS_CLOUD = true;
       vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
         ...defaultEntitlementsContext,
         licenseStatus: "expired",
-        limits: { ...defaultEntitlementsContext.limits, projects: 10 },
+        limits: { ...defaultEntitlementsContext.limits, workspaces: 10 },
       });
 
-      const result = await getOrganizationProjectsLimit("org_1");
+      const result = await getOrganizationWorkspacesLimit("org_1");
 
-      expect(result).toBe(3);
+      // The org's own entitlement (10) is deliberately ignored: an entitlement we cannot verify is
+      // treated as no entitlement, so the free-tier allowance applies until the license resolves.
+      expect(result).toBe(1);
     });
 
-    test("returns self-hosted project limit from active license feature", async () => {
+    test("returns Infinity for self-hosted when an active license grants unlimited workspaces", async () => {
       vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
       vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
         ...defaultEntitlementsContext,
         source: "self_hosted_license",
         licenseStatus: "active",
-        licenseFeatures: { ...defaultFeatures, projects: 5 },
+        licenseFeatures: { ...defaultFeatures, workspaces: null },
+        limits: { ...defaultEntitlementsContext.limits, workspaces: null },
       });
 
-      const result = await getOrganizationProjectsLimit("org_1");
+      const result = await getOrganizationWorkspacesLimit("org_1");
 
-      expect(result).toBe(5);
+      expect(result).toBe(Infinity);
     });
 
-    test("returns 3 for self-hosted without active project entitlement", async () => {
-      vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
-      vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
-        ...defaultEntitlementsContext,
-        source: "self_hosted_license",
-        licenseStatus: "active",
-        licenseFeatures: { ...defaultFeatures, projects: null },
-      });
+    // One guard for the three shapes an unusable license can take, all of which the provider has
+    // already resolved to the community cap. These prove only that this function reads the resolved
+    // `limits.workspaces`; the cap *mapping* itself is proved where it happens, in
+    // self-hosted-provider.test.ts ("defaults workspaces to the community limit when license is
+    // inactive").
+    test.each([
+      {
+        case: "a license that lapsed past the grace window",
+        licenseActive: false,
+        licenseStatus: "expired" as const,
+        licenseFeatures: { ...defaultFeatures, workspaces: null },
+      },
+      {
+        // Still active, but the check returned no features, so there is no allowance to read.
+        case: "an active license carrying no features",
+        licenseActive: true,
+        licenseStatus: "active" as const,
+        licenseFeatures: null,
+      },
+      {
+        case: "no license key at all",
+        licenseActive: false,
+        licenseStatus: "no-license" as const,
+        licenseFeatures: null,
+      },
+    ])(
+      "returns the community limit for self-hosted with $case",
+      async ({ licenseActive, licenseStatus, licenseFeatures }) => {
+        vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
+        vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
+          ...defaultEntitlementsContext,
+          source: "self_hosted_license",
+          licenseActive,
+          licenseStatus,
+          licenseFeatures,
+          limits: { ...defaultEntitlementsContext.limits, workspaces: 1 },
+        });
 
-      const result = await getOrganizationProjectsLimit("org_1");
+        const result = await getOrganizationWorkspacesLimit("org_1");
 
-      expect(result).toBe(3);
-    });
+        expect(result).toBe(1);
+      }
+    );
+
+    // The licensed allowance holds whatever the live check reported, which is the point of the fix:
+    // "active" is the ordinary case, and both grace entries keep the cached license active for the
+    // window (getFallbackLevel, license.ts:285-295) — "unreachable" when the check never completed,
+    // "expired" when it completed and the key had lapsed.
+    test.each(["active", "unreachable", "expired"] as const)(
+      "keeps the licensed self-hosted workspace limit when the license status is %s",
+      async (licenseStatus) => {
+        vi.mocked(constants).IS_FORMBRICKS_CLOUD = false;
+        vi.mocked(getOrganizationEntitlementsContext).mockResolvedValue({
+          ...defaultEntitlementsContext,
+          source: "self_hosted_license",
+          licenseActive: true,
+          licenseStatus,
+          licenseFeatures: { ...defaultFeatures, workspaces: 5 },
+          limits: { ...defaultEntitlementsContext.limits, workspaces: 5 },
+        });
+
+        const result = await getOrganizationWorkspacesLimit("org_1");
+
+        expect(result).toBe(5);
+      }
+    );
   });
 
   describe("getIsAuditLogsEnabled", () => {

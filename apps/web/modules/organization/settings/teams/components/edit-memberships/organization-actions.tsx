@@ -11,8 +11,17 @@ import { FORMBRICKS_ENVIRONMENT_ID_LS } from "@/lib/localStorage";
 import { getAccessFlags } from "@/lib/membership/utils";
 import { getFormattedErrorMessage } from "@/lib/utils/helper";
 import { TOrganizationTeam } from "@/modules/ee/teams/team-list/types/team";
-import { inviteUserAction, leaveOrganizationAction } from "@/modules/organization/settings/teams/actions";
+import {
+  bulkInviteUsersAction,
+  inviteUserAction,
+  leaveOrganizationAction,
+} from "@/modules/organization/settings/teams/actions";
 import { InviteMemberModal } from "@/modules/organization/settings/teams/components/invite-member/invite-member-modal";
+import {
+  formatInviteFailureMessage,
+  formatInviteFailureMessages,
+  getInviteFailureReasonFromMessage,
+} from "@/modules/organization/settings/teams/lib/invite-failure";
 import { TInvitee } from "@/modules/organization/settings/teams/types/invites";
 import { Button } from "@/modules/ui/components/button";
 import {
@@ -33,12 +42,12 @@ interface OrganizationActionsProps {
   isInviteDisabled: boolean;
   isAccessControlAllowed: boolean;
   isFormbricksCloud: boolean;
-  environmentId: string;
   isMultiOrgEnabled: boolean;
   isUserManagementDisabledFromUi: boolean;
-  isStorageConfigured: boolean;
   isTeamAdmin: boolean;
   userAdminTeamIds?: string[];
+  enterpriseLicenseRequestFormUrl: string;
+  isBulkInviteAllowed: boolean;
 }
 
 export const OrganizationActions = ({
@@ -50,12 +59,12 @@ export const OrganizationActions = ({
   isInviteDisabled,
   isAccessControlAllowed,
   isFormbricksCloud,
-  environmentId,
   isMultiOrgEnabled,
   isUserManagementDisabledFromUi,
-  isStorageConfigured,
   isTeamAdmin,
   userAdminTeamIds,
+  enterpriseLicenseRequestFormUrl,
+  isBulkInviteAllowed,
 }: OrganizationActionsProps) => {
   const router = useRouter();
   const { t } = useTranslation();
@@ -77,7 +86,7 @@ export const OrganizationActions = ({
         setLoading(false);
         return;
       }
-      toast.success(t("environments.settings.general.member_deleted_successfully"));
+      toast.success(t("workspace.settings.general.member_deleted_successfully"));
       router.refresh();
       setLoading(false);
       localStorage.removeItem(FORMBRICKS_ENVIRONMENT_ID_LS);
@@ -88,64 +97,84 @@ export const OrganizationActions = ({
     }
   };
 
-  const handleAddMembers = async (data: TInvitee[]) => {
-    if (data.length === 1) {
-      // Individual invite
-      const inviteUserActionResult = await inviteUserAction({
-        organizationId: organization.id,
-        email: data[0].email.toLowerCase(),
-        name: data[0].name,
-        role: data[0].role,
-        teamIds: data[0].teamIds,
-      });
-      if (inviteUserActionResult?.data) {
-        router.refresh();
-        toast.success(t("environments.settings.general.member_invited_successfully"));
-      } else {
-        const errorMessage = getFormattedErrorMessage(inviteUserActionResult);
-        toast.error(errorMessage);
-      }
-    } else {
-      const inviteResults: { email: string; success: boolean }[] = [];
-      for (const { name, email, role, teamIds } of data) {
+  const handleAddMembers = async (data: TInvitee[]): Promise<boolean> => {
+    const toastId = toast.loading(t("workspace.settings.general.inviting_member", { count: data.length }));
+
+    try {
+      if (data.length === 1) {
         const inviteUserActionResult = await inviteUserAction({
           organizationId: organization.id,
-          email: email.toLowerCase(),
-          name,
-          role,
-          teamIds,
+          email: data[0].email.toLowerCase(),
+          name: data[0].name,
+          role: data[0].role,
+          teamIds: data[0].teamIds,
         });
-        inviteResults.push({
-          email,
-          success: Boolean(inviteUserActionResult?.data),
-        });
-      }
-      const failedInvites: string[] = [];
-      const successInvites: string[] = [];
-      inviteResults.forEach((invite) => {
-        if (!invite.success) {
-          failedInvites.push(invite.email);
-        } else {
-          successInvites.push(invite.email);
+
+        if (inviteUserActionResult?.data) {
+          router.refresh();
+          toast.success(t("workspace.settings.general.member_invited_successfully"), {
+            id: toastId,
+          });
+          return true;
         }
-      });
-      if (failedInvites.length > 0) {
-        toast.error(`${failedInvites.length} ${t("environments.settings.general.invites_failed")}`);
+
+        const errorMessage = getFormattedErrorMessage(inviteUserActionResult);
+        const failureReason = getInviteFailureReasonFromMessage(errorMessage);
+        toast.error(
+          failureReason === "unknown" && errorMessage
+            ? errorMessage
+            : formatInviteFailureMessage(t, { email: data[0].email, failureReason }),
+          { id: toastId }
+        );
+        return false;
       }
+
+      const bulkInviteResult = await bulkInviteUsersAction({
+        organizationId: organization.id,
+        invitees: data.map((invitee) => ({ ...invitee, email: invitee.email.toLowerCase() })),
+      });
+
+      if (!bulkInviteResult?.data) {
+        toast.error(getFormattedErrorMessage(bulkInviteResult), { id: toastId });
+        return false;
+      }
+
+      const inviteResults = bulkInviteResult.data;
+      router.refresh();
+
+      const failedInvites = inviteResults
+        .filter((invite) => !invite.success)
+        .map((invite) => ({
+          email: invite.email,
+          failureReason: invite.failureReason ?? ("unknown" as const),
+        }));
+      const successInvites = inviteResults.filter((invite) => invite.success);
+
       if (successInvites.length > 0) {
         toast.success(
-          `${successInvites.length} ${t("environments.settings.general.member_invited_successfully")}`
+          t("workspace.settings.general.members_invited_successfully", { count: successInvites.length }),
+          { id: toastId }
         );
+        if (failedInvites.length > 0) {
+          toast.error(formatInviteFailureMessages(t, failedInvites));
+        }
+        return true;
       }
+
+      toast.error(formatInviteFailureMessages(t, failedInvites), { id: toastId });
+      return false;
+    } catch (err) {
+      toast.error(`Error: ${err instanceof Error ? err.message : "Unknown error occurred"}`, { id: toastId });
+      return false;
     }
   };
 
   return (
     <>
-      <div className="mb-4 flex justify-end space-x-2 text-right">
+      <div className="mb-4 flex justify-end gap-x-2 text-right">
         {role !== "owner" && isMultiOrgEnabled && (
           <Button variant="destructive" size="sm" onClick={() => setIsLeaveOrganizationModalOpen(true)}>
-            {t("environments.settings.general.leave_organization")}
+            {t("workspace.settings.general.leave_organization")}
             <XIcon />
           </Button>
         )}
@@ -157,7 +186,7 @@ export const OrganizationActions = ({
             onClick={() => {
               setIsInviteMemberModalOpen(true);
             }}>
-            {t("environments.settings.teams.invite_member")}
+            {t("workspace.settings.teams.invite_member")}
           </Button>
         )}
       </div>
@@ -166,27 +195,28 @@ export const OrganizationActions = ({
         setOpen={setIsInviteMemberModalOpen}
         onSubmit={handleAddMembers}
         membershipRole={membershipRole}
+        organizationId={organization.id}
         isAccessControlAllowed={isAccessControlAllowed}
         isFormbricksCloud={isFormbricksCloud}
-        environmentId={environmentId}
         teams={teams}
-        isStorageConfigured={isStorageConfigured}
         isOwnerOrManager={isOwnerOrManager}
         isTeamAdmin={isTeamAdmin}
         userAdminTeamIds={userAdminTeamIds}
+        enterpriseLicenseRequestFormUrl={enterpriseLicenseRequestFormUrl}
+        isBulkInviteAllowed={isBulkInviteAllowed}
       />
 
       <Dialog open={isLeaveOrganizationModalOpen} onOpenChange={setIsLeaveOrganizationModalOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t("environments.settings.general.leave_organization_title")}</DialogTitle>
+            <DialogTitle>{t("workspace.settings.general.leave_organization_title")}</DialogTitle>
             <DialogDescription>
-              {t("environments.settings.general.leave_organization_description")}
+              {t("workspace.settings.general.leave_organization_description")}
             </DialogDescription>
           </DialogHeader>
           {isLeaveOrganizationDisabled && (
             <p className="mt-2 text-sm text-red-700">
-              {t("environments.settings.general.cannot_leave_only_organization")}
+              {t("workspace.settings.general.cannot_leave_only_organization")}
             </p>
           )}
           <DialogFooter>
@@ -198,7 +228,7 @@ export const OrganizationActions = ({
               onClick={handleLeaveOrganization}
               loading={loading}
               disabled={isLeaveOrganizationDisabled}>
-              {t("environments.settings.general.leave_organization_ok_btn_text")}
+              {t("workspace.settings.general.leave_organization_ok_btn_text")}
             </Button>
           </DialogFooter>
         </DialogContent>

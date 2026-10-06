@@ -1,8 +1,12 @@
 import { resolve } from "node:path";
-import { PluginOption, defineConfig } from "vite";
-import dts from "vite-plugin-dts";
+import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  test: {
+    coverage: {
+      reporter: ["text", "json", "html", "lcov"],
+    },
+  },
   build: {
     lib: {
       entry: resolve(__dirname, "src/index.ts"),
@@ -23,9 +27,4 @@ export default defineConfig({
     },
     emptyOutDir: false,
   },
-  plugins: [
-    dts({
-      rollupTypes: true,
-    }) as PluginOption,
-  ],
 });

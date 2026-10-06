@@ -1,9 +1,15 @@
-import { Prisma } from "@prisma/client";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
-import { DatabaseError } from "@formbricks/types/errors";
+import { Prisma } from "@formbricks/database/prisma";
+import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
+import { lookupAuthorizedOrganizationIds } from "@/lib/authorization/resource-list";
+import { reconcileApiKeyRelationships } from "@/lib/authzed/api-key";
+import { reconcileFeedbackDirectoryRelationships } from "@/lib/authzed/feedback-directory";
+import { deleteOrganizationRelationships } from "@/lib/authzed/organization-membership";
+import { reconcileTeamWorkspaceRelationships } from "@/lib/authzed/team-workspace";
 import { IS_FORMBRICKS_CLOUD } from "@/lib/constants";
 import { updateUser } from "@/lib/user/service";
+import { getWorkspaces } from "@/lib/workspace/service";
 import {
   cleanupStripeCustomer,
   ensureCloudStripeSetupForOrganization,
@@ -11,6 +17,7 @@ import {
 import {
   createOrganization,
   deleteOrganization,
+  getMonthlyOrganizationWorkflowRunCount,
   getOrganization,
   getOrganizationsByUserId,
   select as organizationSelect,
@@ -34,6 +41,9 @@ vi.mock("@formbricks/database", () => ({
     user: {
       findUnique: vi.fn(),
     },
+    workflowRun: {
+      aggregate: vi.fn(),
+    },
   },
 }));
 
@@ -41,14 +51,40 @@ vi.mock("@/lib/user/service", () => ({
   updateUser: vi.fn(),
 }));
 
+vi.mock("@/lib/workspace/service", () => ({
+  getWorkspaces: vi.fn(),
+}));
+vi.mock("@/lib/authorization/resource-list", () => ({ lookupAuthorizedOrganizationIds: vi.fn() }));
+
+vi.mock("@/lib/authzed/organization-membership", () => ({
+  deleteOrganizationRelationships: vi.fn(),
+}));
+vi.mock("@/lib/authzed/api-key", () => ({
+  reconcileApiKeyRelationships: vi.fn(),
+}));
+vi.mock("@/lib/authzed/feedback-directory", () => ({
+  reconcileFeedbackDirectoryRelationships: vi.fn(),
+}));
+vi.mock("@/lib/authzed/team-workspace", () => ({
+  reconcileTeamWorkspaceRelationships: vi.fn(),
+}));
+
 vi.mock("@/modules/ee/billing/lib/organization-billing", () => ({
   ensureCloudStripeSetupForOrganization: vi.fn().mockResolvedValue(undefined),
   cleanupStripeCustomer: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("@/modules/hub/service", () => ({
+  deleteHubTenantData: vi.fn().mockResolvedValue({
+    data: { deletedFeedbackRecords: 0, deletedEmbeddings: 0, deletedWebhooks: 0 },
+    error: null,
+  }),
+}));
+
 describe("Organization Service", () => {
   beforeEach(() => {
     vi.mocked(ensureCloudStripeSetupForOrganization).mockResolvedValue(undefined);
+    vi.mocked(lookupAuthorizedOrganizationIds).mockResolvedValue(["org1"]);
   });
 
   afterEach(() => {
@@ -64,7 +100,7 @@ describe("Organization Service", () => {
         updatedAt: new Date(),
         billing: {
           limits: {
-            projects: 3,
+            workspaces: 3,
             monthly: {
               responses: 1500,
             },
@@ -73,7 +109,7 @@ describe("Organization Service", () => {
           usageCycleAnchor: new Date(),
         },
         isAISmartToolsEnabled: false,
-        isAIDataAnalysisEnabled: false,
+        displayTimeZone: null,
         whitelabel: false,
       };
 
@@ -117,7 +153,7 @@ describe("Organization Service", () => {
           updatedAt: new Date(),
           billing: {
             limits: {
-              projects: 3,
+              workspaces: 3,
               monthly: {
                 responses: 1500,
               },
@@ -126,7 +162,7 @@ describe("Organization Service", () => {
             usageCycleAnchor: new Date(),
           },
           isAISmartToolsEnabled: false,
-          isAIDataAnalysisEnabled: false,
+          displayTimeZone: null,
           whitelabel: false,
         },
       ];
@@ -138,11 +174,7 @@ describe("Organization Service", () => {
       expect(result).toEqual(mockOrganizations);
       expect(prisma.organization.findMany).toHaveBeenCalledWith({
         where: {
-          memberships: {
-            some: {
-              userId: "user1",
-            },
-          },
+          id: { in: ["org1"] },
         },
         select: expect.any(Object),
       });
@@ -163,7 +195,7 @@ describe("Organization Service", () => {
     test("should create organization with default billing settings", async () => {
       const expectedBilling = {
         limits: {
-          projects: IS_FORMBRICKS_CLOUD ? 1 : 3,
+          workspaces: IS_FORMBRICKS_CLOUD ? 1 : 3,
           monthly: {
             responses: IS_FORMBRICKS_CLOUD ? 250 : 1500,
           },
@@ -179,7 +211,7 @@ describe("Organization Service", () => {
         updatedAt: new Date(),
         billing: expectedBilling,
         isAISmartToolsEnabled: false,
-        isAIDataAnalysisEnabled: false,
+        displayTimeZone: null,
         whitelabel: false,
       };
 
@@ -194,9 +226,10 @@ describe("Organization Service", () => {
           billing: {
             create: {
               limits: {
-                projects: IS_FORMBRICKS_CLOUD ? 1 : 3,
+                workspaces: IS_FORMBRICKS_CLOUD ? 1 : 3,
                 monthly: {
                   responses: IS_FORMBRICKS_CLOUD ? 250 : 1500,
+                  workflowRuns: null,
                 },
               },
               stripeCustomerId: null,
@@ -230,7 +263,7 @@ describe("Organization Service", () => {
         updatedAt: new Date(),
         billing: {
           limits: {
-            projects: 3,
+            workspaces: 3,
             monthly: {
               responses: 1500,
             },
@@ -239,10 +272,10 @@ describe("Organization Service", () => {
           usageCycleAnchor: new Date(),
         },
         isAISmartToolsEnabled: false,
-        isAIDataAnalysisEnabled: false,
+        displayTimeZone: null,
         whitelabel: false,
         memberships: [{ userId: "user1" }, { userId: "user2" }],
-        projects: [
+        workspaces: [
           {
             environments: [{ id: "env1" }, { id: "env2" }],
           },
@@ -272,7 +305,7 @@ describe("Organization Service", () => {
         updatedAt: expect.any(Date),
         billing: {
           limits: {
-            projects: 3,
+            workspaces: 3,
             monthly: {
               responses: 1500,
             },
@@ -281,13 +314,36 @@ describe("Organization Service", () => {
           usageCycleAnchor: expect.any(Date),
         },
         isAISmartToolsEnabled: false,
-        isAIDataAnalysisEnabled: false,
         whitelabel: false,
       });
       expect(prisma.organization.update).toHaveBeenCalledWith({
         where: { id: "org1" },
         data: { name: "Updated Org" },
       });
+    });
+
+    test("should throw ResourceNotFoundError when the update targets a missing organization (P2025)", async () => {
+      const prismaError = new Prisma.PrismaClientKnownRequestError("Record to update not found", {
+        code: "P2025",
+        clientVersion: "5.0.0",
+      });
+
+      vi.mocked(prisma.$transaction).mockImplementation(
+        async (fn: any) =>
+          await fn({
+            organization: {
+              update: vi.fn().mockRejectedValue(prismaError),
+              findUnique: vi.fn().mockResolvedValue({ id: "org1" }),
+            },
+            organizationBilling: {
+              upsert: prisma.organizationBilling.upsert,
+            },
+          })
+      );
+
+      await expect(updateOrganization("org1", { name: "Updated Org" })).rejects.toThrow(
+        ResourceNotFoundError
+      );
     });
   });
 
@@ -354,14 +410,111 @@ describe("Organization Service", () => {
         name: "Test Org",
         billing: { stripeCustomerId: "cus_123" },
         memberships: [],
-        projects: [],
+        workspaces: [],
+        teams: [],
+        apiKeys: [{ id: "api-key-1" }],
+        feedbackDirectories: [],
       } as any);
 
       await deleteOrganization("org1");
 
+      expect(deleteOrganizationRelationships).toHaveBeenCalledWith("org1");
+      expect(reconcileTeamWorkspaceRelationships).toHaveBeenCalledWith({ teamIds: [], workspaceIds: [] });
+      expect(reconcileApiKeyRelationships).toHaveBeenCalledWith({
+        apiKeyIds: ["api-key-1"],
+      });
       if (IS_FORMBRICKS_CLOUD) {
         expect(cleanupStripeCustomer).toHaveBeenCalledWith("cus_123");
       }
+    });
+
+    test("should purge Hub-owned data for each feedback directory", async () => {
+      const { deleteHubTenantData } = await import("@/modules/hub/service");
+      vi.mocked(prisma.organization.delete).mockResolvedValue({
+        id: "org1",
+        name: "Test Org",
+        billing: null,
+        memberships: [],
+        workspaces: [{ id: "workspace-1" }],
+        teams: [{ id: "team-1" }],
+        apiKeys: [{ id: "api-key-1" }, { id: "api-key-2" }],
+        feedbackDirectories: [
+          { id: "frd_1", workspaces: [{ workspaceId: "workspace-1" }] },
+          { id: "frd_2", workspaces: [] },
+        ],
+      } as any);
+
+      await deleteOrganization("org1");
+
+      expect(deleteHubTenantData).toHaveBeenCalledTimes(2);
+      expect(deleteHubTenantData).toHaveBeenCalledWith("frd_1");
+      expect(deleteHubTenantData).toHaveBeenCalledWith("frd_2");
+      expect(reconcileTeamWorkspaceRelationships).toHaveBeenCalledWith({
+        teamIds: ["team-1"],
+        workspaceIds: ["workspace-1"],
+      });
+      expect(reconcileApiKeyRelationships).toHaveBeenCalledWith({
+        apiKeyIds: ["api-key-1", "api-key-2"],
+      });
+      expect(reconcileFeedbackDirectoryRelationships).toHaveBeenCalledWith({
+        assignments: [{ feedbackDirectoryId: "frd_1", workspaceId: "workspace-1" }],
+        feedbackDirectoryIds: ["frd_1", "frd_2"],
+      });
+    });
+  });
+
+  describe("getMonthlyOrganizationWorkflowRunCount", () => {
+    const mockOrganization = {
+      id: "org_1",
+      name: "Test Org",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      billing: {
+        stripeCustomerId: "cus_1",
+        limits: { workspaces: 5, monthly: { responses: 5000, workflowRuns: 1000 } },
+        usageCycleAnchor: null,
+        stripe: null,
+      },
+      isAISmartToolsEnabled: false,
+      whitelabel: null,
+    };
+
+    test("counts non-dry workflow runs across the organization's workspaces in the billing cycle", async () => {
+      vi.mocked(prisma.organization.findUnique).mockResolvedValue(mockOrganization as never);
+      vi.mocked(getWorkspaces).mockResolvedValue([{ id: "ws_1" }, { id: "ws_2" }] as never);
+      vi.mocked(prisma.workflowRun.aggregate).mockResolvedValue({ _count: { id: 42 } } as never);
+
+      const result = await getMonthlyOrganizationWorkflowRunCount("cms634kob000001uzrelh0qeb");
+
+      expect(result).toBe(42);
+      const aggregateArgs = vi.mocked(prisma.workflowRun.aggregate).mock.calls[0][0];
+      expect(aggregateArgs.where?.AND).toEqual(
+        expect.arrayContaining([
+          { workspaceId: { in: ["ws_1", "ws_2"] } },
+          { isDryRun: false },
+          expect.objectContaining({ createdAt: expect.any(Object) }),
+        ])
+      );
+    });
+
+    test("throws ResourceNotFoundError when the organization does not exist", async () => {
+      vi.mocked(prisma.organization.findUnique).mockResolvedValue(null);
+
+      await expect(getMonthlyOrganizationWorkflowRunCount("cmmissingorg00000000000a")).rejects.toThrow(
+        ResourceNotFoundError
+      );
+    });
+
+    test("wraps a known Prisma error in DatabaseError", async () => {
+      vi.mocked(prisma.organization.findUnique).mockResolvedValue(mockOrganization as never);
+      vi.mocked(getWorkspaces).mockResolvedValue([{ id: "ws_1" }] as never);
+      vi.mocked(prisma.workflowRun.aggregate).mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError("db down", { code: "P2002", clientVersion: "1.0.0" })
+      );
+
+      await expect(getMonthlyOrganizationWorkflowRunCount("cms634kob000001uzrelh0qeb")).rejects.toThrow(
+        DatabaseError
+      );
     });
   });
 });

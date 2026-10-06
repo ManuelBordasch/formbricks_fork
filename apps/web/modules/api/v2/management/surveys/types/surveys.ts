@@ -28,7 +28,6 @@ export const ZSurveyInput = ZSurveyWithoutQuestionType.pick({
   name: true,
   redirectUrl: true,
   type: true,
-  environmentId: true,
   questions: true,
   blocks: true,
   endings: true,
@@ -40,15 +39,16 @@ export const ZSurveyInput = ZSurveyWithoutQuestionType.pick({
   autoClose: true,
   autoComplete: true,
   delay: true,
+  publishOn: true,
+  closeOn: true,
   singleUse: true,
   isVerifyEmailEnabled: true,
-  isSingleResponsePerEmailEnabled: true,
   inlineTriggers: true,
   displayPercentage: true,
   welcomeCard: true,
   surveyClosedMessage: true,
   styling: true,
-  projectOverwrites: true,
+  workspaceOverwrites: true,
   showLanguageSwitch: true,
 })
   .partial({
@@ -60,8 +60,10 @@ export const ZSurveyInput = ZSurveyWithoutQuestionType.pick({
     autoClose: true,
     autoComplete: true,
     surveyClosedMessage: true,
+    publishOn: true,
+    closeOn: true,
     styling: true,
-    projectOverwrites: true,
+    workspaceOverwrites: true,
     showLanguageSwitch: true,
     inlineTriggers: true,
     displayPercentage: true,
@@ -69,6 +71,9 @@ export const ZSurveyInput = ZSurveyWithoutQuestionType.pick({
   .meta({
     id: "surveyInput",
     description: "A survey input object for creating or updating surveys",
+  })
+  .extend({
+    environmentId: z.cuid2(),
   });
 
 export type TSurveyInput = z.infer<typeof ZSurveyInput>;

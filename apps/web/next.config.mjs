@@ -2,22 +2,63 @@ import { withSentryConfig } from "@sentry/nextjs";
 import createJiti from "jiti";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+// Single source of truth for image-optimizer hosts (ENG-1678); shared with the runtime
+// `isExternalImageSrc` check in lib/image-hosts.ts so remotePatterns and the per-<Image>
+// `unoptimized` decision can never drift apart.
+import { LOOPBACK_HOSTS, OPTIMIZABLE_IMAGE_HOSTS } from "./lib/optimizable-image-hosts.mjs";
 
 const jiti = createJiti(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 jiti("./lib/env");
 
+const LOOPBACK_WILDCARD_ORIGINS = LOOPBACK_HOSTS.map((host) => `http://${host}:*`);
+
+const getLoopbackOriginVariants = (value) => {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const url = new URL(value);
+
+    if (!["http:", "https:"].includes(url.protocol) || !LOOPBACK_HOSTS.includes(url.hostname)) {
+      return [];
+    }
+
+    const portSuffix = url.port ? `:${url.port}` : "";
+    const alternateHost = url.hostname === "localhost" ? "127.0.0.1" : "localhost";
+
+    return [
+      `${url.protocol}//${url.hostname}${portSuffix}`,
+      `${url.protocol}//${alternateHost}${portSuffix}`,
+    ];
+  } catch {
+    return [];
+  }
+};
+
+const getUniqueValues = (values) => [...new Set(values.filter(Boolean))];
+
+// NOTE: every `process.env.*` read in this file shapes the build output and MUST be listed in the
+// `build.env` array of apps/web/turbo.json — the web build's own task config since ENG-1682, not the
+// root turbo.json — so Turborepo hashes it into the cache key. Adding a read here without updating
+// that file serves stale cached builds — from the local Turbo cache and the CI build-output cache
+// alike. Enforced by lib/turbo-build-env.test.ts. Read env vars directly (`process.env.<NAME>` or
+// `process.env["<NAME>"]`), not via destructuring, so that guardrail can detect them.
 /** @type {import('next').NextConfig} */
 
 const nextConfig = {
   assetPrefix: process.env.ASSET_PREFIX_URL || undefined,
+  allowedDevOrigins: process.env.NODE_ENV === "production" ? undefined : LOOPBACK_HOSTS,
   basePath: process.env.BASE_PATH || undefined,
   output: "standalone",
   poweredByHeader: false,
   // Enable source maps only when uploading to Sentry (CI/production); skip for faster local builds
   productionBrowserSourceMaps: !!process.env.SENTRY_AUTH_TOKEN,
   serverExternalPackages: [
+    "@authzed/authzed-node",
     "@aws-sdk",
+    "@grpc/grpc-js",
     "@opentelemetry/api",
     "@opentelemetry/auto-instrumentations-node",
     "@opentelemetry/exporter-metrics-otlp-http",
@@ -30,9 +71,12 @@ const nextConfig = {
     "@opentelemetry/sdk-trace-base",
     "@opentelemetry/semantic-conventions",
     "@prisma/instrumentation",
+    "bullmq",
+    "ioredis",
     "pino",
     "pino-pretty",
     "pino-opentelemetry-transport",
+    "posthog-node",
   ],
   outputFileTracingIncludes: {
     "/api/auth/**/*": ["../../node_modules/jose/**/*"],
@@ -48,8 +92,10 @@ const nextConfig = {
     ],
   },
   turbopack: {},
-  experimental: {},
-  transpilePackages: ["@formbricks/database"],
+  experimental: {
+    proxyClientMaxBodySize: "16mb",
+  },
+  transpilePackages: ["@formbricks/database", "@formbricks/workflows"],
   images: {
     // Optimize image processing to reduce CPU time and prevent timeouts
     deviceSizes: [640, 750, 828, 1080, 1200, 1920], // Removed 3840 to avoid processing huge images
@@ -57,36 +103,15 @@ const nextConfig = {
     formats: ["image/webp"], // WebP is faster to process and smaller than JPEG/PNG
     minimumCacheTTL: 60, // Cache optimized images for at least 60 seconds
     dangerouslyAllowSVG: true, // Allow SVG images
-    remotePatterns: [
-      {
-        protocol: "https",
-        hostname: "avatars.githubusercontent.com",
-      },
-      {
-        protocol: "https",
-        hostname: "avatars.slack-edge.com",
-      },
-      {
-        protocol: "https",
-        hostname: "lh3.googleusercontent.com",
-      },
-      {
-        protocol: "http",
-        hostname: "localhost",
-      },
-      {
-        protocol: "https",
-        hostname: "app.formbricks.com",
-      },
-      {
-        protocol: "https",
-        hostname: "formbricks-cdn.s3.eu-central-1.amazonaws.com",
-      },
-      {
-        protocol: "https",
-        hostname: "images.unsplash.com",
-      },
-    ],
+    // Only universal provider/CDN hosts are optimized (ENG-1678). Same-origin `/storage/...` uploads
+    // are relative paths (local images, always optimized) and need no entry; the deployment's own
+    // domain is intentionally NOT listed since the same build serves every domain. Arbitrary
+    // user-provided external URLs are rendered `unoptimized` (see lib/image-hosts.ts) instead of
+    // being allowlisted, so the optimizer never acts as an open proxy.
+    remotePatterns: OPTIMIZABLE_IMAGE_HOSTS.map((hostname) => ({
+      protocol: LOOPBACK_HOSTS.includes(hostname) ? "http" : "https",
+      hostname,
+    })),
   },
   async redirects() {
     return [
@@ -110,11 +135,6 @@ const nextConfig = {
         destination: "/api/v1/management/me",
         permanent: true,
       },
-      {
-        source: "/api/v1/me",
-        destination: "/api/v1/management/me",
-        permanent: true,
-      },
       // Redirect old project URLs to new workspace URLs
       {
         source: "/environments/:environmentId/project/:path*",
@@ -131,33 +151,47 @@ const nextConfig = {
         destination: "/workspaces/:projectId",
         permanent: true,
       },
+      // Redirect old workspace-scoped account settings to the account-scoped routes.
+      {
+        source: "/workspaces/:workspaceId/settings/account",
+        destination: "/account/settings/profile",
+        permanent: true,
+      },
+      {
+        source: "/workspaces/:workspaceId/settings/account/:path*",
+        destination: "/account/settings/:path*",
+        permanent: true,
+      },
+      // Old workspace-scoped org settings need workspaceId -> organizationId resolution, so they go
+      // through a server route shim (not a static redirect). Non-permanent: the target is resolved
+      // at request time.
+      {
+        source: "/workspaces/:workspaceId/settings/organization",
+        destination: "/legacy-organization-settings/:workspaceId",
+        permanent: false,
+      },
+      {
+        source: "/workspaces/:workspaceId/settings/organization/:path*",
+        destination: "/legacy-organization-settings/:workspaceId/:path*",
+        permanent: false,
+      },
     ];
-  },
-  webpack: (config) => {
-    config.module.rules.push({
-      test: /\.(mp4|webm|ogg|swf|ogv)$/,
-      use: [
-        {
-          loader: "file-loader",
-          options: {
-            publicPath: "/_next/static/videos/",
-            outputPath: "static/videos/",
-            name: "[name].[hash].[ext]",
-          },
-        },
-      ],
-    });
-    config.resolve.fallback = {
-      http: false, // Prevents Next.js from trying to bundle 'http'
-      https: false,
-    };
-    return config;
   },
   async headers() {
     const isProduction = process.env.NODE_ENV === "production";
     const scriptSrcUnsafeEval = isProduction ? "" : " 'unsafe-eval'";
+    const allowLoopbackSources = !isProduction || process.env.E2E_TESTING === "1";
+    const devLoopbackSources = allowLoopbackSources
+      ? getUniqueValues([
+          ...LOOPBACK_WILDCARD_ORIGINS,
+          ...getLoopbackOriginVariants(process.env.WEBAPP_URL),
+          ...getLoopbackOriginVariants(process.env.NEXTAUTH_URL),
+          ...getLoopbackOriginVariants(process.env.S3_ENDPOINT_URL),
+        ])
+      : [];
+    const devLoopbackSourceList = devLoopbackSources.length > 0 ? ` ${devLoopbackSources.join(" ")}` : "";
 
-    const cspBase = `default-src 'self'; script-src 'self' 'unsafe-inline'${scriptSrcUnsafeEval} https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' blob: data: http://localhost:9000 https:; font-src 'self' data: https:; connect-src 'self' http://localhost:9000 https: wss:; frame-src 'self' https://app.cal.com https:; media-src 'self' https:; object-src 'self' data: https:; base-uri 'self'; form-action 'self'`;
+    const cspBase = `default-src 'self'; script-src 'self' 'unsafe-inline'${scriptSrcUnsafeEval} https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' blob: data:${devLoopbackSourceList} https:; font-src 'self' data: https:; connect-src 'self'${devLoopbackSourceList} https: wss:; frame-src 'self' https://app.cal.com https:; media-src 'self' https:; object-src 'self' data: https:; base-uri 'self'; form-action 'self'`;
 
     return [
       {
@@ -420,40 +454,8 @@ const nextConfig = {
     return [
       ...posthogRewrites,
       {
-        source: "/api/packages/website",
-        destination: "/js/formbricks.umd.cjs",
-      },
-      {
-        source: "/api/packages/app",
-        destination: "/js/formbricks.umd.cjs",
-      },
-      {
-        source: "/api/packages/js",
-        destination: "/js/formbricks.umd.cjs",
-      },
-      {
-        source: "/api/packages/surveys",
-        destination: "/js/surveys.umd.cjs",
-      },
-      {
-        source: "/api/v1/client/:environmentId/website/environment",
-        destination: "/api/v1/client/:environmentId/environment",
-      },
-      {
-        source: "/api/v1/client/:environmentId/app/environment",
-        destination: "/api/v1/client/:environmentId/environment",
-      },
-      {
-        source: "/api/v1/management/people/:id*",
-        destination: "/api/v1/management/contacts/:id*",
-      },
-      {
-        source: "/api/v1/management/attribute-classes",
-        destination: "/api/v1/management/contact-attribute-keys",
-      },
-      {
-        source: "/api/v1/management/attribute-classes/:id*",
-        destination: "/api/v1/management/contact-attribute-keys/:id*",
+        source: "/api/v2/organizations/:organizationId/project-teams",
+        destination: "/api/v2/organizations/:organizationId/workspace-teams",
       },
     ];
   },
@@ -470,16 +472,27 @@ if (process.env.WEBAPP_URL) {
   };
 }
 
-// Allow all origins for next/image
-nextConfig.images.remotePatterns.push({
-  protocol: "https",
-  hostname: "**",
-});
+// Build-time release identifier, derived exactly the way the runtime `SENTRY_RELEASE` is
+// derived in lib/constants.ts. CI bumps apps/web/package.json to the release version before
+// the image build (.github/actions/build-and-push-docker/action.yml), so the release the
+// artifacts are uploaded under and the release the events are tagged with always agree.
+// It doubles as the "is this an official release build?" signal below: only CI bumps this
+// file, so an unbumped 0.0.0 means a local or self-hosted build.
+const sentryRelease = (() => {
+  try {
+    const { version } = require("./package.json");
+    return version && version !== "0.0.0" ? `${version}` : undefined;
+  } catch {
+    return undefined;
+  }
+})();
 
 const sentryOptions = {
   // For all available options, see:
   // https://www.npmjs.com/package/@sentry/webpack-plugin#options
-  project: "formbricks-cloud",
+  // Production ingests into formbricks/formbricks (EU). "formbricks-cloud" lives in a
+  // different org (formbricks-us), so uploads were rejected with "projects are invalid".
+  project: "formbricks",
   org: "formbricks",
 
   // Enable logging to debug sourcemap generation issues
@@ -490,11 +503,38 @@ const sentryOptions = {
 
   // Automatically tree-shake Sentry logger statements to reduce bundle size
   disableLogger: false,
+
+  sourcemaps: {
+    // The SDK documents this as defaulting to true, but it only applies that default on the
+    // same path that turns `productionBrowserSourceMaps` on for you — and line 57 already
+    // sets that explicitly, so the SDK bails out first. Without this the generated .map
+    // files stay in the image and are served publicly.
+    deleteSourcemapsAfterUpload: true,
+
+    // Only an official release build uploads. A local or self-hosted build carries 0.0.0, and
+    // its token either has no access to this org (so the upload fails) or does (so a laptop
+    // would create a git-SHA release in our production project). "disable-upload" skips the
+    // upload while still injecting Debug IDs — `true` would skip those too, which would leave
+    // the image unsymbolicatable and defeat the point of the read-secrets.sh change. The
+    // string is honoured by the underlying bundler plugin; @sentry/nextjs types the field as
+    // boolean, so re-verify this if the SDK is upgraded.
+    disable: sentryRelease ? false : "disable-upload",
+  },
+
+  release: { name: sentryRelease },
+
+  // The plugin's default is to log an upload failure and leave the build green, which is why
+  // a wrong project slug went unnoticed for two years. On a release build, fail instead: an
+  // image whose source maps never uploaded produces unreadable production stack traces.
+  errorHandler: sentryRelease
+    ? (err) => {
+        throw err;
+      }
+    : undefined,
 };
 
 // Always enable Sentry plugin to inject Debug IDs
 // Runtime Sentry reporting still depends on DSN being set via environment variables
 const exportConfig = process.env.SENTRY_AUTH_TOKEN ? withSentryConfig(nextConfig, sentryOptions) : nextConfig;
-
 
 export default exportConfig;

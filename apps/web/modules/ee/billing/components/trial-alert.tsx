@@ -2,9 +2,10 @@
 
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { cn } from "@/lib/cn";
 import { Alert, AlertTitle } from "@/modules/ui/components/alert";
 
-type TrialAlertVariant = "error" | "warning" | "info" | "success";
+type TrialAlertVariant = "error" | "warning" | "info";
 
 const getTrialVariant = (daysRemaining: number): TrialAlertVariant => {
   if (daysRemaining <= 3) return "error";
@@ -15,16 +16,11 @@ const getTrialVariant = (daysRemaining: number): TrialAlertVariant => {
 interface TrialAlertProps {
   trialDaysRemaining: number;
   size?: "small";
-  hasPaymentMethod?: boolean;
+  className?: string;
   children?: React.ReactNode;
 }
 
-export const TrialAlert = ({
-  trialDaysRemaining,
-  size,
-  hasPaymentMethod = false,
-  children,
-}: TrialAlertProps) => {
+export const TrialAlert = ({ trialDaysRemaining, size, className, children }: Readonly<TrialAlertProps>) => {
   const { t } = useTranslation();
 
   const title = useMemo(() => {
@@ -33,10 +29,10 @@ export const TrialAlert = ({
     return t("common.trial_days_remaining", { count: trialDaysRemaining });
   }, [trialDaysRemaining, t]);
 
-  const variant = hasPaymentMethod ? "success" : getTrialVariant(trialDaysRemaining);
+  const variant = getTrialVariant(trialDaysRemaining);
 
   return (
-    <Alert variant={variant} size={size} className="max-w-4xl">
+    <Alert variant={variant} size={size} className={cn("max-w-4xl", className)} role="status">
       <AlertTitle>{title}</AlertTitle>
       {children}
     </Alert>

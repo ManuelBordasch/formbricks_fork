@@ -1,8 +1,10 @@
-import { Prisma } from "@prisma/client";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { DatabaseError, ValidationError } from "@formbricks/types/errors";
+import { getSurvey } from "@/lib/survey/service";
 import { getContactSurveyLink } from "@/modules/ee/contacts/lib/contact-survey-link";
+import { SEGMENT_SURVEY_WORKSPACE_MISMATCH_ERROR_CODE } from "@/modules/ee/contacts/lib/personal-link-errors";
 import { segmentFilterToPrismaQuery } from "@/modules/ee/contacts/segments/lib/filter/prisma-query";
 import { getSegment } from "@/modules/ee/contacts/segments/lib/segments";
 import {
@@ -11,6 +13,7 @@ import {
   deleteContact,
   generatePersonalLinks,
   getContact,
+  getContactInWorkspace,
   getContacts,
   getContactsInSegment,
 } from "./contacts";
@@ -20,6 +23,7 @@ vi.mock("@formbricks/database", () => ({
   prisma: {
     contact: {
       findMany: vi.fn(),
+      findFirst: vi.fn(),
       findUnique: vi.fn(),
       delete: vi.fn(),
       create: vi.fn(),
@@ -38,6 +42,10 @@ vi.mock("@formbricks/database", () => ({
 
 vi.mock("@/lib/utils/validate", () => ({
   validateInputs: vi.fn(),
+}));
+
+vi.mock("@/lib/survey/service", () => ({
+  getSurvey: vi.fn(),
 }));
 
 vi.mock("@/modules/ee/contacts/segments/lib/segments", () => ({
@@ -64,7 +72,7 @@ vi.mock("@formbricks/logger", () => ({
   },
 }));
 
-const mockEnvironmentId = "env-123";
+const mockWorkspaceId = "workspace-123";
 const mockContactId = "contact-123";
 const mockSegmentId = "segment-123";
 const mockSurveyId = "survey-123";
@@ -72,7 +80,6 @@ const mockPrismaContact = {
   id: mockContactId,
   createdAt: new Date("2024-01-01"),
   updatedAt: new Date("2024-01-02"),
-  environmentId: mockEnvironmentId,
   attributes: [
     {
       value: "john@example.com",
@@ -89,7 +96,6 @@ const mockTransformedContact = {
   id: mockContactId,
   createdAt: new Date("2024-01-01"),
   updatedAt: new Date("2024-01-02"),
-  environmentId: mockEnvironmentId,
   attributes: {
     email: "john@example.com",
     name: "John Doe",
@@ -102,17 +108,17 @@ describe("Contacts Lib", () => {
   });
 
   describe("buildContactWhereClause", () => {
-    test("returns where clause with only environmentId when no search provided", () => {
-      const result = buildContactWhereClause(mockEnvironmentId);
-      expect(result).toEqual({ environmentId: mockEnvironmentId });
+    test("returns where clause with only workspaceId when no search provided", () => {
+      const result = buildContactWhereClause(mockWorkspaceId);
+      expect(result).toEqual({ workspaceId: mockWorkspaceId });
     });
 
     test("returns where clause with search filters when search is provided", () => {
       const searchTerm = "john";
-      const result = buildContactWhereClause(mockEnvironmentId, searchTerm);
+      const result = buildContactWhereClause(mockWorkspaceId, searchTerm);
 
       expect(result).toEqual({
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
         OR: [
           {
             attributes: {
@@ -135,8 +141,8 @@ describe("Contacts Lib", () => {
     });
 
     test("handles empty search string same as no search", () => {
-      const result = buildContactWhereClause(mockEnvironmentId, "");
-      expect(result).toEqual({ environmentId: mockEnvironmentId });
+      const result = buildContactWhereClause(mockWorkspaceId, "");
+      expect(result).toEqual({ workspaceId: mockWorkspaceId });
     });
   });
 
@@ -145,7 +151,7 @@ describe("Contacts Lib", () => {
       const mockSegmentData = {
         id: mockSegmentId,
         filters: [],
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
       };
 
       const mockContactsInSegment = [
@@ -163,7 +169,7 @@ describe("Contacts Lib", () => {
       vi.mocked(getSegment).mockResolvedValue(mockSegmentData as any);
       vi.mocked(segmentFilterToPrismaQuery).mockResolvedValue({
         ok: true,
-        data: { whereClause: { environmentId: mockEnvironmentId } },
+        data: { whereClause: { workspaceId: mockWorkspaceId } },
       } as any);
       vi.mocked(prisma.contact.findMany).mockResolvedValue(mockContactsInSegment as any);
 
@@ -191,7 +197,7 @@ describe("Contacts Lib", () => {
       const mockSegmentData = {
         id: mockSegmentId,
         filters: [],
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
       };
 
       vi.mocked(getSegment).mockResolvedValue(mockSegmentData as any);
@@ -209,13 +215,13 @@ describe("Contacts Lib", () => {
       const mockSegmentData = {
         id: mockSegmentId,
         filters: [],
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
       };
 
       vi.mocked(getSegment).mockResolvedValue(mockSegmentData as any);
       vi.mocked(segmentFilterToPrismaQuery).mockResolvedValue({
         ok: true,
-        data: { whereClause: { environmentId: mockEnvironmentId } },
+        data: { whereClause: { workspaceId: mockWorkspaceId } },
       } as any);
       vi.mocked(prisma.contact.findMany).mockRejectedValue(new Error("DB Error"));
 
@@ -228,7 +234,7 @@ describe("Contacts Lib", () => {
       const mockSegmentData = {
         id: mockSegmentId,
         filters: [],
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
       };
 
       const mockContactsInSegment = [
@@ -246,7 +252,7 @@ describe("Contacts Lib", () => {
       vi.mocked(getSegment).mockResolvedValue(mockSegmentData as any);
       vi.mocked(segmentFilterToPrismaQuery).mockResolvedValue({
         ok: true,
-        data: { whereClause: { environmentId: mockEnvironmentId } },
+        data: { whereClause: { workspaceId: mockWorkspaceId } },
       } as any);
       vi.mocked(prisma.contact.findMany).mockResolvedValue(mockContactsInSegment as any);
 
@@ -271,11 +277,11 @@ describe("Contacts Lib", () => {
       vi.mocked(prisma.contact.findMany).mockResolvedValue([mockPrismaContact] as any);
       vi.mocked(transformPrismaContact).mockReturnValue(mockTransformedContact as any);
 
-      const result = await getContacts(mockEnvironmentId);
+      const result = await getContacts(mockWorkspaceId);
 
       expect(result).toEqual([mockTransformedContact]);
       expect(prisma.contact.findMany).toHaveBeenCalledWith({
-        where: { environmentId: mockEnvironmentId },
+        where: { workspaceId: mockWorkspaceId },
         select: expect.any(Object),
         take: 30,
         skip: undefined,
@@ -287,11 +293,11 @@ describe("Contacts Lib", () => {
       vi.mocked(prisma.contact.findMany).mockResolvedValue([mockPrismaContact] as any);
       vi.mocked(transformPrismaContact).mockReturnValue(mockTransformedContact as any);
 
-      const result = await getContacts(mockEnvironmentId, 30);
+      const result = await getContacts(mockWorkspaceId, 30);
 
       expect(result).toEqual([mockTransformedContact]);
       expect(prisma.contact.findMany).toHaveBeenCalledWith({
-        where: { environmentId: mockEnvironmentId },
+        where: { workspaceId: mockWorkspaceId },
         select: expect.any(Object),
         take: 30,
         skip: 30,
@@ -304,11 +310,11 @@ describe("Contacts Lib", () => {
       vi.mocked(prisma.contact.findMany).mockResolvedValue([mockPrismaContact] as any);
       vi.mocked(transformPrismaContact).mockReturnValue(mockTransformedContact as any);
 
-      const result = await getContacts(mockEnvironmentId, undefined, searchValue);
+      const result = await getContacts(mockWorkspaceId, undefined, searchValue);
 
       expect(result).toEqual([mockTransformedContact]);
       expect(prisma.contact.findMany).toHaveBeenCalledWith({
-        where: buildContactWhereClause(mockEnvironmentId, searchValue),
+        where: buildContactWhereClause(mockWorkspaceId, searchValue),
         select: expect.any(Object),
         take: 30,
         skip: undefined,
@@ -323,14 +329,14 @@ describe("Contacts Lib", () => {
       });
       vi.mocked(prisma.contact.findMany).mockRejectedValue(prismaError);
 
-      await expect(getContacts(mockEnvironmentId)).rejects.toThrow(DatabaseError);
+      await expect(getContacts(mockWorkspaceId)).rejects.toThrow(DatabaseError);
     });
 
     test("re-throws non-Prisma errors", async () => {
       const error = new Error("Unknown error");
       vi.mocked(prisma.contact.findMany).mockRejectedValue(error);
 
-      await expect(getContacts(mockEnvironmentId)).rejects.toThrow(error);
+      await expect(getContacts(mockWorkspaceId)).rejects.toThrow(error);
     });
 
     test("returns multiple contacts", async () => {
@@ -340,7 +346,7 @@ describe("Contacts Lib", () => {
         .mockReturnValueOnce(mockTransformedContact as any)
         .mockReturnValueOnce({ ...mockTransformedContact, id: "contact-2" } as any);
 
-      const result = await getContacts(mockEnvironmentId);
+      const result = await getContacts(mockWorkspaceId);
 
       expect(result).toHaveLength(2);
     });
@@ -382,6 +388,55 @@ describe("Contacts Lib", () => {
       vi.mocked(prisma.contact.findUnique).mockRejectedValue(error);
 
       await expect(getContact(mockContactId)).rejects.toThrow(error);
+    });
+  });
+
+  // ENG-2290: the contact detail page authorizes the workspace in the URL and must not be able to
+  // load a contact from another workspace with it. `getContact` stays unscoped on purpose — it is
+  // what derives a contact's workspace elsewhere — so page reads go through this scoped sibling.
+  describe("getContactInWorkspace", () => {
+    test("returns the contact when it belongs to the workspace", async () => {
+      vi.mocked(prisma.contact.findFirst).mockResolvedValue(mockPrismaContact as any);
+
+      const result = await getContactInWorkspace(mockContactId, mockWorkspaceId);
+
+      expect(result).toEqual(mockPrismaContact);
+      expect(prisma.contact.findFirst).toHaveBeenCalledWith({
+        where: { id: mockContactId, workspaceId: mockWorkspaceId },
+        select: expect.any(Object),
+      });
+    });
+
+    test("returns null for a contact in another workspace", async () => {
+      // The scoped where clause is what makes this null: Prisma finds no row for the pair.
+      vi.mocked(prisma.contact.findFirst).mockResolvedValue(null);
+
+      const result = await getContactInWorkspace(mockContactId, "workspace-attacker");
+
+      expect(result).toBeNull();
+      expect(prisma.contact.findFirst).toHaveBeenCalledWith({
+        where: { id: mockContactId, workspaceId: "workspace-attacker" },
+        select: expect.any(Object),
+      });
+      // The unscoped lookup must not be used as a fallback.
+      expect(prisma.contact.findUnique).not.toHaveBeenCalled();
+    });
+
+    test("throws DatabaseError on Prisma error", async () => {
+      const prismaError = new Prisma.PrismaClientKnownRequestError("DB Error", {
+        code: "P2002",
+        clientVersion: "5.0.0",
+      });
+      vi.mocked(prisma.contact.findFirst).mockRejectedValue(prismaError);
+
+      await expect(getContactInWorkspace(mockContactId, mockWorkspaceId)).rejects.toThrow(DatabaseError);
+    });
+
+    test("re-throws non-Prisma errors", async () => {
+      const error = new Error("Unknown error");
+      vi.mocked(prisma.contact.findFirst).mockRejectedValue(error);
+
+      await expect(getContactInWorkspace(mockContactId, mockWorkspaceId)).rejects.toThrow(error);
     });
   });
 
@@ -438,12 +493,12 @@ describe("Contacts Lib", () => {
 
       const mockCreatedContact = {
         id: "new-contact-1",
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
         attributes: [{ attributeKey: { key: "email" }, value: "john@example.com" }],
       };
       vi.mocked(prisma.contact.create).mockResolvedValue(mockCreatedContact as any);
 
-      const result = await createContactsFromCSV(csvData, mockEnvironmentId, "skip", attributeMap);
+      const result = await createContactsFromCSV(csvData, mockWorkspaceId, "skip", attributeMap);
 
       expect(result).toBeDefined();
       expect("contacts" in result).toBe(true);
@@ -467,7 +522,7 @@ describe("Contacts Lib", () => {
         .mockResolvedValueOnce([{ key: "name", id: "key-3", dataType: "string" }] as any);
       vi.mocked(prisma.contactAttributeKey.createMany).mockResolvedValue({ count: 1 });
 
-      const result = await createContactsFromCSV(csvData, mockEnvironmentId, "skip", attributeMap);
+      const result = await createContactsFromCSV(csvData, mockWorkspaceId, "skip", attributeMap);
 
       expect("contacts" in result).toBe(true);
     });
@@ -493,7 +548,7 @@ describe("Contacts Lib", () => {
       vi.mocked(prisma.contactAttributeKey.createMany).mockResolvedValue({ count: 1 });
       vi.mocked(prisma.contact.update).mockResolvedValue(existingContact as any);
 
-      const result = await createContactsFromCSV(csvData, mockEnvironmentId, "update", attributeMap);
+      const result = await createContactsFromCSV(csvData, mockWorkspaceId, "update", attributeMap);
 
       expect("contacts" in result).toBe(true);
     });
@@ -520,7 +575,7 @@ describe("Contacts Lib", () => {
       vi.mocked(prisma.contactAttribute.deleteMany).mockResolvedValue({ count: 2 });
       vi.mocked(prisma.contact.update).mockResolvedValue(existingContact as any);
 
-      const result = await createContactsFromCSV(csvData, mockEnvironmentId, "overwrite", attributeMap);
+      const result = await createContactsFromCSV(csvData, mockWorkspaceId, "overwrite", attributeMap);
 
       expect("contacts" in result).toBe(true);
     });
@@ -535,8 +590,24 @@ describe("Contacts Lib", () => {
         .mockResolvedValueOnce([{ key: "userid", id: "key-1" }] as any);
 
       await expect(
-        createContactsFromCSV(invalidCsvData as any, mockEnvironmentId, "skip", attributeMap)
+        createContactsFromCSV(invalidCsvData as any, mockWorkspaceId, "skip", attributeMap)
       ).rejects.toThrow(ValidationError);
+    });
+
+    test("throws ValidationError when CSV creates reserved future default keys", async () => {
+      const reservedCsvData = [{ email: "john@example.com", user_id: "user-1" }];
+      const attributeMap = { email: "email", user_id: "user_id" };
+
+      vi.mocked(prisma.contact.findMany).mockResolvedValueOnce([]);
+      vi.mocked(prisma.contactAttribute.findMany).mockResolvedValue([]);
+      vi.mocked(prisma.contactAttributeKey.findMany).mockResolvedValueOnce([
+        { key: "email", id: "key-1", dataType: "string" },
+      ] as any);
+
+      await expect(
+        createContactsFromCSV(reservedCsvData as any, mockWorkspaceId, "skip", attributeMap)
+      ).rejects.toThrow(ValidationError);
+      expect(prisma.contactAttributeKey.createMany).not.toHaveBeenCalled();
     });
 
     test("throws DatabaseError on Prisma error", async () => {
@@ -548,7 +619,7 @@ describe("Contacts Lib", () => {
 
       vi.mocked(prisma.contact.findMany).mockRejectedValue(prismaError);
 
-      await expect(createContactsFromCSV(csvData, mockEnvironmentId, "skip", attributeMap)).rejects.toThrow(
+      await expect(createContactsFromCSV(csvData, mockWorkspaceId, "skip", attributeMap)).rejects.toThrow(
         DatabaseError
       );
     });
@@ -567,11 +638,11 @@ describe("Contacts Lib", () => {
       vi.mocked(prisma.contactAttributeKey.createMany).mockResolvedValue({ count: 1 });
       vi.mocked(prisma.contact.create).mockResolvedValue({
         id: "new-1",
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
         attributes: [],
       } as any);
 
-      const result = await createContactsFromCSV(csvData, mockEnvironmentId, "skip", attributeMap);
+      const result = await createContactsFromCSV(csvData, mockWorkspaceId, "skip", attributeMap);
 
       expect(prisma.contactAttributeKey.createMany).toHaveBeenCalled();
       expect("contacts" in result).toBe(true);
@@ -591,13 +662,13 @@ describe("Contacts Lib", () => {
       ] as any);
       vi.mocked(prisma.contact.create).mockResolvedValue({
         id: "new-1",
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
         attributes: [],
       } as any);
 
       const result = await createContactsFromCSV(
         csvDataWithMixedCase as any,
-        mockEnvironmentId,
+        mockWorkspaceId,
         "skip",
         attributeMap
       );
@@ -633,12 +704,7 @@ describe("Contacts Lib", () => {
 
       vi.mocked(prisma.contact.update).mockResolvedValue(existingContact as any);
 
-      const result = await createContactsFromCSV(
-        csvDataWithUserId,
-        mockEnvironmentId,
-        "update",
-        attributeMap
-      );
+      const result = await createContactsFromCSV(csvDataWithUserId, mockWorkspaceId, "update", attributeMap);
 
       expect("contacts" in result).toBe(true);
       expect(prisma.contact.update).toHaveBeenCalled();
@@ -675,7 +741,7 @@ describe("Contacts Lib", () => {
 
       const result = await createContactsFromCSV(
         csvDataWithUserId,
-        mockEnvironmentId,
+        mockWorkspaceId,
         "overwrite",
         attributeMap
       );
@@ -705,18 +771,19 @@ describe("Contacts Lib", () => {
 
       vi.mocked(prisma.contact.update).mockResolvedValue(existingContact as any);
 
-      const result = await createContactsFromCSV(
-        csvDataWithUserId,
-        mockEnvironmentId,
-        "update",
-        attributeMap
-      );
+      const result = await createContactsFromCSV(csvDataWithUserId, mockWorkspaceId, "update", attributeMap);
 
       expect("contacts" in result).toBe(true);
     });
   });
 
   describe("generatePersonalLinks", () => {
+    beforeEach(() => {
+      // Default: survey lives in the same workspace as the segment so the
+      // cross-tenant guard passes. Individual tests override as needed.
+      vi.mocked(getSurvey).mockResolvedValue({ workspaceId: mockWorkspaceId } as any);
+    });
+
     test("generates survey links for contacts in segment", async () => {
       const mockPrismaContactData = [
         {
@@ -738,13 +805,13 @@ describe("Contacts Lib", () => {
       const mockSegmentData = {
         id: mockSegmentId,
         filters: [],
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
       };
 
       vi.mocked(getSegment).mockResolvedValue(mockSegmentData as any);
       vi.mocked(segmentFilterToPrismaQuery).mockResolvedValue({
         ok: true,
-        data: { whereClause: { environmentId: mockEnvironmentId } },
+        data: { whereClause: { workspaceId: mockWorkspaceId } },
       } as any);
       vi.mocked(prisma.contact.findMany).mockResolvedValue(mockPrismaContactData as any);
 
@@ -770,13 +837,13 @@ describe("Contacts Lib", () => {
       const mockSegmentData = {
         id: mockSegmentId,
         filters: [],
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
       };
 
       vi.mocked(getSegment).mockResolvedValue(mockSegmentData as any);
       vi.mocked(segmentFilterToPrismaQuery).mockResolvedValue({
         ok: true,
-        data: { whereClause: { environmentId: mockEnvironmentId } },
+        data: { whereClause: { workspaceId: mockWorkspaceId } },
       } as any);
       vi.mocked(prisma.contact.findMany).mockResolvedValue(mockPrismaContactData as any);
       vi.mocked(getContactSurveyLink).mockResolvedValue({
@@ -807,13 +874,13 @@ describe("Contacts Lib", () => {
       const mockSegmentData = {
         id: mockSegmentId,
         filters: [],
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
       };
 
       vi.mocked(getSegment).mockResolvedValue(mockSegmentData as any);
       vi.mocked(segmentFilterToPrismaQuery).mockResolvedValue({
         ok: true,
-        data: { whereClause: { environmentId: mockEnvironmentId } },
+        data: { whereClause: { workspaceId: mockWorkspaceId } },
       } as any);
       vi.mocked(prisma.contact.findMany).mockResolvedValue(mockPrismaContactData as any);
       vi.mocked(getContactSurveyLink)
@@ -839,13 +906,13 @@ describe("Contacts Lib", () => {
       const mockSegmentData = {
         id: mockSegmentId,
         filters: [],
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
       };
 
       vi.mocked(getSegment).mockResolvedValue(mockSegmentData as any);
       vi.mocked(segmentFilterToPrismaQuery).mockResolvedValue({
         ok: true,
-        data: { whereClause: { environmentId: mockEnvironmentId } },
+        data: { whereClause: { workspaceId: mockWorkspaceId } },
       } as any);
       vi.mocked(prisma.contact.findMany).mockResolvedValue([]);
 
@@ -865,13 +932,13 @@ describe("Contacts Lib", () => {
       const mockSegmentData = {
         id: mockSegmentId,
         filters: [],
-        environmentId: mockEnvironmentId,
+        workspaceId: mockWorkspaceId,
       };
 
       vi.mocked(getSegment).mockResolvedValue(mockSegmentData as any);
       vi.mocked(segmentFilterToPrismaQuery).mockResolvedValue({
         ok: true,
-        data: { whereClause: { environmentId: mockEnvironmentId } },
+        data: { whereClause: { workspaceId: mockWorkspaceId } },
       } as any);
       vi.mocked(prisma.contact.findMany).mockResolvedValue(mockPrismaContactData as any);
       vi.mocked(getContactSurveyLink).mockResolvedValue({
@@ -882,6 +949,38 @@ describe("Contacts Lib", () => {
       const result = await generatePersonalLinks(mockSurveyId, mockSegmentId);
 
       expect(result).toHaveLength(0);
+    });
+
+    test("throws when the segment belongs to a different workspace than the survey (cross-tenant guard)", async () => {
+      // Survey is in workspace A, segment is in workspace B. The caller was only
+      // authorized against the survey's workspace, so reading the segment's
+      // contacts would leak another workspace's PII. Must reject before any
+      // contact is read.
+      vi.mocked(getSurvey).mockResolvedValue({ workspaceId: "workspace-A" } as any);
+      vi.mocked(getSegment).mockResolvedValue({
+        id: mockSegmentId,
+        filters: [],
+        workspaceId: "workspace-B",
+      } as any);
+
+      await expect(generatePersonalLinks(mockSurveyId, mockSegmentId)).rejects.toThrow(ValidationError);
+      // Message is a stable error code the client maps to a localized string.
+      await expect(generatePersonalLinks(mockSurveyId, mockSegmentId)).rejects.toThrow(
+        SEGMENT_SURVEY_WORKSPACE_MISMATCH_ERROR_CODE
+      );
+
+      // No contacts should have been queried for the foreign segment.
+      expect(prisma.contact.findMany).not.toHaveBeenCalled();
+      expect(getContactSurveyLink).not.toHaveBeenCalled();
+    });
+
+    test("returns null when the survey does not exist", async () => {
+      vi.mocked(getSurvey).mockResolvedValue(null as any);
+
+      const result = await generatePersonalLinks(mockSurveyId, mockSegmentId);
+
+      expect(result).toBeNull();
+      expect(getSegment).not.toHaveBeenCalled();
     });
   });
 });

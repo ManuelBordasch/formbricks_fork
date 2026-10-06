@@ -1,8 +1,9 @@
-import { Prisma } from "@prisma/client";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { DatabaseError, UnknownError } from "@formbricks/types/errors";
 import { TMembership } from "@formbricks/types/memberships";
+import { reconcileOrganizationMembership } from "../authzed/organization-membership";
 import { createMembership, getMembershipByUserIdOrganizationId } from "./service";
 
 vi.mock("@formbricks/database", () => ({
@@ -13,6 +14,10 @@ vi.mock("@formbricks/database", () => ({
       update: vi.fn(),
     },
   },
+}));
+
+vi.mock("../authzed/organization-membership", () => ({
+  reconcileOrganizationMembership: vi.fn(),
 }));
 
 describe("Membership Service", () => {
@@ -68,6 +73,33 @@ describe("Membership Service", () => {
 
       await expect(getMembershipByUserIdOrganizationId(mockUserId, mockOrgId)).rejects.toThrow(UnknownError);
     });
+
+    test("uses the transaction client directly when provided", async () => {
+      const mockMembership: TMembership = {
+        organizationId: mockOrgId,
+        userId: mockUserId,
+        accepted: true,
+        role: "owner",
+      };
+      const tx = {
+        membership: {
+          findUnique: vi.fn().mockResolvedValue(mockMembership),
+        },
+      } as any;
+
+      const result = await getMembershipByUserIdOrganizationId(mockUserId, mockOrgId, tx);
+
+      expect(result).toEqual(mockMembership);
+      expect(tx.membership.findUnique).toHaveBeenCalledWith({
+        where: {
+          userId_organizationId: {
+            userId: mockUserId,
+            organizationId: mockOrgId,
+          },
+        },
+      });
+      expect(prisma.membership.findUnique).not.toHaveBeenCalled();
+    });
   });
 
   describe("createMembership", () => {
@@ -100,6 +132,7 @@ describe("Membership Service", () => {
           role: mockMembershipData.role,
         },
       });
+      expect(reconcileOrganizationMembership).toHaveBeenCalledWith(mockOrgId, mockUserId);
     });
 
     test("returns existing membership if role matches", async () => {
@@ -116,6 +149,7 @@ describe("Membership Service", () => {
       expect(result).toEqual(existingMembership);
       expect(prisma.membership.create).not.toHaveBeenCalled();
       expect(prisma.membership.update).not.toHaveBeenCalled();
+      expect(reconcileOrganizationMembership).toHaveBeenCalledWith(mockOrgId, mockUserId);
     });
 
     test("updates existing membership if role differs", async () => {
@@ -148,6 +182,33 @@ describe("Membership Service", () => {
           role: "owner",
         },
       });
+      expect(reconcileOrganizationMembership).toHaveBeenCalledWith(mockOrgId, mockUserId);
+    });
+
+    test("defers projection when the membership participates in an outer transaction", async () => {
+      const createdMembership = {
+        organizationId: mockOrgId,
+        userId: mockUserId,
+        accepted: true,
+        role: "member",
+      } as TMembership;
+      const transaction = {
+        membership: {
+          create: vi.fn().mockResolvedValue(createdMembership),
+          findUnique: vi.fn().mockResolvedValue(null),
+          update: vi.fn(),
+        },
+      } as any;
+
+      await expect(
+        createMembership(mockOrgId, mockUserId, mockMembershipData, {
+          projection: "deferred",
+          transaction,
+        })
+      ).resolves.toEqual(createdMembership);
+
+      expect(transaction.membership.create).toHaveBeenCalled();
+      expect(reconcileOrganizationMembership).not.toHaveBeenCalled();
     });
 
     test("throws DatabaseError on Prisma error", async () => {

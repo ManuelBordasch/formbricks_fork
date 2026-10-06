@@ -4,6 +4,7 @@ import { ListItemNode, ListNode } from "@lexical/list";
 import { LINK, TRANSFORMERS } from "@lexical/markdown";
 import { AutoFocusPlugin } from "@lexical/react/LexicalAutoFocusPlugin";
 import { LexicalComposer } from "@lexical/react/LexicalComposer";
+import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
 import { ContentEditable } from "@lexical/react/LexicalContentEditable";
 import { LexicalErrorBoundary } from "@lexical/react/LexicalErrorBoundary";
 import { LinkPlugin } from "@lexical/react/LexicalLinkPlugin";
@@ -12,7 +13,7 @@ import { MarkdownShortcutPlugin } from "@lexical/react/LexicalMarkdownShortcutPl
 import { RichTextPlugin } from "@lexical/react/LexicalRichTextPlugin";
 import { HeadingNode, QuoteNode } from "@lexical/rich-text";
 import { TableCellNode, TableNode, TableRowNode } from "@lexical/table";
-import { type Dispatch, type SetStateAction, useRef, useState } from "react";
+import { type Dispatch, type SetStateAction, useEffect, useRef, useState } from "react";
 import { TSurvey, TSurveyRecallItem } from "@formbricks/types/surveys/types";
 import { cn } from "@/lib/cn";
 import { FallbackInput } from "@/modules/survey/components/element-form-input/components/fallback-input";
@@ -24,6 +25,7 @@ import "../styles-editor.css";
 import { PlaygroundAutoLinkPlugin as AutoLinkPlugin } from "./auto-link-plugin";
 import { EditorContentChecker } from "./editor-content-checker";
 import { LinkEditor } from "./link-editor";
+import { ListTabIndentationPlugin } from "./list-tab-indentation-plugin";
 import { RecallNode } from "./recall-node";
 import { RecallPlugin } from "./recall-plugin";
 import { ToolbarPlugin } from "./toolbar-plugin";
@@ -50,6 +52,12 @@ export type TextEditorProps = {
   editable?: boolean;
   onEmptyChange?: (isEmpty: boolean) => void;
   isInvalid?: boolean;
+  /**
+   * Id of the element describing an invalid state (an inline error message). Forwarded to the
+   * contenteditable alongside `aria-invalid`, so the editor announces its error like a native input
+   * does — `isInvalid` alone only paints the border red.
+   */
+  ariaDescribedBy?: string;
   localSurvey?: TSurvey;
   elementId?: string;
   selectedLanguageCode?: string;
@@ -82,6 +90,21 @@ const editorConfig = {
   ],
 };
 
+// LexicalComposer only reads `initialConfig.editable` at mount; without this sync a mounted
+// editor keeps its initial mode when the `editable` prop flips (e.g. a workflow being enabled
+// while its email body is open in the inspector).
+const SyncEditablePlugin = ({ editable }: Readonly<{ editable: boolean }>) => {
+  const [editor] = useLexicalComposerContext();
+
+  useEffect(() => {
+    if (editor.isEditable() !== editable) {
+      editor.setEditable(editable);
+    }
+  }, [editor, editable]);
+
+  return null;
+};
+
 export const Editor = (props: TextEditorProps) => {
   const editable = props.editable ?? true;
   const editorContainerRef = useRef<HTMLDivElement>(null);
@@ -94,11 +117,18 @@ export const Editor = (props: TextEditorProps) => {
 
   return (
     <>
-      <div className="editor cursor-text rounded-md">
+      <div className={cn("editor rounded-md", editable ? "cursor-text" : "cursor-not-allowed")}>
         <LexicalComposer initialConfig={{ ...editorConfig, editable }}>
+          <SyncEditablePlugin editable={editable} />
           <div
             ref={editorContainerRef}
-            className={cn("editor-container rounded-md p-0", props.isInvalid && "!border !border-red-500")}>
+            className={cn(
+              "editor-container rounded-md p-0",
+              // Defined in styles-editor.css — see the comment there for why this state can't be
+              // expressed as Tailwind utilities.
+              !editable && "editor-container-disabled",
+              props.isInvalid && "border! border-red-500!"
+            )}>
             <ToolbarPlugin
               getText={props.getText}
               setText={props.setText}
@@ -118,26 +148,33 @@ export const Editor = (props: TextEditorProps) => {
               isExternalUrlsAllowed={props.isExternalUrlsAllowed}
             />
             {props.onEmptyChange ? <EditorContentChecker onEmptyChange={props.onEmptyChange} /> : null}
-            <div
-              className={cn("editor-inner scroll-bar", !editable && "bg-muted")}
-              style={{ height: props.height }}>
+            <div className="editor-inner scroll-bar" style={{ height: props.height }}>
               <RichTextPlugin
                 contentEditable={
                   <ContentEditable
                     style={{ height: props.height }}
                     className="editor-input"
                     aria-labelledby={props.id}
+                    aria-invalid={props.isInvalid ? true : undefined}
+                    aria-describedby={props.ariaDescribedBy}
                     dir="auto"
                   />
                 }
                 placeholder={
-                  <div className="-mt-11 cursor-text p-3 text-sm text-slate-400" dir="auto">
+                  // Overlay the (empty-state-only) placeholder on the contentEditable instead of
+                  // flowing after it — a static sibling would render below the input, which shows
+                  // once the input's min-height exceeds one line. pointer-events-none keeps clicks
+                  // on the placeholder text focusing the editor. Padding/leading mirror .editor-input.
+                  <div
+                    className="pointer-events-none absolute top-0 left-0 px-2.5 pt-[5px] text-sm leading-6 text-slate-400"
+                    dir="auto">
                     {props.placeholder ?? ""}
                   </div>
                 }
                 ErrorBoundary={LexicalErrorBoundary}
               />
               <ListPlugin />
+              <ListTabIndentationPlugin />
               {props.isExternalUrlsAllowed && <LinkPlugin />}
               {props.isExternalUrlsAllowed && <AutoLinkPlugin />}
               {props.autoFocus && <AutoFocusPlugin />}

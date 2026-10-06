@@ -1,29 +1,37 @@
 "use client";
 
-import { signIn } from "next-auth/react";
 import { useTranslation } from "react-i18next";
 import { FORMBRICKS_LOGGED_IN_WITH_LS } from "@/lib/localStorage";
-import { getCallbackUrl } from "@/modules/ee/sso/lib/utils";
+import { authClient } from "@/modules/auth/lib/auth-client";
+import { getSsoReturnToUrl } from "@/modules/ee/sso/lib/utils";
 import { Button } from "@/modules/ui/components/button";
 import { GithubIcon } from "@/modules/ui/components/icons";
 
 interface GithubButtonProps {
-  inviteUrl?: string;
+  returnToUrl?: string;
   lastUsed?: boolean;
+  variant?: "default" | "secondary";
   source: "signin" | "signup";
 }
 
-export const GithubButton = ({ inviteUrl, lastUsed, source }: GithubButtonProps) => {
+export const GithubButton = ({
+  returnToUrl,
+  lastUsed,
+  variant = "secondary",
+  source,
+}: Readonly<GithubButtonProps>) => {
   const { t } = useTranslation();
   const handleLogin = async () => {
     if (typeof window !== "undefined") {
       localStorage.setItem(FORMBRICKS_LOGGED_IN_WITH_LS, "Github");
     }
-    const callbackUrlWithSource = getCallbackUrl(inviteUrl, source);
+    const returnToUrlWithSource = getSsoReturnToUrl(returnToUrl, source);
 
-    await signIn("github", {
-      redirect: true,
-      callbackUrl: callbackUrlWithSource,
+    await authClient.signIn.social({
+      provider: "github",
+      callbackURL: returnToUrlWithSource,
+      // OAuth failures redirect here so the login page's existing ?error= UX surfaces them (parity).
+      errorCallbackURL: "/auth/login",
     });
   };
 
@@ -31,11 +39,11 @@ export const GithubButton = ({ inviteUrl, lastUsed, source }: GithubButtonProps)
     <Button
       type="button"
       onClick={handleLogin}
-      variant="secondary"
-      className="relative w-full justify-center">
-      {t("auth.continue_with_github")}
+      variant={variant}
+      className="h-11 w-full min-w-0 justify-center sm:h-9">
+      <span className="truncate">{t("auth.continue_with_github")}</span>
       <GithubIcon />
-      {lastUsed && <span className="absolute right-3 text-xs opacity-50">{t("auth.last_used")}</span>}
+      {lastUsed && <span className="shrink-0 text-xs opacity-50">{t("auth.last_used")}</span>}
     </Button>
   );
 };

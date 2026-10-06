@@ -1,30 +1,19 @@
 import "server-only";
-import { Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
 import { z } from "zod";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { ZId } from "@formbricks/types/common";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
 import { TUser, TUserLocale, TUserUpdateInput, ZUserUpdateInput } from "@formbricks/types/user";
+import { deleteUserOrganizationRelationships } from "@/lib/authzed/organization-membership";
+import { runPostCommitProjection } from "@/lib/authzed/projection-boundary";
+import { deleteUserTeamRelationships } from "@/lib/authzed/team-workspace";
 import { deleteOrganization, getOrganizationsWhereUserIsSingleOwner } from "@/lib/organization/service";
 import { deleteBrevoCustomerByEmail } from "@/modules/auth/lib/brevo";
 import { validateInputs } from "../utils/validate";
-
-const responseSelection = {
-  id: true,
-  name: true,
-  email: true,
-  emailVerified: true,
-  createdAt: true,
-  updatedAt: true,
-  twoFactorEnabled: true,
-  identityProvider: true,
-  notificationSettings: true,
-  locale: true,
-  lastLoginAt: true,
-  isActive: true,
-};
+import { publicUserSelect } from "./public-user";
 
 // function to retrive basic information about a user's user
 export const getUser = reactCache(async (id: string): Promise<TUser | null> => {
@@ -35,7 +24,7 @@ export const getUser = reactCache(async (id: string): Promise<TUser | null> => {
       where: {
         id,
       },
-      select: responseSelection,
+      select: publicUserSelect,
     });
 
     if (!user) {
@@ -59,7 +48,7 @@ export const getUserByEmail = reactCache(async (email: string): Promise<TUser | 
       where: {
         email,
       },
-      select: responseSelection,
+      select: publicUserSelect,
     });
 
     return user;
@@ -82,14 +71,14 @@ export const updateUser = async (personId: string, data: TUserUpdateInput): Prom
         id: personId,
       },
       data: data,
-      select: responseSelection,
+      select: publicUserSelect,
     });
 
     return updatedUser;
   } catch (error) {
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
-      error.code === PrismaErrorType.RecordDoesNotExist
+      error.code === PrismaErrorType.RecordNotFound
     ) {
       throw new ResourceNotFoundError("User", personId);
     }
@@ -105,7 +94,7 @@ const deleteUserById = async (id: string): Promise<TUser> => {
       where: {
         id,
       },
-      select: responseSelection,
+      select: publicUserSelect,
     });
     return user;
   } catch (error) {
@@ -128,7 +117,13 @@ export const deleteUser = async (id: string): Promise<TUser> => {
       await deleteOrganization(organization.id);
     }
 
+    await prisma.invite.deleteMany({ where: { creatorId: id } });
+
     const deletedUser = await deleteUserById(id);
+    await runPostCommitProjection("user_delete_organization_cleanup", () =>
+      deleteUserOrganizationRelationships(id)
+    );
+    await runPostCommitProjection("user_delete_team_cleanup", () => deleteUserTeamRelationships(id));
     await deleteBrevoCustomerByEmail({ email: deletedUser.email });
 
     return deletedUser;
@@ -153,7 +148,7 @@ export const getUsersWithOrganization = async (organizationId: string): Promise<
           },
         },
       },
-      select: responseSelection,
+      select: publicUserSelect,
     });
 
     return users;
@@ -174,7 +169,7 @@ export const getUserLocale = reactCache(async (id: string): Promise<TUserLocale 
       where: {
         id,
       },
-      select: responseSelection,
+      select: publicUserSelect,
     });
 
     if (!user) {

@@ -17,16 +17,19 @@ describe("Survey Lib", () => {
   });
 
   describe("getSurveyQuestions", () => {
-    test("return survey questions and environmentId when the survey is found", async () => {
+    test("return survey questions when the survey is found", async () => {
       vi.mocked(prisma.survey.findUnique).mockResolvedValue(survey as any);
 
       const result = await getSurveyQuestions(survey.id);
       expect(prisma.survey.findUnique).toHaveBeenCalledWith({
         where: { id: survey.id },
         select: {
-          environmentId: true,
           questions: true,
           blocks: true,
+          workspaceId: true,
+          // The response routes read the survey's Anonymize setting off this same query rather than
+          // making a second one, so it has to be selected here (ENG-1842).
+          isAnonymizeResponsesEnabled: true,
         },
       });
       expect(result.ok).toBe(true);

@@ -1,27 +1,25 @@
 "use client";
 
 import { createId } from "@paralleldrive/cuid2";
-import { Project } from "@prisma/client";
 import { ArrowDownIcon, ArrowRightIcon, ArrowUpIcon, CopyIcon, EllipsisIcon, TrashIcon } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Workspace } from "@formbricks/database/prisma-browser";
 import { TI18nString } from "@formbricks/types/i18n";
 import { TSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
 import { TSurveyElement, TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import { TSurvey, TSurveyEndScreenCard, TSurveyRedirectUrlCard } from "@formbricks/types/surveys/types";
+import { getBlockDisplayName } from "@/modules/survey/editor/lib/blocks";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
-import {
-  getCXElementNameMap,
-  getElementDefaults,
-  getElementIconMap,
-  getElementNameMap,
-} from "@/modules/survey/lib/elements";
+import { getElementDefaults, getGroupedElementTypes } from "@/modules/survey/lib/elements";
 import { Button } from "@/modules/ui/components/button";
 import { ConfirmationModal } from "@/modules/ui/components/confirmation-modal";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -50,7 +48,7 @@ interface EditorCardMenuProps {
   addCardToBlock?: (element: TSurveyElement, blockId: string, afterElementIdx: number) => void;
   moveElementToBlock?: (elementId: string, targetBlockId: string) => void;
   cardType: "element" | "ending";
-  project?: Project;
+  workspace?: Workspace;
   isCxMode?: boolean;
 }
 
@@ -63,7 +61,7 @@ export const EditorCardMenu = ({
   duplicateCard,
   deleteCard,
   moveCard,
-  project,
+  workspace,
   card,
   updateCard,
   addCard,
@@ -73,7 +71,6 @@ export const EditorCardMenu = ({
   isCxMode = false,
 }: EditorCardMenuProps) => {
   const { t } = useTranslation();
-  const ELEMENTS_ICON_MAP = getElementIconMap(t);
   const [logicWarningModal, setLogicWarningModal] = useState(false);
   const [changeToType, setChangeToType] = useState(() => {
     if (card.type !== "endScreen" && card.type !== "redirectToUrl") {
@@ -87,7 +84,7 @@ export const EditorCardMenu = ({
   const isDeleteDisabled =
     cardType === "element" ? elements.length === 1 : survey.type === "link" && survey.endings.length === 1;
 
-  const availableElementTypes = isCxMode ? getCXElementNameMap(t) : getElementNameMap(t);
+  const groupedElementTypes = getGroupedElementTypes(t, isCxMode);
 
   const changeElementType = (type?: TSurveyElementTypeEnum) => {
     if (!type) return;
@@ -95,7 +92,7 @@ export const EditorCardMenu = ({
     const { headline, required, subheader, imageUrl, videoUrl, buttonLabel, backButtonLabel } =
       card as EditorCardMenuSurveyElement;
 
-    const elementDefaults = getElementDefaults(type, project, t);
+    const elementDefaults = getElementDefaults(type, workspace, t);
 
     if (
       (type === TSurveyElementTypeEnum.MultipleChoiceSingle &&
@@ -134,7 +131,7 @@ export const EditorCardMenu = ({
   };
 
   const addElementCardBelow = (type: TSurveyElementTypeEnum) => {
-    const elementDefaults = getElementDefaults(type, project, t);
+    const elementDefaults = getElementDefaults(type, workspace, t);
 
     const newElement = {
       ...elementDefaults,
@@ -150,9 +147,6 @@ export const EditorCardMenu = ({
     } else {
       addCard(newElement, cardIdx + 1);
     }
-
-    const section = document.getElementById(`${card.id}`);
-    section?.scrollIntoView({ behavior: "smooth", block: "end", inline: "end" });
   };
 
   const addEndingCardBelow = () => {
@@ -197,7 +191,7 @@ export const EditorCardMenu = ({
         </Button>
       </TooltipRenderer>
       <TooltipRenderer
-        tooltipContent={t("environments.surveys.edit.duplicate_question")}
+        tooltipContent={t("workspace.surveys.edit.duplicate_question")}
         triggerClass="disabled:border-none">
         <Button
           variant="ghost"
@@ -225,8 +219,8 @@ export const EditorCardMenu = ({
         </Button>
       </TooltipRenderer>
       <DropdownMenu>
-        <DropdownMenuTrigger className="h-10 w-10 rounded-lg border border-transparent p-2 hover:border-slate-200">
-          <EllipsisIcon className="mx-auto h-4 w-4 text-slate-700 hover:text-slate-600" />
+        <DropdownMenuTrigger className="size-10 rounded-lg border border-transparent p-2 hover:border-slate-200">
+          <EllipsisIcon className="mx-auto size-4 text-slate-700 hover:text-slate-600" />
         </DropdownMenuTrigger>
 
         <DropdownMenuContent>
@@ -236,29 +230,40 @@ export const EditorCardMenu = ({
                 <DropdownMenuSubTrigger
                   className="cursor-pointer text-sm text-slate-600 hover:text-slate-700"
                   onClick={(e) => e.preventDefault()}>
-                  {t("environments.surveys.edit.change_question_type")}
+                  {t("workspace.surveys.edit.change_question_type")}
                 </DropdownMenuSubTrigger>
 
                 <DropdownMenuSubContent className="ml-2">
-                  {Object.entries(availableElementTypes).map(([type, name]) => {
-                    if (type === card.type) return null;
-                    return (
-                      <DropdownMenuItem
-                        key={type}
-                        onClick={() => {
-                          setChangeToType(type as TSurveyElementTypeEnum);
-                          if ((card as EditorCardMenuSurveyElement).logic) {
-                            setLogicWarningModal(true);
-                            return;
-                          }
+                  {groupedElementTypes
+                    .map((group) => ({
+                      ...group,
+                      elements: group.elements.filter((elementType) => elementType.id !== card.type),
+                    }))
+                    .filter((group) => group.elements.length > 0)
+                    .map((group, index) => (
+                      <div key={group.category.id}>
+                        {index > 0 && <DropdownMenuSeparator />}
+                        <DropdownMenuLabel className="pt-2 text-xs font-semibold tracking-wide text-slate-500 uppercase">
+                          {group.category.label}
+                        </DropdownMenuLabel>
+                        {group.elements.map((elementType) => (
+                          <DropdownMenuItem
+                            key={elementType.id}
+                            onClick={() => {
+                              setChangeToType(elementType.id as TSurveyElementTypeEnum);
+                              if ((card as EditorCardMenuSurveyElement).logic) {
+                                setLogicWarningModal(true);
+                                return;
+                              }
 
-                          changeElementType(type as TSurveyElementTypeEnum);
-                        }}
-                        icon={ELEMENTS_ICON_MAP[type as TSurveyElementTypeEnum]}>
-                        <span className="ml-2">{name}</span>
-                      </DropdownMenuItem>
-                    );
-                  })}
+                              changeElementType(elementType.id as TSurveyElementTypeEnum);
+                            }}
+                            icon={<elementType.icon className="size-4" />}>
+                            <span className="ml-2">{elementType.label}</span>
+                          </DropdownMenuItem>
+                        ))}
+                      </div>
+                    ))}
                 </DropdownMenuSubContent>
               </DropdownMenuSub>
             )}
@@ -269,48 +274,54 @@ export const EditorCardMenu = ({
                   e.preventDefault();
                   addEndingCardBelow();
                 }}>
-                <span className="text-sm">{t("environments.surveys.edit.add_ending_below")}</span>
+                <span className="text-sm">{t("workspace.surveys.edit.add_ending_below")}</span>
               </DropdownMenuItem>
             )}
 
             {cardType === "element" && (
               <DropdownMenuSub>
                 <DropdownMenuSubTrigger className="cursor-pointer" onClick={(e) => e.preventDefault()}>
-                  {t("environments.surveys.edit.add_question_below")}
+                  {t("workspace.surveys.edit.add_question_below")}
                 </DropdownMenuSubTrigger>
 
                 <DropdownMenuSubContent className="ml-2">
-                  {Object.entries(availableElementTypes).map(([type, name]) => {
-                    return (
-                      <DropdownMenuItem
-                        key={type}
-                        className="min-h-8"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (cardType === "element") {
-                            addElementCardBelow(type as TSurveyElementTypeEnum);
-                          }
-                        }}>
-                        {ELEMENTS_ICON_MAP[type as TSurveyElementTypeEnum]}
-                        <span className="ml-2">{name}</span>
-                      </DropdownMenuItem>
-                    );
-                  })}
+                  {groupedElementTypes.map((group, index) => (
+                    <div key={group.category.id}>
+                      {index > 0 && <DropdownMenuSeparator />}
+                      <DropdownMenuLabel className="pt-2 text-xs font-semibold tracking-wide text-slate-500 uppercase">
+                        {group.category.label}
+                      </DropdownMenuLabel>
+                      {group.elements.map((elementType) => (
+                        <DropdownMenuItem
+                          key={elementType.id}
+                          className="min-h-8"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (cardType === "element") {
+                              addElementCardBelow(elementType.id as TSurveyElementTypeEnum);
+                            }
+                          }}>
+                          <elementType.icon className="size-4" />
+                          <span className="ml-2">{elementType.label}</span>
+                        </DropdownMenuItem>
+                      ))}
+                    </div>
+                  ))}
                 </DropdownMenuSubContent>
               </DropdownMenuSub>
             )}
             {cardType === "element" && moveElementToBlock && survey.blocks.length > 1 && (
               <DropdownMenuSub>
                 <DropdownMenuSubTrigger className="cursor-pointer" onClick={(e) => e.preventDefault()}>
-                  {t("environments.surveys.edit.move_question_to_block")}
+                  {t("workspace.surveys.edit.move_question_to_block")}
                 </DropdownMenuSubTrigger>
 
                 <DropdownMenuSubContent className="ml-2">
-                  {survey.blocks.map((block) => {
+                  {survey.blocks.map((block, idx) => {
                     // Don't show current block in the list
                     if (block.id === blockId) return null;
 
-                    const blockName = block.name;
+                    const blockName = getBlockDisplayName(block, idx, t);
                     return (
                       <DropdownMenuItem
                         key={block.id}
@@ -319,7 +330,7 @@ export const EditorCardMenu = ({
                           e.stopPropagation();
                           moveElementToBlock(card.id, block.id);
                         }}
-                        icon={<ArrowRightIcon className="h-4 w-4" />}>
+                        icon={<ArrowRightIcon className="size-4" />}>
                         <span className="ml-2">{blockName}</span>
                       </DropdownMenuItem>
                     );
@@ -334,7 +345,7 @@ export const EditorCardMenu = ({
                   moveCard(cardIdx, true);
                 }
               }}
-              icon={<ArrowUpIcon className="h-4 w-4" />}
+              icon={<ArrowUpIcon className="size-4" />}
               disabled={cardIdx === 0}>
               <span>{t("common.move_up")}</span>
             </DropdownMenuItem>
@@ -346,7 +357,7 @@ export const EditorCardMenu = ({
                   moveCard(cardIdx, false);
                 }
               }}
-              icon={<ArrowDownIcon className="h-4 w-4" />}
+              icon={<ArrowDownIcon className="size-4" />}
               disabled={lastCard}>
               <span>{t("common.move_down")}</span>
             </DropdownMenuItem>
@@ -356,9 +367,9 @@ export const EditorCardMenu = ({
       <ConfirmationModal
         open={logicWarningModal}
         setOpen={setLogicWarningModal}
-        title={t("environments.surveys.edit.logic_error_warning")}
-        body={t("environments.surveys.edit.logic_error_warning_text")}
-        buttonText={t("environments.surveys.edit.change_anyway")}
+        title={t("workspace.surveys.edit.logic_error_warning")}
+        body={t("workspace.surveys.edit.logic_error_warning_text")}
+        buttonText={t("workspace.surveys.edit.change_anyway")}
         onConfirm={onConfirm}
       />
     </div>

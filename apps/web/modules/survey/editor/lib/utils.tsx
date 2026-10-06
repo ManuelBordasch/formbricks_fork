@@ -1,8 +1,19 @@
 import { TFunction } from "i18next";
-import { EyeOffIcon, FileDigitIcon, FileType2Icon } from "lucide-react";
+import { EyeOffIcon, FileDigitIcon, FileType2Icon, GlobeIcon } from "lucide-react";
 import { HTMLInputTypeAttribute, JSX } from "react";
+import type { TEmbeddedDataType } from "@formbricks/types/embedded-data";
+import {
+  RESERVED_FIELD_CATALOG,
+  type TReservedFieldCatalogEntry,
+  getDeclaredComputedFields,
+  getDeclaredEmbeddedFields,
+  getDeclaredIngestedStorageKeys,
+  listMidSurveyReservedEntries,
+  listShadowingNames,
+} from "@formbricks/types/embedded-data-resolver";
 import { TI18nString } from "@formbricks/types/i18n";
 import { TSurveyQuota } from "@formbricks/types/quota";
+import { formatFieldNameToTitleCase } from "@formbricks/types/safe-identifier";
 import { TSurveyBlockLogic, TSurveyBlockLogicAction } from "@formbricks/types/surveys/blocks";
 import { TSurveyElement, TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import {
@@ -22,13 +33,26 @@ import { getTextContent } from "@formbricks/types/surveys/validation";
 import { getLocalizedValue } from "@/lib/i18n/utils";
 import { isConditionGroup } from "@/lib/surveyLogic/utils";
 import { recallToHeadline } from "@/lib/utils/recall";
-import { findElementLocation } from "@/modules/survey/editor/lib/blocks";
+import { findElementLocation, getBlockDisplayName } from "@/modules/survey/editor/lib/blocks";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
 import { type TElement, getElementTypes, getTSurveyElementTypeEnumName } from "@/modules/survey/lib/elements";
 import { TComboboxGroupedOption, TComboboxOption } from "@/modules/ui/components/input-combo-box";
 import { TLogicRuleOption, getLogicRules } from "./logic-rule-engine";
 
 export const MAX_STRING_LENGTH = 2000;
+
+export const scrollElementCardIntoView = (elementId: string, block: ScrollLogicalPosition = "center") => {
+  if (typeof window === "undefined") return;
+  // Double rAF: first frame flushes React state + DOM mutations (new card mounted, Collapsible opened);
+  // second frame waits for layout/paint so scrollIntoView computes the final position.
+  // The target's scroll-mt clears the fixed tabs bar; use block "start" to land the card top below it.
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      const node = document.getElementById(elementId);
+      node?.scrollIntoView({ behavior: "smooth", block });
+    });
+  });
+};
 
 export const extractParts = (text: string): string[] => {
   const parts: string[] = [];
@@ -121,13 +145,87 @@ const getElementHeadline = (
   return getTSurveyElementTypeEnumName(element.type, t) ?? "";
 };
 
+/**
+ * ENG-1837: the editor's view of one computed Embedded Data field. The logic builder renders and
+ * filters on an id/name/type triple, so the definitions are adapted to that shape once here rather
+ * than reshaped at each of the five pickers below.
+ *
+ * Sourced from `getDeclaredEmbeddedFields`, which derives from the Variables and Hidden Fields cards
+ * and ignores the saved rows — in the editor the cards are the live source of truth, and the rows
+ * only catch up on save.
+ */
+interface TComputedFieldOption {
+  id: string;
+  name: string;
+  type: "text" | "number";
+}
+
+const getComputedFieldOptions = (localSurvey: TSurvey): TComputedFieldOption[] =>
+  getDeclaredComputedFields(localSurvey).map(({ field, link }) => ({
+    id: link.storageKey,
+    name: field.name,
+    type: field.dataType === "number" ? "number" : "text",
+  }));
+
+/**
+ * Every name a survey already declares — the shadow list the grandfather rule filters against. All
+ * three declaration kinds count: an ingested field, a variable and an element id are equally capable
+ * of being named `country`, and any of them resolves ahead of the reserved entry at read time,
+ * because the merged value map spreads `responseData` (which is keyed by element id) over the
+ * reserved projection.
+ */
+const getDeclaredFieldNames = (localSurvey: TSurvey): string[] =>
+  // `listShadowingNames` so the picker and the two value maps (the renderer's and
+  // `buildServerEmbeddedValues`) agree on what "declared" means from one definition — ENG-2538 fixed
+  // the value maps by giving them this same list. `getDeclaredEmbeddedFields` rather than the stored
+  // rows because this is the editor: its working copy is stale from the first card edit until save.
+  listShadowingNames(
+    getDeclaredEmbeddedFields(localSurvey),
+    getElementsFromBlocks(localSurvey.blocks).map((element) => element.id)
+  );
+
+/** The reserved entries this survey may offer mid-survey, already availability- and shadow-filtered. */
+const getPickerReservedEntries = (localSurvey: TSurvey): TReservedFieldCatalogEntry[] =>
+  listMidSurveyReservedEntries(RESERVED_FIELD_CATALOG, getDeclaredFieldNames(localSurvey));
+
+/**
+ * Which HTML input the literal comparison value gets, per reserved dataType. A map rather than a
+ * chain of ternaries so it stays exhaustive: adding a dataType is a compile error here instead of
+ * silently falling through to a text box. `boolean` is deliberately text — the value is compared as
+ * the string "true"/"false" (see `projectReservedValues`).
+ */
+const INPUT_TYPE_BY_DATA_TYPE: Record<TEmbeddedDataType, HTMLInputTypeAttribute> = {
+  string: "text",
+  number: "number",
+  boolean: "text",
+  date: "date",
+};
+
+const toReservedOption = (entry: TReservedFieldCatalogEntry): TComboboxOption => ({
+  icon: GlobeIcon,
+  label: formatFieldNameToTitleCase(entry.name),
+  value: entry.name,
+  meta: {
+    type: "reserved",
+  },
+});
+
 export const getConditionValueOptions = (
   localSurvey: TSurvey,
   t: TFunction,
-  blockIdx?: number // Optional - if provided, includes elements from this block and all previous blocks
+  blockIdx?: number, // Optional - if provided, includes elements from this block and all previous blocks
+  /**
+   * Off by default because this picker is shared with the quota condition builder, whose evaluation
+   * (`evaluateQuotas`) projects no reserved values — offering them there would let an author write a
+   * condition that silently never matches. Survey block logic opts in; see ENG-1840's PR notes.
+   */
+  includeReservedFields = false
 ): TComboboxGroupedOption[] => {
-  const hiddenFields = localSurvey.hiddenFields?.fieldIds ?? [];
-  const variables = localSurvey.variables ?? [];
+  const hiddenFields = getDeclaredIngestedStorageKeys(localSurvey);
+  const variables = getComputedFieldOptions(localSurvey);
+  const reservedOptions = includeReservedFields
+    ? getPickerReservedEntries(localSurvey).map(toReservedOption)
+    : [];
 
   // If blockIdx is provided, get elements from current block and all previous blocks
   // Otherwise, get all elements from all blocks
@@ -140,11 +238,6 @@ export const getConditionValueOptions = (
   const elementOptions: TComboboxOption[] = [];
 
   allElements.forEach((element) => {
-    // Skip CTAs without external buttons - they're presentation-only elements
-    if (element.type === TSurveyElementTypeEnum.CTA && !element.buttonExternal) {
-      return;
-    }
-
     if (element.type === TSurveyElementTypeEnum.Matrix) {
       const elementHeadline = getElementHeadline(localSurvey, element, "default", t);
 
@@ -171,12 +264,12 @@ export const getConditionValueOptions = (
         },
         children: [
           {
-            label: t("environments.surveys.edit.matrix_rows", "Rows"),
+            label: t("workspace.surveys.edit.matrix_rows", "Rows"),
             value: `${element.id}-rows`,
             children: rows,
           },
           {
-            label: t("environments.surveys.edit.matrix_all_fields", "All fields"),
+            label: t("workspace.surveys.edit.matrix_all_fields", "All fields"),
             value: element.id,
             meta: {
               type: "element",
@@ -242,6 +335,14 @@ export const getConditionValueOptions = (
     });
   }
 
+  if (reservedOptions.length > 0) {
+    groupedOptions.push({
+      label: t("common.survey_data"),
+      value: "reservedFields",
+      options: reservedOptions,
+    });
+  }
+
   return groupedOptions;
 };
 
@@ -256,9 +357,9 @@ export const replaceEndingCardHeadlineRecall = (survey: TSurvey, language: strin
 };
 
 export const getActionObjectiveOptions = (t: TFunction): TComboboxOption[] => [
-  { label: t("environments.surveys.edit.calculate"), value: "calculate" },
-  { label: t("environments.surveys.edit.require_answer"), value: "requireAnswer" },
-  { label: t("environments.surveys.edit.jump_to_block"), value: "jumpToBlock" },
+  { label: t("workspace.surveys.edit.calculate"), value: "calculate" },
+  { label: t("workspace.surveys.edit.require_answer"), value: "requireAnswer" },
+  { label: t("workspace.surveys.edit.jump_to_block"), value: "jumpToBlock" },
 ];
 
 export const hasJumpToBlockAction = (actions: TSurveyBlockLogicAction[]): boolean => {
@@ -318,12 +419,20 @@ export const getConditionOperatorOptions = (
   t: TFunction
 ): TComboboxOption[] => {
   if (condition.leftOperand.type === "variable") {
-    const variables = localSurvey.variables ?? [];
+    const variables = getComputedFieldOptions(localSurvey);
     const variableType =
       variables.find((variable) => variable.id === condition.leftOperand.value)?.type || "text";
     return getLogicRules(t)[`variable.${variableType}`].options;
   } else if (condition.leftOperand.type === "hiddenField") {
     return getLogicRules(t).hiddenField.options;
+  } else if (condition.leftOperand.type === "reserved") {
+    // Read off the whole catalog, not the picker's filtered list: a condition can outlive the entry
+    // being offered (the survey later declares a field of the same name), and an operand with no
+    // operators at all would strand the author in a broken row. Unknown names fall back to string,
+    // which is the widest safe set.
+    const entry = RESERVED_FIELD_CATALOG.find((candidate) => candidate.name === condition.leftOperand.value);
+    const dataType = entry?.dataType ?? "string";
+    return getLogicRules(t)[`reserved.${dataType}`].options;
   } else if (condition.leftOperand.type === "element") {
     // Derive elements from blocks
     const elements = getElementsFromBlocks(localSurvey.blocks);
@@ -381,8 +490,8 @@ export const getMatchValueProps = (
           .slice(0, blockIdx + 1) // Include blocks from 0 to blockIdx (inclusive)
           .flatMap((block) => block.elements);
 
-  let variables = localSurvey.variables ?? [];
-  let hiddenFields = localSurvey.hiddenFields?.fieldIds ?? [];
+  let variables = getComputedFieldOptions(localSurvey);
+  let hiddenFields = getDeclaredIngestedStorageKeys(localSurvey);
 
   const selectedElement = elements.find((element) => element.id === condition.leftOperand.value);
   const selectedVariable = variables.find((variable) => variable.id === condition.leftOperand.value);
@@ -400,7 +509,12 @@ export const getMatchValueProps = (
       const allowedElementTypes = [TSurveyElementTypeEnum.OpenText];
 
       if (selectedElement.inputType === "number") {
-        allowedElementTypes.push(TSurveyElementTypeEnum.Rating, TSurveyElementTypeEnum.NPS);
+        allowedElementTypes.push(
+          TSurveyElementTypeEnum.Rating,
+          TSurveyElementTypeEnum.NPS,
+          TSurveyElementTypeEnum.CSAT,
+          TSurveyElementTypeEnum.CES
+        );
       }
 
       if (["equals", "doesNotEqual"].includes(condition.operator)) {
@@ -533,7 +647,11 @@ export const getMatchValueProps = (
         showInput: false,
         options: [{ label: t("common.choices"), value: "choices", options: choices }],
       };
-    } else if (selectedElement?.type === TSurveyElementTypeEnum.Rating) {
+    } else if (
+      selectedElement?.type === TSurveyElementTypeEnum.Rating ||
+      selectedElement?.type === TSurveyElementTypeEnum.CSAT ||
+      selectedElement?.type === TSurveyElementTypeEnum.CES
+    ) {
       const choices = Array.from({ length: selectedElement.range }, (_, idx) => {
         return {
           label: `${idx + 1}`,
@@ -801,7 +919,12 @@ export const getMatchValueProps = (
     } else if (selectedVariable?.type === "number") {
       const allowedElements = elements.filter(
         (element) =>
-          [TSurveyElementTypeEnum.Rating, TSurveyElementTypeEnum.NPS].includes(element.type) ||
+          [
+            TSurveyElementTypeEnum.Rating,
+            TSurveyElementTypeEnum.NPS,
+            TSurveyElementTypeEnum.CSAT,
+            TSurveyElementTypeEnum.CES,
+          ].includes(element.type) ||
           (element.type === TSurveyElementTypeEnum.OpenText && element.inputType === "number")
       );
 
@@ -952,6 +1075,119 @@ export const getMatchValueProps = (
       inputType: "text",
       options: groupedOptions,
     };
+  } else if (condition.leftOperand.type === "reserved") {
+    // Without this branch a reserved condition falls through to `{ show: false }` and renders with no
+    // right-hand side at all — an operator the author can never complete.
+    const entry = RESERVED_FIELD_CATALOG.find((candidate) => candidate.name === condition.leftOperand.value);
+    const dataType = entry?.dataType ?? "string";
+    const inputType = INPUT_TYPE_BY_DATA_TYPE[dataType];
+
+    /*
+     * Only operands that can actually hold this field's dataType. Without the filter a
+     * `reserved.number` condition could be pointed at a text variable, and a `reserved.date` one at a
+     * numeric answer — selectable, and silently never true. The per-type rules mirror the element and
+     * variable branches above. Hidden fields stay in every list because they are untyped strings,
+     * exactly as they do for a number variable.
+     */
+    const comparableElements = elements.filter((element) => {
+      if (dataType === "number") {
+        return (
+          [
+            TSurveyElementTypeEnum.Rating,
+            TSurveyElementTypeEnum.NPS,
+            TSurveyElementTypeEnum.CSAT,
+            TSurveyElementTypeEnum.CES,
+          ].includes(element.type) ||
+          (element.type === TSurveyElementTypeEnum.OpenText && element.inputType === "number")
+        );
+      }
+      if (dataType === "date") return element.type === TSurveyElementTypeEnum.Date;
+      // No element type answers with a boolean, so a boolean reserved field has no comparable answer.
+      if (dataType === "boolean") return false;
+
+      const allowedTextTypes = [TSurveyElementTypeEnum.OpenText, TSurveyElementTypeEnum.MultipleChoiceSingle];
+      if (["equals", "doesNotEqual"].includes(condition.operator)) {
+        allowedTextTypes.push(TSurveyElementTypeEnum.MultipleChoiceMulti, TSurveyElementTypeEnum.Date);
+      }
+      return allowedTextTypes.includes(element.type);
+    });
+
+    // Variables are only ever text or number, so date and boolean reserved fields have none to offer.
+    const comparableVariables = variables.filter((variable) => {
+      if (dataType === "number") return variable.type === "number";
+      if (dataType === "string") return variable.type === "text";
+      return false;
+    });
+
+    const elementOptions = comparableElements.map((element) => ({
+      icon: getElementIconMapping(t)[element.type],
+      label: getElementHeadline(localSurvey, element, "default", t),
+      value: element.id,
+      meta: { type: "element" },
+    }));
+
+    const variableOptions = comparableVariables.map((variable) => ({
+      icon: variable.type === "number" ? FileDigitIcon : FileType2Icon,
+      label: variable.name,
+      value: variable.id,
+      meta: { type: "variable" },
+    }));
+
+    const hiddenFieldsOptions = hiddenFields.map((field) => ({
+      icon: EyeOffIcon,
+      label: field,
+      value: field,
+      meta: { type: "hiddenField" },
+    }));
+
+    // Other reserved entries of the SAME dataType are comparable (`source` equals `action`, say),
+    // minus the one already on the left — comparing a field to itself is never a useful condition.
+    const reservedOptions = getPickerReservedEntries(localSurvey)
+      .filter(
+        (candidate) => candidate.name !== condition.leftOperand.value && candidate.dataType === dataType
+      )
+      .map(toReservedOption);
+
+    const groupedOptions: TComboboxGroupedOption[] = [];
+
+    if (elementOptions.length > 0) {
+      groupedOptions.push({
+        label: t("common.questions"),
+        value: "elements",
+        options: elementOptions,
+      });
+    }
+
+    if (variableOptions.length > 0) {
+      groupedOptions.push({
+        label: t("common.variables"),
+        value: "variables",
+        options: variableOptions,
+      });
+    }
+
+    if (hiddenFieldsOptions.length > 0) {
+      groupedOptions.push({
+        label: t("common.hidden_fields"),
+        value: "hiddenFields",
+        options: hiddenFieldsOptions,
+      });
+    }
+
+    if (reservedOptions.length > 0) {
+      groupedOptions.push({
+        label: t("common.survey_data"),
+        value: "reservedFields",
+        options: reservedOptions,
+      });
+    }
+
+    return {
+      show: true,
+      showInput: true,
+      inputType,
+      options: groupedOptions,
+    };
   }
 
   return { show: false, options: [] };
@@ -998,7 +1234,7 @@ export const getActionTargetOptions = (
     const block = blocks[i];
 
     blockOptions.push({
-      label: block.name,
+      label: getBlockDisplayName(block, i, t),
       value: block.id,
     });
   }
@@ -1013,13 +1249,12 @@ export const getActionTargetOptions = (
         "default"
       );
       return {
-        label:
-          getTextContent(processedHeadline.default ?? "") || t("environments.surveys.edit.end_screen_card"),
+        label: getTextContent(processedHeadline.default ?? "") || t("workspace.surveys.edit.end_screen_card"),
         value: ending.id,
       };
     } else {
       return {
-        label: ending.label || t("environments.surveys.edit.redirect_thank_you_card"),
+        label: ending.label || t("workspace.surveys.edit.redirect_thank_you_card"),
         value: ending.id,
       };
     }
@@ -1029,7 +1264,7 @@ export const getActionTargetOptions = (
 };
 
 export const getActionVariableOptions = (localSurvey: TSurvey): TComboboxOption[] => {
-  const variables = localSurvey.variables ?? [];
+  const variables = getComputedFieldOptions(localSurvey);
 
   return variables.map((variable) => {
     return {
@@ -1050,34 +1285,34 @@ export const getActionOperatorOptions = (
   if (variableType === "number") {
     return [
       {
-        label: t("environments.surveys.edit.add"),
+        label: t("workspace.surveys.edit.add"),
         value: "add",
       },
       {
-        label: t("environments.surveys.edit.subtract"),
+        label: t("workspace.surveys.edit.subtract"),
         value: "subtract",
       },
       {
-        label: t("environments.surveys.edit.multiply"),
+        label: t("workspace.surveys.edit.multiply"),
         value: "multiply",
       },
       {
-        label: t("environments.surveys.edit.divide"),
+        label: t("workspace.surveys.edit.divide"),
         value: "divide",
       },
       {
-        label: t("environments.surveys.edit.assign"),
+        label: t("workspace.surveys.edit.assign"),
         value: "assign",
       },
     ];
   } else if (variableType === "text") {
     return [
       {
-        label: t("environments.surveys.edit.assign"),
+        label: t("workspace.surveys.edit.assign"),
         value: "assign",
       },
       {
-        label: t("environments.surveys.edit.concat"),
+        label: t("workspace.surveys.edit.concat"),
         value: "concat",
       },
     ];
@@ -1095,8 +1330,8 @@ export const getActionValueOptions = (
   const allElements = localSurvey.blocks
     .slice(0, blockIdx + 1) // Include blocks from 0 to blockIdx (inclusive)
     .flatMap((block) => block.elements);
-  const hiddenFields = localSurvey.hiddenFields?.fieldIds ?? [];
-  let variables = localSurvey.variables ?? [];
+  const hiddenFields = getDeclaredIngestedStorageKeys(localSurvey);
+  let variables = getComputedFieldOptions(localSurvey);
 
   const hiddenFieldsOptions = hiddenFields.map((field) => {
     return {
@@ -1122,6 +1357,8 @@ export const getActionValueOptions = (
         TSurveyElementTypeEnum.MultipleChoiceSingle,
         TSurveyElementTypeEnum.Rating,
         TSurveyElementTypeEnum.NPS,
+        TSurveyElementTypeEnum.CSAT,
+        TSurveyElementTypeEnum.CES,
         TSurveyElementTypeEnum.Date,
       ].includes(element.type)
     );
@@ -1180,7 +1417,12 @@ export const getActionValueOptions = (
   } else if (selectedVariable.type === "number") {
     const allowedElements = allElements.filter(
       (element) =>
-        [TSurveyElementTypeEnum.Rating, TSurveyElementTypeEnum.NPS].includes(element.type) ||
+        [
+          TSurveyElementTypeEnum.Rating,
+          TSurveyElementTypeEnum.NPS,
+          TSurveyElementTypeEnum.CSAT,
+          TSurveyElementTypeEnum.CES,
+        ].includes(element.type) ||
         (element.type === TSurveyElementTypeEnum.OpenText && element.inputType === "number")
     );
 

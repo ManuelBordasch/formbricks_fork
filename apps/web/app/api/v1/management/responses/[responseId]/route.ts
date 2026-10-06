@@ -1,16 +1,25 @@
 import { logger } from "@formbricks/logger";
-import { ZResponseUpdateInput } from "@formbricks/types/responses";
+import { TResponseData, ZResponseUpdateInput } from "@formbricks/types/responses";
 import { handleErrorResponse } from "@/app/api/v1/auth";
+import { RequestBodyTooLargeError, parseJsonBodyWithLimit } from "@/app/lib/api/request-body";
 import { responses } from "@/app/lib/api/response";
 import { transformErrorToDetails } from "@/app/lib/api/validator";
 import { TApiV1Authentication, THandlerParams, withV1ApiWrapper } from "@/app/lib/api/with-api-logging";
 import { sendToPipeline } from "@/app/lib/pipelines";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
 import { deleteResponse, getResponse } from "@/lib/response/service";
 import { getSurvey } from "@/lib/survey/service";
+import { getWorkspaceLegacyStoragePrefixes } from "@/lib/workspace/service";
 import { formatValidationErrorsForV1Api, validateResponseData } from "@/modules/api/lib/validation";
-import { hasPermission } from "@/modules/organization/settings/api-keys/lib/utils";
-import { resolveStorageUrlsInObject, validateFileUploads } from "@/modules/storage/utils";
+import { resolveStorageUrlsInObject, validateClientFileUploads } from "@/modules/storage/utils";
 import { updateResponseWithQuotaEvaluation } from "./lib/response";
+
+type TUncheckedResponseUpdate = Record<string, unknown> & {
+  // Both optional: the body is unchecked here, and ZResponseUpdateInput allows partial updates.
+  data?: TResponseData;
+  language?: string;
+};
 
 async function fetchAndAuthorizeResponse(
   responseId: string,
@@ -31,7 +40,13 @@ async function fetchAndAuthorizeResponse(
     return { error: responses.notFoundResponse("Survey", response.surveyId, true) };
   }
 
-  if (!hasPermission(authentication.environmentPermissions, survey.environmentId, requiredPermission)) {
+  if (
+    !(await can(
+      { type: "apiKey", id: authentication.apiKeyId },
+      getWorkspaceAuthorizationActionForMethod(requiredPermission),
+      { type: "workspace", id: survey.workspaceId }
+    ))
+  ) {
     return { error: responses.unauthorizedResponse() };
   }
 
@@ -56,9 +71,7 @@ export const GET = withV1ApiWrapper({
         }),
       };
     } catch (error) {
-      return {
-        response: handleErrorResponse(error),
-      };
+      return handleErrorResponse(error);
     }
   },
 });
@@ -89,9 +102,7 @@ export const DELETE = withV1ApiWrapper({
         response: responses.successResponse(deletedResponse),
       };
     } catch (error) {
-      return {
-        response: handleErrorResponse(error),
-      };
+      return handleErrorResponse(error);
     }
   },
   action: "deleted",
@@ -120,19 +131,38 @@ export const PUT = withV1ApiWrapper({
         auditLog.oldObject = result.response;
       }
 
-      let responseUpdate;
+      let responseUpdate: TUncheckedResponseUpdate;
       try {
-        responseUpdate = await req.json();
+        responseUpdate = await parseJsonBodyWithLimit<TUncheckedResponseUpdate>(req);
       } catch (error) {
+        if (error instanceof RequestBodyTooLargeError) {
+          return {
+            response: responses.payloadTooLargeResponse("Payload Too Large", { error: error.message }),
+          };
+        }
+
         logger.error({ error, url: req.url }, "Error parsing JSON");
         return {
           response: responses.badRequestResponse("Malformed JSON input, please check your request body"),
         };
       }
 
-      if (!validateFileUploads(responseUpdate.data, result.survey.questions)) {
+      if (
+        !validateClientFileUploads({
+          data: responseUpdate.data,
+          workspaceId: result.survey.workspaceId,
+          surveyId: result.survey.id,
+          blocks: result.survey.blocks,
+          questions: result.survey.questions,
+          // Management callers replay stored responses whose file URLs may predate the scoped shape;
+          // accept those against a prefix this workspace owns (ENG-1981 review).
+          legacyOwnedStoragePrefixes: await getWorkspaceLegacyStoragePrefixes(result.survey.workspaceId),
+        })
+      ) {
         return {
-          response: responses.badRequestResponse("Invalid file upload response"),
+          response: responses.badRequestResponse(
+            "Invalid file upload response: each file URL must reference a file uploaded to this survey's file-upload element"
+          ),
         };
       }
 
@@ -169,17 +199,17 @@ export const PUT = withV1ApiWrapper({
         auditLog.newObject = updated;
       }
 
-      sendToPipeline({
+      await sendToPipeline({
         event: "responseUpdated",
-        environmentId: result.survey.environmentId,
+        workspaceId: result.survey.workspaceId,
         surveyId: result.survey.id,
         response: updated,
       });
 
       if (updated.finished) {
-        sendToPipeline({
+        await sendToPipeline({
           event: "responseFinished",
-          environmentId: result.survey.environmentId,
+          workspaceId: result.survey.workspaceId,
           surveyId: result.survey.id,
           response: updated,
         });
@@ -189,9 +219,7 @@ export const PUT = withV1ApiWrapper({
         response: responses.successResponse({ ...updated, data: resolveStorageUrlsInObject(updated.data) }),
       };
     } catch (error) {
-      return {
-        response: handleErrorResponse(error),
-      };
+      return handleErrorResponse(error);
     }
   },
   action: "updated",

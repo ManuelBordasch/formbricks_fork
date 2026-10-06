@@ -6,9 +6,10 @@ import { AuthenticationError } from "@formbricks/types/errors";
 import { ZUserEmail, ZUserName } from "@formbricks/types/user";
 import { INVITE_DISABLED } from "@/lib/constants";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
-import { checkAuthorizationUpdated } from "@/lib/utils/action-client/action-client-middleware";
 import { withAuditLogging } from "@/modules/ee/audit-logs/lib/handler";
 import { sendInviteMemberEmail } from "@/modules/email";
+import { applyInviteRateLimit } from "@/modules/organization/settings/teams/lib/invite-rate-limit";
+import { checkSetupInviteAuthorization } from "@/modules/setup/organization/[organizationId]/invite/lib/authorization";
 import { inviteUser } from "@/modules/setup/organization/[organizationId]/invite/lib/invite";
 
 const ZInviteOrganizationMemberAction = z.object({
@@ -25,18 +26,14 @@ export const inviteOrganizationMemberAction = authenticatedActionClient
         throw new AuthenticationError("Invite disabled");
       }
 
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId: parsedInput.organizationId,
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager"],
-          },
-        ],
-      });
+      // Owner-only — see `SETUP_INVITE_ACTION` for why this path is narrower than the org settings
+      // invite path.
+      await checkSetupInviteAuthorization(ctx.user.id, parsedInput.organizationId);
 
       ctx.auditLoggingCtx.organizationId = parsedInput.organizationId;
+
+      // Shares one recipient-counted budget with settings, bulk, and resend invite paths.
+      await applyInviteRateLimit(parsedInput.organizationId);
 
       const invitedUserId = await inviteUser({
         organizationId: parsedInput.organizationId,

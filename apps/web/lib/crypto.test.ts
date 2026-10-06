@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 import { logger } from "@formbricks/logger";
 // Import after unmocking
 import {
+  constantTimeEqual,
   generateStandardWebhookSignature,
   generateWebhookSecret,
   getWebhookSecretBytes,
@@ -13,6 +14,8 @@ import {
   symmetricEncrypt,
   verifySecret,
 } from "./crypto";
+
+const SECRET_HASH_TEST_TIMEOUT_MS = 45_000;
 
 // Unmock crypto for these tests since we want to test the actual crypto functions
 vi.unmock("crypto");
@@ -26,45 +29,61 @@ vi.mock("@formbricks/logger", () => ({
 
 describe("Crypto Utils", () => {
   describe("hashSecret and verifySecret", () => {
-    test("should hash and verify secrets correctly", async () => {
-      const secret = "test-secret-123";
-      const hash = await hashSecret(secret);
+    test(
+      "should hash and verify secrets correctly",
+      async () => {
+        const secret = "test-secret-123";
+        const hash = await hashSecret(secret);
 
-      expect(hash).toMatch(/^\$2[aby]\$\d+\$[./A-Za-z0-9]{53}$/);
+        expect(hash).toMatch(/^\$2[aby]\$\d+\$[./A-Za-z0-9]{53}$/);
 
-      const isValid = await verifySecret(secret, hash);
-      expect(isValid).toBe(true);
-    });
+        const isValid = await verifySecret(secret, hash);
+        expect(isValid).toBe(true);
+      },
+      SECRET_HASH_TEST_TIMEOUT_MS
+    );
 
-    test("should reject wrong secrets", async () => {
-      const secret = "test-secret-123";
-      const wrongSecret = "wrong-secret";
-      const hash = await hashSecret(secret);
+    test(
+      "should reject wrong secrets",
+      async () => {
+        const secret = "test-secret-123";
+        const wrongSecret = "wrong-secret";
+        const hash = await hashSecret(secret);
 
-      const isValid = await verifySecret(wrongSecret, hash);
-      expect(isValid).toBe(false);
-    });
+        const isValid = await verifySecret(wrongSecret, hash);
+        expect(isValid).toBe(false);
+      },
+      SECRET_HASH_TEST_TIMEOUT_MS
+    );
 
-    test("should generate different hashes for the same secret (due to salt)", async () => {
-      const secret = "test-secret-123";
-      const hash1 = await hashSecret(secret);
-      const hash2 = await hashSecret(secret);
+    test(
+      "should generate different hashes for the same secret (due to salt)",
+      async () => {
+        const secret = "test-secret-123";
+        const hash1 = await hashSecret(secret);
+        const hash2 = await hashSecret(secret);
 
-      expect(hash1).not.toBe(hash2);
+        expect(hash1).not.toBe(hash2);
 
-      // But both should verify correctly
-      expect(await verifySecret(secret, hash1)).toBe(true);
-      expect(await verifySecret(secret, hash2)).toBe(true);
-    }, 15000);
+        // But both should verify correctly
+        expect(await verifySecret(secret, hash1)).toBe(true);
+        expect(await verifySecret(secret, hash2)).toBe(true);
+      },
+      SECRET_HASH_TEST_TIMEOUT_MS
+    );
 
-    test("should use custom cost factor", async () => {
-      const secret = "test-secret-123";
-      const hash = await hashSecret(secret, 10);
+    test(
+      "should use custom cost factor",
+      async () => {
+        const secret = "test-secret-123";
+        const hash = await hashSecret(secret, 10);
 
-      // Verify the cost factor is in the hash
-      expect(hash).toMatch(/^\$2[aby]\$10\$/);
-      expect(await verifySecret(secret, hash)).toBe(true);
-    });
+        // Verify the cost factor is in the hash
+        expect(hash).toMatch(/^\$2[aby]\$10\$/);
+        expect(await verifySecret(secret, hash)).toBe(true);
+      },
+      SECRET_HASH_TEST_TIMEOUT_MS
+    );
 
     test("should return false for invalid hash format", async () => {
       const secret = "test-secret-123";
@@ -98,6 +117,37 @@ describe("Crypto Utils", () => {
       const expectedHash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
       expect(hashSha256(input)).toBe(expectedHash);
+    });
+  });
+
+  describe("constantTimeEqual", () => {
+    test("should return true for identical values", () => {
+      expect(constantTimeEqual("a-signature-value", "a-signature-value")).toBe(true);
+    });
+
+    test("should return false for values that differ", () => {
+      expect(constantTimeEqual("a-signature-value", "a-signature-valuf")).toBe(false);
+    });
+
+    test("should return false for values of different lengths", () => {
+      expect(constantTimeEqual("short", "considerably-longer")).toBe(false);
+    });
+
+    test("should compare hex values by their decoded bytes", () => {
+      expect(constantTimeEqual("ab".repeat(32), "ab".repeat(32), "hex")).toBe(true);
+      expect(constantTimeEqual("ab".repeat(32), "cd".repeat(32), "hex")).toBe(false);
+    });
+
+    test("should return false rather than matching when either value is empty", () => {
+      expect(constantTimeEqual("", "")).toBe(false);
+      expect(constantTimeEqual("a-signature-value", "")).toBe(false);
+    });
+
+    // Buffer.from drops input that is invalid for the encoding, so both of these decode to zero bytes.
+    // Without the empty-buffer guard they would compare equal and pass as a valid signature.
+    test("should return false for values that are invalid for the encoding", () => {
+      expect(constantTimeEqual("zz", "yy", "hex")).toBe(false);
+      expect(constantTimeEqual("zz", "ab".repeat(32), "hex")).toBe(false);
     });
   });
 

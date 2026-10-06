@@ -1,5 +1,11 @@
+import {
+  RESERVED_FIELD_CATALOG,
+  type TLinkedEmbeddedField,
+  getDeclaredEmbeddedFields,
+} from "@formbricks/types/embedded-data-resolver";
 import { type TI18nString } from "@formbricks/types/i18n";
 import { TResponseData, TResponseDataValue, TResponseVariables } from "@formbricks/types/responses";
+import { formatFieldNameToTitleCase } from "@formbricks/types/safe-identifier";
 import { TSurveyElement } from "@formbricks/types/surveys/elements";
 import { TSurvey, TSurveyRecallItem } from "@formbricks/types/surveys/types";
 import { getTextContent } from "@formbricks/types/surveys/validation";
@@ -33,10 +39,19 @@ export const extractIds = (text: string): string[] => {
 };
 
 // Extracts the fallback value from a string containing the "fallback" pattern.
+// An index scan, not `/fallback:([^#]*)#/`: that pattern is O(N^2) on a long run of `fallback:`
+// with no `#` after it, because the engine rescans to the end from every occurrence. Identical
+// result — `[^#]*` cannot cross a `#`, so the regex ends at the first `#` after the FIRST
+// `fallback:`, and if none follows that one none follows a later one either.
+const FALLBACK_MARKER = "fallback:";
+
 export const extractFallbackValue = (text: string): string => {
-  const pattern = /fallback:([^#]*)#/;
-  const match = text.match(pattern);
-  return match?.[1] ?? "";
+  const markerStart = text.indexOf(FALLBACK_MARKER);
+  if (markerStart === -1) return "";
+
+  const valueStart = markerStart + FALLBACK_MARKER.length;
+  const valueEnd = text.indexOf("#", valueStart);
+  return valueEnd === -1 ? "" : text.slice(valueStart, valueEnd);
 };
 
 // Extracts the complete recall information (ID and fallback) from a headline string.
@@ -54,25 +69,72 @@ export const findRecallInfoById = (text: string, id: string): string | null => {
   return match ? match[0] : null;
 };
 
-const getRecallItemLabel = <T extends TSurvey>(
-  recallItemId: string,
-  survey: T,
-  languageCode: string
-): string | undefined => {
-  const isHiddenField = survey.hiddenFields.fieldIds?.includes(recallItemId);
-  if (isHiddenField) return recallItemId;
+/**
+ * A recall token addresses an Embedded Data field by its storage key. ENG-1837 resolves what that
+ * key means through the resolver rather than reading `hiddenFields.fieldIds` / `variables` directly;
+ * `source` is what used to be the array a key was found in.
+ *
+ * Deliberately `getDeclaredEmbeddedFields`, not `getSurveyEmbeddedFields`: a token's label is
+ * authoring syntax. The recall picker writes `@label` into the text and these functions read it back
+ * (`headlineToRecall` matches on the label), so both sides must see the same instant's definitions —
+ * against the editor's working copy the stored rows are one save behind, which would render a
+ * just-added field as a raw `#recall:…#` token and stop a just-renamed one from matching. For a
+ * saved survey the two agree element for element, because every write path that persists those
+ * columns reconciles the rows in the same transaction. See the accessor's own doc block for the
+ * enumeration of those paths and for when the two stop agreeing (ENG-1851/ENG-1853).
+ */
+const findEmbeddedField = (
+  embeddedFields: TLinkedEmbeddedField[],
+  storageKey: string,
+  source: "computed" | "ingested"
+): TLinkedEmbeddedField | undefined =>
+  embeddedFields.find(({ field, link }) => link.storageKey === storageKey && field.source === source);
 
-  const questions = getElementsFromBlocks(survey.blocks);
-  const surveyQuestion = questions.find((question) => question.id === recallItemId);
+/**
+ * Takes the already-resolved element list and field list rather than a survey, so callers that label
+ * several tokens — a headline with nested recalls, a whole text — flatten the blocks and resolve the
+ * definitions once instead of once per token. Both are non-trivial (the field lookup re-derives the
+ * whole list from the declarations, and flattening walks every block), and these run on every editor
+ * render.
+ */
+const resolveRecallItemLabel = (
+  recallItemId: string,
+  elements: TSurveyElement[],
+  languageCode: string,
+  embeddedFields: TLinkedEmbeddedField[]
+): string | undefined => {
+  // Precedence is load-bearing and unchanged: ingested first, then elements, then computed — so a
+  // storage key that also matches an element id keeps resolving the way it does today.
+  const ingestedField = findEmbeddedField(embeddedFields, recallItemId, "ingested");
+  if (ingestedField) return ingestedField.field.name;
+
+  const surveyQuestion = elements.find((question) => question.id === recallItemId);
   if (surveyQuestion) {
     const headline = getLocalizedValue(surveyQuestion.headline, languageCode);
     // Strip HTML tags to prevent raw HTML from showing in nested recalls
     return headline ? getTextContent(headline) : headline;
   }
 
-  const variable = survey.variables?.find((variable) => variable.id === recallItemId);
-  if (variable) return variable.name;
+  const computedField = findEmbeddedField(embeddedFields, recallItemId, "computed");
+  if (computedField) return computedField.field.name;
+
+  // Reserved is checked LAST, which is the grandfather rule in label form: a survey that declares its
+  // own `country` has already returned above, so the token keeps showing the declared field's name.
+  const reservedEntry = RESERVED_FIELD_CATALOG.find((entry) => entry.name === recallItemId);
+  if (reservedEntry) return formatFieldNameToTitleCase(reservedEntry.name);
 };
+
+export const getRecallItemLabel = <T extends TSurvey>(
+  recallItemId: string,
+  survey: T,
+  languageCode: string
+): string | undefined =>
+  resolveRecallItemLabel(
+    recallItemId,
+    getElementsFromBlocks(survey.blocks),
+    languageCode,
+    getDeclaredEmbeddedFields(survey)
+  );
 
 // Converts recall information in a headline to a corresponding recall question headline, with or without a slash.
 export const recallToHeadline = <T extends TSurvey>(
@@ -86,6 +148,9 @@ export const recallToHeadline = <T extends TSurvey>(
 
   if (!localizedHeadline?.includes("#recall:")) return headline;
 
+  const embeddedFields = getDeclaredEmbeddedFields(survey);
+  const elements = getElementsFromBlocks(survey.blocks);
+
   const replaceNestedRecalls = (text: string): string => {
     while (text.includes("#recall:")) {
       const recallInfo = extractRecallInfo(text);
@@ -94,7 +159,8 @@ export const recallToHeadline = <T extends TSurvey>(
       const recallItemId = extractId(recallInfo);
       if (!recallItemId) break;
 
-      let recallItemLabel = getRecallItemLabel(recallItemId, survey, languageCode) || recallItemId;
+      let recallItemLabel =
+        resolveRecallItemLabel(recallItemId, elements, languageCode, embeddedFields) || recallItemId;
 
       while (recallItemLabel.includes("#recall:")) {
         const nestedRecallInfo = extractRecallInfo(recallItemLabel);
@@ -159,19 +225,25 @@ export const getRecallItems = (text: string, survey: TSurvey, languageCode: stri
   if (!text.includes("#recall:")) return [];
 
   const ids = extractIds(text);
+  // Both lists are resolved once for the whole text, not once per token.
+  const embeddedFields = getDeclaredEmbeddedFields(survey);
+  const elements = getElementsFromBlocks(survey.blocks);
   let recallItems: TSurveyRecallItem[] = [];
   ids.forEach((recallItemId) => {
-    const isHiddenField = survey.hiddenFields.fieldIds?.includes(recallItemId);
-    const questions = getElementsFromBlocks(survey.blocks);
-    const isSurveyQuestion = questions.find((question) => question.id === recallItemId);
-    const isVariable = survey.variables.find((variable) => variable.id === recallItemId);
+    const isHiddenField = findEmbeddedField(embeddedFields, recallItemId, "ingested");
+    const isSurveyQuestion = elements.some((question) => question.id === recallItemId);
+    const isVariable = findEmbeddedField(embeddedFields, recallItemId, "computed");
 
-    const recallItemLabel = getRecallItemLabel(recallItemId, survey, languageCode);
+    const recallItemLabel = resolveRecallItemLabel(recallItemId, elements, languageCode, embeddedFields);
 
     const getRecallItemType = () => {
       if (isHiddenField) return "hiddenField";
       if (isSurveyQuestion) return "element";
       if (isVariable) return "variable";
+      // Same precedence as the label lookup, and load-bearing for the same reason: without this arm
+      // `getRecallItems` drops the id it could not type, and the editor renders the raw
+      // `#recall:country/fallback:x#` token as literal text instead of a chip.
+      if (RESERVED_FIELD_CATALOG.some((entry) => entry.name === recallItemId)) return "reserved";
     };
 
     if (recallItemLabel) {
@@ -220,13 +292,62 @@ export const headlineToRecall = (
   return text;
 };
 
+/** The trailing `\#` a slash-wrapped recall tag ends with. */
+const RECALL_SLASH_SUFFIX = String.raw`\#`;
+
+/**
+ * A response value is `string | number | string[] | Record<string, string>`. Arrays and dates are
+ * already normalized above, but matrix and address answers arrive as records, which would coerce to
+ * `[object Object]` if handed to `String()`.
+ */
+const stringifyRecallValue = (value: TResponseDataValue): string => {
+  if (typeof value === "string") return value;
+  if (typeof value === "number") return String(value);
+  if (Array.isArray(value)) return value.filter(Boolean).join(", ");
+  if (value) return Object.values(value).filter(Boolean).join(", ");
+  return "";
+};
+
+const HTML_ENTITIES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
+/**
+ * Encodes a string so it renders as literal text in HTML, in element content or a quoted attribute.
+ *
+ * Encoding, not sanitizing: `sanitize-html` and DOMPurify parse markup and *remove* what isn't allowed,
+ * which is the wrong tool here — a respondent who answers `<b>bold</b>` should see that text in the
+ * email, not have it silently dropped. Escaping is also what makes the value inert regardless of where
+ * the surrounding template puts it.
+ *
+ * Single pass over the five characters rather than chained `replaceAll`s, so `&` cannot be
+ * double-encoded if someone reorders the entries — with sequential replacements, moving the `&` rule
+ * after the others turns `<` into `&amp;lt;`.
+ */
+const escapeHtml = (value: string): string => value.replaceAll(/[&<>"']/g, (char) => HTML_ENTITIES[char]);
+
+/**
+ * @param escapeValues HTML-escape each substituted value before splicing it in. Off by default because
+ * most callers render the result through React, which escapes for them — escaping here too would show
+ * literal `&amp;`. Turn it on when the result goes into raw HTML, e.g. the follow-up email body.
+ *
+ * The recalled value is a respondent's answer, i.e. data, and must never become markup. Sanitizing the
+ * *combined* string afterwards is not a substitute: a sanitizer cannot tell the survey author's
+ * intended markup from markup a respondent injected, so an allowlist that legitimately permits
+ * `<a href>` in an author-written body will equally pass off an anchor spliced in from an answer.
+ */
 export const parseRecallInfo = (
   text: string,
   responseData?: TResponseData,
   variables?: TResponseVariables,
   withSlash: boolean = false,
   locale: string = "en-US",
-  dateFormats?: TSurveyDateFormatMap
+  dateFormats?: TSurveyDateFormatMap,
+  escapeValues: boolean = false
 ) => {
   let modifiedText = text;
   const questionIds = responseData ? Object.keys(responseData) : [];
@@ -272,11 +393,18 @@ export const parseRecallInfo = (
       value = fallback;
     }
 
-    // Replace the recall tag with the value
+    // Stringify unconditionally, escape only when asked. Gating the stringify on `escapeValues` left the
+    // default path casting a `Record<string, string>` answer (matrix, address) straight to string, which
+    // renders as "[object Object]" — the exact bug stringifyRecallValue exists to prevent, still live for
+    // every caller outside the follow-up-email flow. Raised by CodeRabbit on #8681.
+    const stringifiedValue = stringifyRecallValue(value);
+    const substitutedValue = escapeValues ? escapeHtml(stringifiedValue) : stringifiedValue;
+    // Replacer functions, not replacement strings: `$&`, `` $` `` and friends are special in a
+    // replacement string, so an answer containing them would splice part of the pattern back in.
     if (withSlash) {
-      modifiedText = modifiedText.replace(recallInfo, "#/" + value + "\\#");
+      modifiedText = modifiedText.replace(recallInfo, () => `#/${substitutedValue}${RECALL_SLASH_SUFFIX}`);
     } else {
-      modifiedText = modifiedText.replace(recallInfo, value as string);
+      modifiedText = modifiedText.replace(recallInfo, () => substitutedValue);
     }
   }
 

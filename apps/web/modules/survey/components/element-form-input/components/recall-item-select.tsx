@@ -4,6 +4,8 @@ import {
   EyeOffIcon,
   FileDigitIcon,
   FileTextIcon,
+  GaugeIcon,
+  GlobeIcon,
   HomeIcon,
   ListIcon,
   ListOrderedIcon,
@@ -11,12 +13,20 @@ import {
   PhoneIcon,
   PresentationIcon,
   Rows3Icon,
+  SmilePlusIcon,
   StarIcon,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+  RESERVED_FIELD_CATALOG,
+  getDeclaredEmbeddedFields,
+  listMidSurveyReservedEntries,
+  listReadableFields,
+} from "@formbricks/types/embedded-data-resolver";
 import { TSurveyElement, TSurveyElementId, TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import { TSurvey, TSurveyHiddenFields, TSurveyRecallItem } from "@formbricks/types/surveys/types";
+import { getTextContent } from "@formbricks/types/surveys/validation";
 import { getTextContentWithRecallTruncated } from "@/lib/utils/recall";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
 import {
@@ -38,6 +48,8 @@ const elementIconMapping = {
   address: HomeIcon,
   contactInfo: ContactIcon,
   ranking: ListOrderedIcon,
+  csat: SmilePlusIcon,
+  ces: GaugeIcon,
 };
 
 interface RecallItemSelectProps {
@@ -57,7 +69,7 @@ export const RecallItemSelect = ({
   setShowRecallItemSelect,
   recallItems,
   selectedLanguageCode,
-}: RecallItemSelectProps) => {
+}: Readonly<RecallItemSelectProps>) => {
   const [searchValue, setSearchValue] = useState("");
   const { t } = useTranslation();
   const isNotAllowedElementType = (element: TSurveyElement): boolean => {
@@ -77,36 +89,85 @@ export const RecallItemSelect = ({
     return recallItems.map((recallItem) => recallItem.id);
   }, [recallItems]);
 
-  const hiddenFieldRecallItems = useMemo(() => {
-    if (localSurvey.hiddenFields.fieldIds) {
-      return localSurvey.hiddenFields.fieldIds
-        .filter((hiddenFieldId) => {
-          return !recallItemIds.includes(hiddenFieldId);
-        })
-        .map((hiddenFieldId) => ({
-          id: hiddenFieldId,
-          label: hiddenFieldId,
-          type: "hiddenField" as const,
-        }));
-    }
-    return [];
-  }, [localSurvey.hiddenFields, recallItemIds]);
+  // ENG-1837: both groups are enumerated from the survey's Embedded Data definitions, derived from
+  // the editor's cards (`getDeclaredEmbeddedFields`) so a rename shows here without a reload. Only the
+  // `embeddedData` group of `listReadableFields` is used — its keys and labels are exactly today's
+  // (storage key / field name); the element group keeps this file's own labelling, which stores the
+  // raw headline HTML and searches it through `getTextContent`.
+  const embeddedFields = useMemo(
+    () =>
+      getDeclaredEmbeddedFields({
+        variables: localSurvey.variables,
+        hiddenFields: localSurvey.hiddenFields,
+      }),
+    [localSurvey.variables, localSurvey.hiddenFields]
+  );
 
-  const variableRecallItems = useMemo(() => {
-    if (localSurvey.variables.length) {
-      return localSurvey.variables
-        .filter((variable) => !recallItemIds.includes(variable.id))
-        .map((variable) => {
-          return {
-            id: variable.id,
-            label: variable.name,
-            type: "variable" as const,
-          };
-        });
-    }
+  /**
+   * The definitions joined to their picker labels, in the definitions' own order. Keyed on
+   * `storageKey`, not on position: `listReadableFields` happens to emit one entry per input today,
+   * but a future filter there would silently shift every label past the first drop.
+   */
+  const embeddedFieldEntries = useMemo(() => {
+    const labelByKey = new Map(
+      listReadableFields({
+        blocks: [],
+        embeddedData: embeddedFields,
+        reservedEntries: [],
+        contactAttributeKeys: [],
+      }).embeddedData.map(({ key, label }) => [key, label] as const)
+    );
 
-    return [];
-  }, [localSurvey.variables, recallItemIds]);
+    return embeddedFields.map(({ field, link }) => ({
+      key: link.storageKey,
+      // The enumerator's blank-name fallback is the key, so mirror it when a field is not listed.
+      label: labelByKey.get(link.storageKey) ?? link.storageKey,
+      source: field.source,
+      dataType: field.dataType,
+    }));
+  }, [embeddedFields]);
+
+  const hiddenFieldRecallItems = useMemo(
+    () =>
+      embeddedFieldEntries
+        .filter(({ key, source }) => source === "ingested" && !recallItemIds.includes(key))
+        .map(({ key, label }) => ({ id: key, label, type: "hiddenField" as const })),
+    [embeddedFieldEntries, recallItemIds]
+  );
+
+  const variableRecallItems = useMemo(
+    () =>
+      embeddedFieldEntries
+        .filter(({ key, source }) => source === "computed" && !recallItemIds.includes(key))
+        .map(({ key, label }) => ({ id: key, label, type: "variable" as const })),
+    [embeddedFieldEntries, recallItemIds]
+  );
+
+  /**
+   * Reserved fields (ENG-1840). `listMidSurveyReservedEntries` applies both gates: it drops
+   * server-derived entries — recall renders while the respondent is still answering, so `country` or
+   * `durationSeconds` could only ever render as their fallback text — and it drops any entry this
+   * survey already declares under the same name, which would otherwise show twice with no way to
+   * tell the rows apart. Labels come from `listReadableFields`, the same enumerator the other groups
+   * use, so reserved rows are title-cased consistently rather than by a rule local to this file.
+   */
+  const reservedRecallItems = useMemo(() => {
+    const entries = listMidSurveyReservedEntries(RESERVED_FIELD_CATALOG, [
+      ...embeddedFieldEntries.map(({ key }) => key),
+      // Element ids shadow reserved entries too: an element answered under the id `country` writes
+      // `responseData.country`, which the merged value map spreads over the reserved projection.
+      ...elements.map((element) => element.id),
+    ]);
+
+    return listReadableFields({
+      blocks: [],
+      embeddedData: [],
+      reservedEntries: entries,
+      contactAttributeKeys: [],
+    })
+      .reserved.filter(({ key }) => !recallItemIds.includes(key))
+      .map(({ key, label }) => ({ id: key, label, type: "reserved" as const }));
+  }, [embeddedFieldEntries, elements, recallItemIds]);
 
   const surveyElementRecallItems = useMemo(() => {
     const isWelcomeCard = elementId === "start";
@@ -122,22 +183,38 @@ export const RecallItemSelect = ({
         return !recallItemIds.includes(element.id) && !notAllowed && element.id !== elementId && idx > index;
       })
       .map((element) => {
-        return { id: element.id, label: element.headline[selectedLanguageCode], type: "element" as const };
+        return {
+          id: element.id,
+          label: element.headline[selectedLanguageCode],
+          type: "element" as const,
+        };
       });
 
     return filteredElements;
   }, [elementId, elements, recallItemIds, selectedLanguageCode]);
 
   const filteredRecallItems: TSurveyRecallItem[] = useMemo(() => {
-    return [...surveyElementRecallItems, ...hiddenFieldRecallItems, ...variableRecallItems].filter(
-      (recallItems) => {
-        if (searchValue.trim() === "") return true;
-        else {
-          return recallItems.label.toLowerCase().startsWith(searchValue.toLowerCase());
-        }
-      }
-    );
-  }, [surveyElementRecallItems, hiddenFieldRecallItems, variableRecallItems, searchValue]);
+    const allItems = [
+      ...surveyElementRecallItems,
+      ...hiddenFieldRecallItems,
+      ...variableRecallItems,
+      ...reservedRecallItems,
+    ];
+    const query = searchValue.trim().toLowerCase();
+    if (!query) return allItems;
+
+    // Match the label's text content, not the label itself: an element's label is its raw headline HTML
+    // (`<p class="fb-editor-paragraph">…`), so comparing against it made every query for question text
+    // miss. `includes` rather than `startsWith` so a query also matches mid-headline words, and so it
+    // still matches items whose displayed label is elided by the truncation below.
+    return allItems.filter((recallItem) => getTextContent(recallItem.label).toLowerCase().includes(query));
+  }, [
+    surveyElementRecallItems,
+    hiddenFieldRecallItems,
+    variableRecallItems,
+    reservedRecallItems,
+    searchValue,
+  ]);
 
   const getRecallItemIcon = (recallItem: TSurveyRecallItem) => {
     switch (recallItem.type) {
@@ -150,9 +227,11 @@ export const RecallItemSelect = ({
       }
       case "hiddenField":
         return EyeOffIcon;
+      case "reserved":
+        return GlobeIcon;
       case "variable": {
-        const variable = localSurvey.variables.find((variable) => variable.id === recallItem.id);
-        return variable?.type === "number" ? FileDigitIcon : FileTextIcon;
+        const dataType = embeddedFieldEntries.find(({ key }) => key === recallItem.id)?.dataType;
+        return dataType === "number" ? FileDigitIcon : FileTextIcon;
       }
       default:
         return null;
@@ -169,7 +248,7 @@ export const RecallItemSelect = ({
         align="start"
         side="bottom"
         data-recall-dropdown>
-        <p className="font-medium">{t("environments.surveys.edit.recall_information_from")}</p>
+        <p className="font-medium">{t("workspace.surveys.edit.recall_information_from")}</p>
         <Input
           id="recallItemSearchInput"
           placeholder="Search options"
@@ -183,7 +262,7 @@ export const RecallItemSelect = ({
             }
           }}
         />
-        <div className="max-h-72 overflow-y-auto overflow-x-hidden">
+        <div className="max-h-72 overflow-x-hidden overflow-y-auto">
           {filteredRecallItems.map((recallItem, index) => {
             const IconComponent = getRecallItemIcon(recallItem);
             return (
@@ -196,7 +275,7 @@ export const RecallItemSelect = ({
                   setShowRecallItemSelect(false);
                 }}
                 autoFocus={false}
-                className="flex w-full cursor-pointer items-center rounded-md p-2 focus:bg-slate-200 focus:outline-none"
+                className="flex w-full cursor-pointer items-center rounded-md p-2 focus:bg-slate-200 focus:outline-hidden"
                 onKeyDown={(e) => {
                   if (
                     (e.key === "ArrowUp" && index === 0) ||
@@ -207,15 +286,15 @@ export const RecallItemSelect = ({
                   }
                 }}>
                 <div>{IconComponent && <IconComponent className="mr-2 w-4" />}</div>
-                <p className="max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-sm">
-                  {getTextContentWithRecallTruncated(recallItem.label)}
+                <p className="max-w-full overflow-hidden text-sm text-ellipsis whitespace-nowrap">
+                  {getTextContentWithRecallTruncated(recallItem.label).trim() || t("common.no_text_found")}
                 </p>
               </DropdownMenuItem>
             );
           })}
           {filteredRecallItems.length === 0 && (
             <p className="p-2 text-sm font-medium text-slate-700">
-              {t("environments.surveys.edit.no_recall_items_found")}
+              {t("workspace.surveys.edit.no_recall_items_found")}
             </p>
           )}
         </div>

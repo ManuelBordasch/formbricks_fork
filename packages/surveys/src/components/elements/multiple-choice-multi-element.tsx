@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { MultiSelect, type MultiSelectOption } from "@formbricks/survey-ui";
 import { type TResponseData, type TResponseTtc } from "@formbricks/types/responses";
 import type { TSurveyMultipleChoiceElement } from "@formbricks/types/surveys/elements";
+import { htmlToPlainText } from "@/lib/html-utils";
 import { getLocalizedValue } from "@/lib/i18n";
 import { getUpdatedTtc, useTtc } from "@/lib/ttc";
 import { getShuffledChoicesIds } from "@/lib/utils";
@@ -169,8 +170,7 @@ export function MultipleChoiceMultiElement({
     setOtherValue(newOtherValue);
     const baseLabels = getNormalizedSelectedLabels();
 
-    const nextValue = [...baseLabels, ""];
-    if (newOtherValue.trim()) nextValue.push(newOtherValue);
+    const nextValue = [...baseLabels, newOtherValue];
 
     onChange({ [element.id]: nextValue });
   };
@@ -227,8 +227,7 @@ export function MultipleChoiceMultiElement({
     });
 
     if (isOtherNowSelected) {
-      nextLabels.push("");
-      if (otherValue.trim()) nextLabels.push(otherValue);
+      nextLabels.push(otherValue);
     } else if (otherValue) {
       // If other was deselected, clear any stale other value
       setOtherValue("");
@@ -241,7 +240,11 @@ export function MultipleChoiceMultiElement({
   };
 
   return (
-    <form key={element.id} onSubmit={handleSubmit} className="w-full">
+    <form
+      key={element.id}
+      onSubmit={handleSubmit}
+      className="w-full"
+      aria-label={htmlToPlainText(getLocalizedValue(element.headline, languageCode))}>
       <MultiSelect
         elementId={element.id}
         inputId={element.id}

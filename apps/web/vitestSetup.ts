@@ -1,26 +1,11 @@
 // mock these globally used functions
 import "@testing-library/jest-dom/vitest";
+import { cleanup } from "@testing-library/react";
 import ResizeObserver from "resize-observer-polyfill";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { ValidationError } from "@formbricks/types/errors";
 
-// mock next-auth EARLY to prevent SessionProvider errors
-vi.mock("next-auth/react", () => ({
-  useSession: () => ({
-    data: {
-      user: {
-        id: "test-user-id",
-        email: "test@example.com",
-        name: "Test User",
-      },
-    },
-    status: "authenticated",
-  }),
-  signOut: vi.fn().mockResolvedValue(undefined),
-  SessionProvider: ({ children }: { children: React.ReactNode }) => children,
-}));
-
-// mock our useSignOut hook directly to avoid next-auth issues in tests
+// mock our useSignOut hook directly to avoid auth issues in tests
 vi.mock("@/modules/auth/hooks/use-sign-out", () => ({
   useSignOut: () => ({
     signOut: vi.fn().mockResolvedValue(undefined),
@@ -98,13 +83,31 @@ vi.mock("@/modules/auth/actions/sign-out", () => ({
 
 // mock prisma client
 
-vi.mock("@prisma/client", async () => {
-  const actual = await vi.importActual<typeof import("@prisma/client")>("@prisma/client");
+vi.mock("@formbricks/database/prisma", async () => {
+  const actual = await vi.importActual<typeof import("@formbricks/database/prisma")>(
+    "@formbricks/database/prisma"
+  );
 
   return {
     ...actual,
     Prisma: actual.Prisma,
     PrismaClient: class {
+      // Better Auth 1.7 seeds its `oauthResource` rows when the oauthProvider plugin initialises
+      // (ENG-2343), which happens on any import of modules/auth/lib/auth.ts. Against this stub the
+      // adapter would otherwise throw `Model oauthResource does not exist in the database` as an
+      // unhandled error in every such test file — noise that would sit in the suite forever and
+      // mask a real failure later. A read that returns nothing lets seeding complete quietly;
+      // nothing here asserts on it, and the real behaviour is covered against a real database.
+      oauthResource = {
+        findMany: () => Promise.resolve([]),
+        findFirst: () => Promise.resolve(null),
+        findUnique: () => Promise.resolve(null),
+        create: (args: { data: unknown }) => Promise.resolve(args.data),
+        createMany: () => Promise.resolve({ count: 0 }),
+        update: (args: { data: unknown }) => Promise.resolve(args.data),
+        upsert: (args: { create: unknown }) => Promise.resolve(args.create),
+      };
+
       $connect() {
         return Promise.resolve();
       }
@@ -175,6 +178,14 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // React Testing Library normally registers this itself, but it looks for a *global* `afterEach`
+  // (`typeof afterEach === 'function'`) and this project runs with vitest `globals: false` — so its
+  // auto-cleanup never installs. Without it, every render()/renderHook() stays mounted for the rest
+  // of the file: components from earlier tests keep firing timers, keep responding to window events,
+  // and keep calling shared module mocks, so a later test's assertions can count work it never did.
+  // Called here rather than as its own afterEach so the order against clearAllMocks is explicit:
+  // unmount first, while mock implementations are still in place for any cleanup effects.
+  cleanup();
   vi.clearAllMocks();
 });
 
@@ -184,63 +195,69 @@ export const testInputValidation = async (service: Function, ...args: any[]): Pr
   }, 15000);
 };
 
-vi.mock("@/lib/constants", () => ({
-  IS_FORMBRICKS_CLOUD: false,
-  ENCRYPTION_KEY: "mock-encryption-key",
-  ENTERPRISE_LICENSE_KEY: "mock-enterprise-license-key",
-  GITHUB_ID: "mock-github-id",
-  GITHUB_SECRET: "test-githubID",
-  GOOGLE_CLIENT_ID: "test-google-client-id",
-  GOOGLE_CLIENT_SECRET: "test-google-client-secret",
-  AZUREAD_CLIENT_ID: "test-azuread-client-id",
-  AZUREAD_CLIENT_SECRET: "test-azure",
-  AZUREAD_TENANT_ID: "test-azuread-tenant-id",
-  OIDC_DISPLAY_NAME: "test-oidc-display-name",
-  OIDC_CLIENT_ID: "test-oidc-client-id",
-  OIDC_ISSUER: "test-oidc-issuer",
-  OIDC_CLIENT_SECRET: "test-oidc-client-secret",
-  OIDC_SIGNING_ALGORITHM: "test-oidc-signing-algorithm",
-  WEBAPP_URL: "https://test-webapp-url.com",
-  STRIPE_API_VERSION: "2026-01-28.clover",
-  IS_PRODUCTION: false,
-  SENTRY_DSN: "mock-sentry-dsn",
-  SENTRY_RELEASE: "mock-sentry-release",
-  SENTRY_ENVIRONMENT: "mock-sentry-environment",
-  SESSION_MAX_AGE: 1000,
-  MAX_ATTRIBUTE_CLASSES_PER_ENVIRONMENT: 100,
-  MAX_OTHER_OPTION_LENGTH: 250,
-  AVAILABLE_LOCALES: [
-    "de-DE",
-    "en-US",
-    "es-ES",
-    "fr-FR",
-    "hu-HU",
-    "ja-JP",
-    "nl-NL",
-    "pt-BR",
-    "pt-PT",
-    "ro-RO",
-    "ru-RU",
-    "sv-SE",
-    "zh-Hans-CN",
-    "zh-Hant-TW",
-  ],
-  DEFAULT_LOCALE: "en-US",
-  BREVO_API_KEY: "mock-brevo-api-key",
-  ITEMS_PER_PAGE: 30,
-  FB_LOGO_URL: "mock-fb-logo-url",
-  NOTION_RICH_TEXT_LIMIT: 1000,
-  SMTP_HOST: "mock-smtp-host",
-  SMTP_PORT: "587",
-  SMTP_SECURE_ENABLED: false,
-  SMTP_USER: "mock-smtp-user",
-  SMTP_PASSWORD: "mock-smtp-password", //NOSONAR ignore rule for test setup
-  SMTP_AUTHENTICATED: true,
-  SMTP_REJECT_UNAUTHORIZED_TLS: true,
-  MAIL_FROM: "mock@mail.com",
-  MAIL_FROM_NAME: "Mock Mail",
-  RATE_LIMITING_DISABLED: false,
-  TELEMETRY_DISABLED: false,
-  PASSWORD_RESET_TOKEN_LIFETIME_MINUTES: 30,
-  CONTROL_HASH: "$2b$12$fzHf9le13Ss9UJ04xzmsjODXpFJxz6vsnupoepF5FiqDECkX2BH5q",
-}));
+vi.mock("@/lib/constants", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/constants")>();
+
+  return {
+    ...actual,
+    IS_FORMBRICKS_CLOUD: false,
+    ENCRYPTION_KEY: "mock-encryption-key",
+    ENTERPRISE_LICENSE_KEY: "mock-enterprise-license-key",
+    GITHUB_ID: "mock-github-id",
+    GITHUB_SECRET: "test-githubID",
+    GOOGLE_CLIENT_ID: "test-google-client-id",
+    GOOGLE_CLIENT_SECRET: "test-google-client-secret",
+    AZUREAD_CLIENT_ID: "test-azuread-client-id",
+    AZUREAD_CLIENT_SECRET: "test-azure",
+    AZUREAD_TENANT_ID: "test-azuread-tenant-id",
+    OIDC_DISPLAY_NAME: "test-oidc-display-name",
+    OIDC_CLIENT_ID: "test-oidc-client-id",
+    OIDC_ISSUER: "test-oidc-issuer",
+    OIDC_CLIENT_SECRET: "test-oidc-client-secret",
+    OIDC_SIGNING_ALGORITHM: "test-oidc-signing-algorithm",
+    WEBAPP_URL: "https://test-webapp-url.com",
+    STRIPE_API_VERSION: "2026-01-28.clover",
+    IS_PRODUCTION: false,
+    SENTRY_DSN: "mock-sentry-dsn",
+    SENTRY_RELEASE: "mock-sentry-release",
+    SENTRY_ENVIRONMENT: "mock-sentry-environment",
+    SESSION_MAX_AGE: 1000,
+    MAX_ATTRIBUTE_CLASSES_PER_ENVIRONMENT: 100,
+    MAX_OTHER_OPTION_LENGTH: 250,
+    AVAILABLE_LOCALES: [
+      "de-DE",
+      "en-US",
+      "es-ES",
+      "fr-FR",
+      "hu-HU",
+      "ja-JP",
+      "nl-NL",
+      "pt-BR",
+      "pt-PT",
+      "ro-RO",
+      "ru-RU",
+      "sv-SE",
+      "tr-TR",
+      "zh-Hans-CN",
+      "zh-Hant-TW",
+    ],
+    DEFAULT_LOCALE: "en-US",
+    BREVO_API_KEY: "mock-brevo-api-key",
+    ITEMS_PER_PAGE: 30,
+    FB_LOGO_URL: "mock-fb-logo-url",
+    NOTION_RICH_TEXT_LIMIT: 1000,
+    SMTP_HOST: "mock-smtp-host",
+    SMTP_PORT: "587",
+    SMTP_SECURE_ENABLED: false,
+    SMTP_USER: "mock-smtp-user",
+    SMTP_PASSWORD: "mock-smtp-password", //NOSONAR ignore rule for test setup
+    SMTP_AUTHENTICATED: true,
+    SMTP_REJECT_UNAUTHORIZED_TLS: true,
+    MAIL_FROM: "mock@mail.com",
+    MAIL_FROM_NAME: "Mock Mail",
+    RATE_LIMITING_DISABLED: false,
+    TELEMETRY_DISABLED: false,
+    PASSWORD_RESET_TOKEN_LIFETIME_MINUTES: 30,
+    CONTROL_HASH: "$2b$12$fzHf9le13Ss9UJ04xzmsjODXpFJxz6vsnupoepF5FiqDECkX2BH5q", //NOSONAR mirrors production CONTROL_HASH, not a real password hash
+  };
+});

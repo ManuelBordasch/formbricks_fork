@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ZStorageUrl, ZUrl } from "../common";
+import { ZStorageUrl, isSafeLinkUrl } from "../common";
 import { ZI18nString } from "../i18n";
 import { ZAllowedFileExtension } from "../storage";
 import { TSurveyElementTypeEnum } from "./constants";
@@ -204,16 +204,16 @@ export const ZSurveyCTAElement = ZSurveyElementBase.extend({
         message: "Button URL is required when external button is enabled",
         path: ["buttonUrl"],
       });
-    } else {
-      // Validate URL format only when buttonExternal is true and URL is provided
-      const urlValidation = ZUrl.safeParse(data.buttonUrl);
-      if (!urlValidation.success) {
-        ctx.addIssue({
-          code: "custom",
-          message: "Please enter a valid URL",
-          path: ["buttonUrl"],
-        });
-      }
+    } else if (!isSafeLinkUrl(data.buttonUrl)) {
+      // Validate URL format only when buttonExternal is true and URL is provided. The scheme has to be
+      // constrained, not just parseable: the renderer hands this value to `window.open()`, so accepting
+      // any `z.url()`-parseable value (which includes `javascript:`) made an editable survey field
+      // stored XSS — on a link survey that executes on the Formbricks origin.
+      ctx.addIssue({
+        code: "custom",
+        message: "Please enter a valid http(s), mailto: or tel: URL",
+        path: ["buttonUrl"],
+      });
     }
 
     if (!data.ctaButtonLabel?.default || data.ctaButtonLabel.default.trim() === "") {
@@ -362,6 +362,30 @@ export const ZSurveyContactInfoElement = ZSurveyElementBase.extend({
 
 export type TSurveyContactInfoElement = z.infer<typeof ZSurveyContactInfoElement>;
 
+// CSAT Element
+export const ZSurveyCsatElement = ZSurveyElementBase.extend({
+  type: z.literal(TSurveyElementTypeEnum.CSAT),
+  scale: z.enum(["number", "smiley", "star"]),
+  range: z.literal(5),
+  lowerLabel: ZI18nString.optional(),
+  upperLabel: ZI18nString.optional(),
+  isColorCodingEnabled: z.boolean().optional().prefault(false),
+});
+
+export type TSurveyCsatElement = z.infer<typeof ZSurveyCsatElement>;
+
+// CES Element
+export const ZSurveyCesElement = ZSurveyElementBase.extend({
+  type: z.literal(TSurveyElementTypeEnum.CES),
+  scale: z.enum(["number", "smiley", "star"]),
+  range: z.union([z.literal(5), z.literal(7)]),
+  lowerLabel: ZI18nString.optional(),
+  upperLabel: ZI18nString.optional(),
+  isColorCodingEnabled: z.boolean().optional().prefault(false),
+});
+
+export type TSurveyCesElement = z.infer<typeof ZSurveyCesElement>;
+
 // Union of all element types
 export const ZSurveyElement = z.union([
   ZSurveyOpenTextElement,
@@ -379,6 +403,8 @@ export const ZSurveyElement = z.union([
   ZSurveyAddressElement,
   ZSurveyRankingElement,
   ZSurveyContactInfoElement,
+  ZSurveyCsatElement,
+  ZSurveyCesElement,
 ]);
 
 export type TSurveyElement = z.infer<typeof ZSurveyElement>;

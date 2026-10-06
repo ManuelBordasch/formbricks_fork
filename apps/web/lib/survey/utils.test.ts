@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { InvalidInputError } from "@formbricks/types/errors";
-import { TJsEnvironmentStateSurvey } from "@formbricks/types/js";
+import { TJsWorkspaceStateSurvey } from "@formbricks/types/js";
 import { TSegment } from "@formbricks/types/segment";
 import { TSurveyBlock } from "@formbricks/types/surveys/blocks";
 import { TSurveyElement, TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
@@ -11,8 +11,27 @@ import {
   anySurveyHasFilters,
   checkForInvalidImagesInQuestions,
   checkForInvalidMediaInBlocks,
+  isAppSurveyMissingTriggersToPublish,
   transformPrismaSurvey,
+  validateMediaAndPrepareBlocks,
 } from "./utils";
+
+describe("isAppSurveyMissingTriggersToPublish", () => {
+  test("flags a non-draft app survey with no triggers", () => {
+    expect(isAppSurveyMissingTriggersToPublish("app", "inProgress", [])).toBe(true);
+    expect(isAppSurveyMissingTriggersToPublish("app", "paused", null)).toBe(true);
+    expect(isAppSurveyMissingTriggersToPublish("app", "completed", undefined)).toBe(true);
+  });
+
+  test("allows a non-draft app survey that has at least one trigger", () => {
+    expect(isAppSurveyMissingTriggersToPublish("app", "inProgress", [{ actionClassId: "a" }])).toBe(false);
+  });
+
+  test("ignores draft app surveys and non-app surveys", () => {
+    expect(isAppSurveyMissingTriggersToPublish("app", "draft", [])).toBe(false);
+    expect(isAppSurveyMissingTriggersToPublish("link", "inProgress", [])).toBe(false);
+  });
+});
 
 describe("transformPrismaSurvey", () => {
   test("transforms prisma survey without segment", () => {
@@ -68,7 +87,7 @@ describe("transformPrismaSurvey", () => {
       displayPercentage: "invalid",
     };
 
-    const result = transformPrismaSurvey<TJsEnvironmentStateSurvey>(surveyPrisma);
+    const result = transformPrismaSurvey<TJsWorkspaceStateSurvey>(surveyPrisma);
 
     expect(result).toEqual({
       id: "survey1",
@@ -116,7 +135,7 @@ describe("anySurveyHasFilters", () => {
           filters: [],
           createdAt: new Date(),
           description: "Segment description",
-          environmentId: "env1",
+          workspaceId: "ws1",
           isPrivate: true,
           surveys: ["survey1"],
           updatedAt: new Date(),
@@ -150,7 +169,7 @@ describe("anySurveyHasFilters", () => {
           ],
           createdAt: new Date(),
           description: "Segment description",
-          environmentId: "env1",
+          workspaceId: "ws1",
           isPrivate: true,
           surveys: ["survey2"],
           updatedAt: new Date(),
@@ -196,9 +215,7 @@ describe("checkForInvalidImagesInQuestions", () => {
       { id: "q1", type: TSurveyQuestionTypeEnum.OpenText, imageUrl: "invalid-image.txt" },
     ] as TSurveyQuestion[];
 
-    expect(() => checkForInvalidImagesInQuestions(questions)).toThrow(
-      new InvalidInputError("Invalid image file in question 1")
-    );
+    expect(() => checkForInvalidImagesInQuestions(questions)).toThrow("Invalid image file in question 1");
     expect(fileValidation.isValidImageFile).toHaveBeenCalledWith("invalid-image.txt");
   });
 
@@ -230,7 +247,7 @@ describe("checkForInvalidImagesInQuestions", () => {
     ] as TSurveyQuestion[];
 
     expect(() => checkForInvalidImagesInQuestions(questions)).toThrow(
-      new InvalidInputError("Invalid image file for choice 2 in question 1")
+      "Invalid image file for choice 2 in question 1"
     );
 
     expect(fileValidation.isValidImageFile).toHaveBeenCalledTimes(2);
@@ -351,9 +368,11 @@ describe("checkForInvalidMediaInBlocks", () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.error.message).toBe(
+      expect(result.error.message).toContain(
         'Invalid image URL in choice 1 of question 1 of block "Welcome Block"'
       );
+      // The message names the supported formats so the caller can fix the URL.
+      expect(result.error.message).toContain("png, jpeg, jpg, webp, heic");
     }
     expect(fileValidation.isValidImageFile).toHaveBeenCalledWith("image1.jpg");
   });
@@ -414,7 +433,7 @@ describe("checkForInvalidMediaInBlocks", () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.error.message).toBe(
+      expect(result.error.message).toContain(
         'Invalid image URL in choice 2 of question 1 of block "Picture Selection"'
       );
     }
@@ -564,7 +583,7 @@ describe("checkForInvalidMediaInBlocks", () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.error.message).toBe('Invalid image URL in question 1 of block "Block 2" (block 2)');
+      expect(result.error.message).toContain('Invalid image URL in question 1 of block "Block 2" (block 2)');
     }
     // Should stop after finding first invalid image
     expect(fileValidation.isValidImageFile).toHaveBeenCalledTimes(2);
@@ -672,5 +691,76 @@ describe("checkForInvalidMediaInBlocks", () => {
     expect(fileValidation.isValidImageFile).toHaveBeenNthCalledWith(1, "element-image.jpg");
     expect(fileValidation.isValidImageFile).toHaveBeenNthCalledWith(2, "choice1.jpg");
     expect(fileValidation.isValidImageFile).toHaveBeenNthCalledWith(3, "choice2.jpg");
+  });
+});
+
+describe("validateMediaAndPrepareBlocks", () => {
+  const pictureSelectionBlock = (choiceImageUrl: string): TSurveyBlock[] => [
+    {
+      id: "block-1",
+      name: "Design Vote",
+      elements: [
+        {
+          id: "picture-q",
+          type: TSurveyElementTypeEnum.PictureSelection,
+          headline: { default: "Pick one" },
+          required: true,
+          choices: [{ id: "c1", imageUrl: choiceImageUrl }],
+        } as unknown as TSurveyElement,
+      ],
+    },
+  ];
+
+  // Regression test for ENG-1329: an invalid choice image must throw InvalidInputError so the API
+  // handlers map it to a 400 (never an unhandled 500 that pages Sentry).
+  test("throws InvalidInputError (not a plain Error) when a choice image is invalid", () => {
+    vi.spyOn(fileValidation, "isValidImageFile").mockReturnValue(false);
+
+    const blocks = pictureSelectionBlock("https://images.unsplash.com/photo-12345");
+
+    expect(() => validateMediaAndPrepareBlocks(blocks)).toThrow(InvalidInputError);
+  });
+
+  test("thrown message names the offending choice/question/block and the supported formats", () => {
+    vi.spyOn(fileValidation, "isValidImageFile").mockReturnValue(false);
+
+    const blocks = pictureSelectionBlock("https://images.unsplash.com/photo-12345");
+
+    try {
+      validateMediaAndPrepareBlocks(blocks);
+      throw new Error("expected validateMediaAndPrepareBlocks to throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(InvalidInputError);
+      expect((error as InvalidInputError).message).toContain(
+        'Invalid image URL in choice 1 of question 1 of block "Design Vote"'
+      );
+      expect((error as InvalidInputError).message).toContain("png, jpeg, jpg, webp, heic");
+    }
+  });
+
+  test("returns blocks with isDraft stripped when all media is valid", () => {
+    vi.spyOn(fileValidation, "isValidImageFile").mockReturnValue(true);
+
+    const blocks = [
+      {
+        id: "block-1",
+        name: "Design Vote",
+        elements: [
+          {
+            id: "picture-q",
+            type: TSurveyElementTypeEnum.PictureSelection,
+            headline: { default: "Pick one" },
+            required: true,
+            isDraft: true,
+            choices: [{ id: "c1", imageUrl: "https://example.com/valid.png" }],
+          } as unknown as TSurveyElement,
+        ],
+      },
+    ] as TSurveyBlock[];
+
+    const result = validateMediaAndPrepareBlocks(blocks);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].elements[0]).not.toHaveProperty("isDraft");
   });
 });

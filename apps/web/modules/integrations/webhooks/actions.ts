@@ -3,16 +3,21 @@
 import { z } from "zod";
 import { ZId } from "@formbricks/types/common";
 import { ResourceNotFoundError } from "@formbricks/types/errors";
+import { assertCan } from "@/lib/authorization";
 import { generateWebhookSecret } from "@/lib/crypto";
+import { capturePostHogEvent } from "@/lib/posthog";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
-import { checkAuthorizationUpdated } from "@/lib/utils/action-client/action-client-middleware";
 import {
-  getOrganizationIdFromEnvironmentId,
   getOrganizationIdFromWebhookId,
-  getProjectIdFromEnvironmentId,
-  getProjectIdFromWebhookId,
+  getOrganizationIdFromWorkspaceId,
+  getWorkspaceIdFromWebhookId,
 } from "@/lib/utils/helper";
-import { getWebhook } from "@/modules/api/v2/management/webhooks/[webhookId]/lib/webhook";
+import {
+  getWebhook,
+  getWebhookWithSecret,
+} from "@/modules/api/v2/management/webhooks/[webhookId]/lib/webhook";
+import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
+import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
 import { withAuditLogging } from "@/modules/ee/audit-logs/lib/handler";
 import {
   createWebhook,
@@ -23,36 +28,38 @@ import {
 import { ZWebhookInput } from "@/modules/integrations/webhooks/types/webhooks";
 
 const ZCreateWebhookAction = z.object({
-  environmentId: ZId,
+  workspaceId: ZId,
   webhookInput: ZWebhookInput,
   webhookSecret: z.string().optional(),
 });
 
 export const createWebhookAction = authenticatedActionClient.inputSchema(ZCreateWebhookAction).action(
   withAuditLogging("created", "webhook", async ({ ctx, parsedInput }) => {
-    const organizationId = await getOrganizationIdFromEnvironmentId(parsedInput.environmentId);
-    await checkAuthorizationUpdated({
-      userId: ctx.user.id,
-      organizationId,
-      access: [
-        {
-          type: "organization",
-          roles: ["owner", "manager"],
-        },
-        {
-          type: "projectTeam",
-          minPermission: "read",
-          projectId: await getProjectIdFromEnvironmentId(parsedInput.environmentId),
-        },
-      ],
+    const organizationId = await getOrganizationIdFromWorkspaceId(parsedInput.workspaceId);
+    await assertCan({ type: "user", id: ctx.user.id }, "workspace.write", {
+      type: "workspace",
+      id: parsedInput.workspaceId,
     });
+    await applyRateLimit(rateLimitConfigs.actions.stateMutation, parsedInput.workspaceId);
     const webhook = await createWebhook(
-      parsedInput.environmentId,
+      parsedInput.workspaceId,
       parsedInput.webhookInput,
       parsedInput.webhookSecret
     );
     ctx.auditLoggingCtx.organizationId = organizationId;
     ctx.auditLoggingCtx.newObject = parsedInput.webhookInput;
+
+    capturePostHogEvent(
+      ctx.user.id,
+      "integration_connected",
+      {
+        integration_type: "webhook",
+        organization_id: organizationId,
+        workspace_id: parsedInput.workspaceId,
+      },
+      { organizationId, workspaceId: parsedInput.workspaceId }
+    );
+
     return webhook;
   })
 );
@@ -64,21 +71,12 @@ const ZDeleteWebhookAction = z.object({
 export const deleteWebhookAction = authenticatedActionClient.inputSchema(ZDeleteWebhookAction).action(
   withAuditLogging("deleted", "webhook", async ({ ctx, parsedInput }) => {
     const organizationId = await getOrganizationIdFromWebhookId(parsedInput.id);
-    await checkAuthorizationUpdated({
-      userId: ctx.user.id,
-      organizationId,
-      access: [
-        {
-          type: "organization",
-          roles: ["owner", "manager"],
-        },
-        {
-          type: "projectTeam",
-          minPermission: "readWrite",
-          projectId: await getProjectIdFromWebhookId(parsedInput.id),
-        },
-      ],
+    const workspaceId = await getWorkspaceIdFromWebhookId(parsedInput.id);
+    await assertCan({ type: "user", id: ctx.user.id }, "workspace.write", {
+      type: "workspace",
+      id: workspaceId,
     });
+    await applyRateLimit(rateLimitConfigs.actions.stateMutation, workspaceId);
 
     ctx.auditLoggingCtx.organizationId = organizationId;
     ctx.auditLoggingCtx.webhookId = parsedInput.id;
@@ -97,21 +95,12 @@ const ZUpdateWebhookAction = z.object({
 export const updateWebhookAction = authenticatedActionClient.inputSchema(ZUpdateWebhookAction).action(
   withAuditLogging("updated", "webhook", async ({ ctx, parsedInput }) => {
     const organizationId = await getOrganizationIdFromWebhookId(parsedInput.webhookId);
-    await checkAuthorizationUpdated({
-      userId: ctx.user.id,
-      organizationId,
-      access: [
-        {
-          type: "organization",
-          roles: ["owner", "manager"],
-        },
-        {
-          type: "projectTeam",
-          minPermission: "readWrite",
-          projectId: await getProjectIdFromWebhookId(parsedInput.webhookId),
-        },
-      ],
+    const workspaceId = await getWorkspaceIdFromWebhookId(parsedInput.webhookId);
+    await assertCan({ type: "user", id: ctx.user.id }, "workspace.write", {
+      type: "workspace",
+      id: workspaceId,
     });
+    await applyRateLimit(rateLimitConfigs.actions.stateMutation, workspaceId);
 
     ctx.auditLoggingCtx.organizationId = organizationId;
     ctx.auditLoggingCtx.webhookId = parsedInput.webhookId;
@@ -126,6 +115,10 @@ export const updateWebhookAction = authenticatedActionClient.inputSchema(ZUpdate
 const ZTestEndpointAction = z.object({
   url: z.string(),
   webhookId: ZId.optional(),
+  // Required so the not-yet-created-webhook path has something to authorize against; without it this
+  // action did no authorization at all and any logged-in user — including a billing-only member with no
+  // product access — could make the server POST a signed test payload to any URL they named.
+  workspaceId: ZId,
   secret: z.string().optional(),
 });
 
@@ -135,29 +128,24 @@ export const testEndpointAction = authenticatedActionClient
     let secret: string | undefined;
 
     if (parsedInput.webhookId) {
-      await checkAuthorizationUpdated({
-        userId: ctx.user.id,
-        organizationId: await getOrganizationIdFromWebhookId(parsedInput.webhookId),
-        access: [
-          {
-            type: "organization",
-            roles: ["owner", "manager"],
-          },
-          {
-            type: "projectTeam",
-            minPermission: "read",
-            projectId: await getProjectIdFromWebhookId(parsedInput.webhookId),
-          },
-        ],
+      await assertCan({ type: "user", id: ctx.user.id }, "workspace.write", {
+        type: "workspace",
+        id: await getWorkspaceIdFromWebhookId(parsedInput.webhookId),
       });
 
-      const webhookResult = await getWebhook(parsedInput.webhookId);
+      const webhookResult = await getWebhookWithSecret(parsedInput.webhookId);
       if (!webhookResult.ok) {
         throw new ResourceNotFoundError("Webhook", parsedInput.webhookId);
       }
 
       secret = webhookResult.data.secret ?? undefined;
     } else {
+      // No webhook yet: authorize against the workspace the webhook is being created in.
+      await assertCan({ type: "user", id: ctx.user.id }, "workspace.write", {
+        type: "workspace",
+        id: parsedInput.workspaceId,
+      });
+
       // New webhook, use the provided secret or generate a new one
       secret = parsedInput.secret ?? generateWebhookSecret();
     }

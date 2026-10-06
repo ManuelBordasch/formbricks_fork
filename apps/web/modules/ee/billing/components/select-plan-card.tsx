@@ -1,8 +1,9 @@
 "use client";
 
-import { CheckIcon, GiftIcon } from "lucide-react";
+import { CheckIcon, GiftIcon, XCircleIcon } from "lucide-react";
 import Image from "next/image";
 import { useRouter } from "next/navigation";
+import posthog from "posthog-js";
 import { useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
@@ -11,14 +12,21 @@ import ethereumLogo from "@/images/customer-logos/ethereum-logo.png";
 import flixbusLogo from "@/images/customer-logos/flixbus-white.svg";
 import githubLogo from "@/images/customer-logos/github-logo.png";
 import siemensLogo from "@/images/customer-logos/siemens.png";
-import { startProTrialAction } from "@/modules/ee/billing/actions";
-import { startHobbyAction } from "@/modules/ee/billing/actions";
+import { startHobbyAction, startProTrialAction } from "@/modules/ee/billing/actions";
 import { Button } from "@/modules/ui/components/button";
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/modules/ui/components/dialog";
 
 interface SelectPlanCardProps {
-  /** URL to redirect after starting trial or continuing with free */
   nextUrl: string;
   organizationId: string;
+  trialDays: number;
 }
 
 const CUSTOMER_LOGOS = [
@@ -29,23 +37,26 @@ const CUSTOMER_LOGOS = [
   { src: ethereumLogo, alt: "Ethereum" },
 ];
 
-export const SelectPlanCard = ({ nextUrl, organizationId }: SelectPlanCardProps) => {
+export const SelectPlanCard = ({ nextUrl, organizationId, trialDays }: Readonly<SelectPlanCardProps>) => {
   const router = useRouter();
   const [isStartingTrial, setIsStartingTrial] = useState(false);
   const [isStartingHobby, setIsStartingHobby] = useState(false);
+  const [showHobbyConfirm, setShowHobbyConfirm] = useState(false);
   const { t } = useTranslation();
 
-  const TRIAL_FEATURE_KEYS = [
-    t("environments.settings.billing.trial_feature_unlimited_seats"),
-    t("environments.settings.billing.trial_feature_hide_branding"),
-    t("environments.settings.billing.trial_feature_respondent_identification"),
-    t("environments.settings.billing.trial_feature_contact_segment_management"),
-    t("environments.settings.billing.trial_feature_attribute_segmentation"),
-    t("environments.settings.billing.trial_feature_mobile_sdks"),
-    t("environments.settings.billing.trial_feature_email_followups"),
-    t("environments.settings.billing.trial_feature_webhooks"),
-    t("environments.settings.billing.trial_feature_api_access"),
-  ] as const;
+  const copy = {
+    header: t("workspace.settings.billing.select_plan_header", { count: trialDays }),
+    subheader: t("workspace.settings.billing.select_plan_subheader"),
+    cta: t("workspace.settings.billing.select_plan_cta"),
+    skip: t("workspace.settings.billing.select_plan_skip"),
+  };
+
+  const SELECT_PLAN_FEATURE_KEYS = [
+    t("workspace.settings.billing.select_plan_feature_1"),
+    t("workspace.settings.billing.select_plan_feature_2"),
+    t("workspace.settings.billing.select_plan_feature_3"),
+    t("workspace.settings.billing.select_plan_feature_4"),
+  ];
 
   const handleStartTrial = async () => {
     setIsStartingTrial(true);
@@ -54,14 +65,14 @@ export const SelectPlanCard = ({ nextUrl, organizationId }: SelectPlanCardProps)
       if (result?.data) {
         router.push(nextUrl);
       } else if (result?.serverError === "trial_already_used") {
-        toast.error(t("environments.settings.billing.trial_already_used"));
+        toast.error(t("workspace.settings.billing.trial_already_used"));
         setIsStartingTrial(false);
       } else {
-        toast.error(t("environments.settings.billing.failed_to_start_trial"));
+        toast.error(t("workspace.settings.billing.failed_to_start_trial"));
         setIsStartingTrial(false);
       }
     } catch {
-      toast.error(t("environments.settings.billing.failed_to_start_trial"));
+      toast.error(t("workspace.settings.billing.failed_to_start_trial"));
       setIsStartingTrial(false);
     }
   };
@@ -83,25 +94,22 @@ export const SelectPlanCard = ({ nextUrl, organizationId }: SelectPlanCardProps)
   };
 
   return (
-    <div className="flex w-full max-w-md flex-col items-center space-y-6">
-      {/* Trial Card */}
+    <div className="flex w-full max-w-md flex-col items-center gap-y-6">
       <div className="relative w-full overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg">
-        <div className="flex flex-col items-center space-y-6 p-8">
+        <div className="flex flex-col items-center gap-y-6 p-8">
           <div className="rounded-full bg-slate-100 p-4">
-            <GiftIcon className="h-10 w-10 text-slate-600" />
+            <GiftIcon className="size-10 text-slate-600" />
           </div>
 
           <div className="text-center">
-            <h3 className="text-2xl font-semibold text-slate-800">
-              {t("environments.settings.billing.trial_title")}
-            </h3>
-            <p className="mt-2 text-slate-600">{t("environments.settings.billing.trial_no_credit_card")}</p>
+            <h3 className="text-2xl font-semibold text-slate-800">{copy.header}</h3>
+            <p className="mt-2 text-slate-600">{copy.subheader}</p>
           </div>
 
-          <ul className="w-full space-y-3 text-left">
-            {TRIAL_FEATURE_KEYS.map((key) => (
+          <ul className="my-3 w-full space-y-3 text-left">
+            {SELECT_PLAN_FEATURE_KEYS.map((key) => (
               <li key={key} className="flex items-center gap-3 text-slate-700">
-                <CheckIcon className="h-5 w-5 flex-shrink-0 text-slate-900" />
+                <CheckIcon className="size-5 shrink-0 text-slate-900" />
                 <span>{key}</span>
               </li>
             ))}
@@ -113,13 +121,12 @@ export const SelectPlanCard = ({ nextUrl, organizationId }: SelectPlanCardProps)
             className="mt-4 w-full"
             loading={isStartingTrial}
             disabled={isStartingTrial || isStartingHobby}>
-            {t("common.start_free_trial")}
+            {copy.cta}
           </Button>
         </div>
 
-        {/* Logo Carousel */}
         <div className="w-full overflow-hidden border-t border-slate-100 bg-slate-50 py-4">
-          <div className="flex w-max animate-logo-scroll gap-12 hover:[animation-play-state:paused]">
+          <div className="flex w-max animate-logo-scroll gap-12 hover:paused">
             {[...CUSTOMER_LOGOS, ...CUSTOMER_LOGOS].map((logo, index) => (
               <div
                 key={`${logo.alt}-${index}`}
@@ -138,11 +145,66 @@ export const SelectPlanCard = ({ nextUrl, organizationId }: SelectPlanCardProps)
       </div>
 
       <button
-        onClick={handleContinueHobby}
+        type="button"
+        onClick={() => setShowHobbyConfirm(true)}
         disabled={isStartingTrial || isStartingHobby}
         className="text-sm text-slate-400 underline-offset-2 transition-colors hover:text-slate-600 hover:underline">
-        {isStartingHobby ? t("common.loading") : t("environments.settings.billing.stay_on_hobby_plan")}
+        {copy.skip}
       </button>
+
+      <Dialog open={showHobbyConfirm} onOpenChange={setShowHobbyConfirm}>
+        <DialogContent width="narrow" hideCloseButton>
+          <DialogHeader>
+            <DialogTitle>{t("workspace.settings.billing.hobby_confirm_title")}</DialogTitle>
+          </DialogHeader>
+          <DialogBody>
+            <p className="text-slate-500">{t("workspace.settings.billing.hobby_confirm_description")}</p>
+            <ul className="mt-4 space-y-1.5">
+              {[
+                { from: "2,000", to: t("workspace.settings.billing.hobby_confirm_feature_responses") },
+                { from: "3", to: t("workspace.settings.billing.hobby_confirm_feature_workspaces") },
+              ].map((item) => (
+                <li key={item.to} className="flex items-center gap-2 text-sm text-slate-700">
+                  <XCircleIcon className="size-3.5 shrink-0 text-primary" />
+                  <span>
+                    <span className="text-slate-400 line-through">{item.from}</span>{" "}
+                    <span aria-hidden="true">→</span> {item.to}
+                  </span>
+                </li>
+              ))}
+              {[
+                t("workspace.settings.billing.hobby_confirm_feature_branding"),
+                t("workspace.settings.billing.hobby_confirm_feature_contacts"),
+                t("workspace.settings.billing.hobby_confirm_feature_ai"),
+              ].map((item) => (
+                <li key={item} className="flex items-center gap-2 text-sm text-slate-700">
+                  <XCircleIcon className="size-3.5 shrink-0 text-primary" />
+                  <span className="text-slate-400 line-through">{item}</span>
+                </li>
+              ))}
+            </ul>
+          </DialogBody>
+          <DialogFooter>
+            <Button
+              variant="secondary"
+              loading={isStartingHobby}
+              onClick={() => {
+                posthog.capture("billing_onboarding_hobby_confirm_cta_clicked", { cta: "downgrade_hobby" });
+                void handleContinueHobby();
+              }}>
+              {t("workspace.settings.billing.hobby_confirm_downgrade")}
+            </Button>
+            <Button
+              onClick={() => {
+                posthog.capture("billing_onboarding_hobby_confirm_cta_clicked", { cta: "start_trial" });
+                setShowHobbyConfirm(false);
+                void handleStartTrial();
+              }}>
+              {t("workspace.settings.billing.hobby_confirm_start_trial")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };

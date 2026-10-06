@@ -1,7 +1,8 @@
-import { ButtonHTMLAttributes, useRef } from "preact/compat";
+import { type ButtonHTMLAttributes } from "preact";
+import { useRef } from "preact/compat";
 import { useCallback, useEffect, useState } from "preact/hooks";
 import { useTranslation } from "react-i18next";
-import { cn } from "@/lib/utils";
+import { Button } from "./button";
 
 interface SubmitButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   buttonLabel?: string;
@@ -12,13 +13,13 @@ interface SubmitButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 export function SubmitButton({
   buttonLabel,
   isLastQuestion,
-  tabIndex = 1,
+  tabIndex = 0,
   focus = false,
   onClick,
   disabled,
   type,
   ...props
-}: SubmitButtonProps) {
+}: Readonly<SubmitButtonProps>) {
   const buttonRef = useRef<HTMLButtonElement>(null);
   const [isProcessing, setIsProcessing] = useState(false);
 
@@ -41,6 +42,21 @@ export function SubmitButton({
   const handleKeyDown = useCallback(
     (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && !disabled && !isProcessing) {
+        // The listener sits on `document` so the chord still works when focus is on <body>, which is
+        // the normal state for link surveys. An embedded survey shares the page with a host app that
+        // owns its own shortcuts, so don't claim the chord — or preventDefault it — while the user is
+        // focused inside their page.
+        const surveyRoot = buttonRef.current?.closest("#fbjs");
+        const activeElement = document.activeElement;
+        if (
+          surveyRoot &&
+          activeElement &&
+          activeElement !== document.body &&
+          !surveyRoot.contains(activeElement)
+        ) {
+          return;
+        }
+
         event.preventDefault();
         setIsProcessing(true);
         const button = buttonRef.current;
@@ -57,41 +73,35 @@ export function SubmitButton({
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [handleKeyDown]);
 
+  // The button sits *below* the headline and subheader of a welcome or ending card, inside
+  // `ScrollableContainer`. Letting focus scroll it into view opens an overflowing card at its end, so
+  // the respondent lands on the button with the text they have yet to read scrolled out of view
+  // (ENG-2289) — hence `preventScroll`. For the same reason the button carries no `autoFocus`
+  // attribute: the browser's autofocus step has no `preventScroll` knob, and this delayed focus
+  // (deferred so the card transition has settled) is the intended focus path anyway.
   useEffect(() => {
     if (buttonRef.current && focus) {
-      setTimeout(() => {
-        buttonRef.current?.focus();
+      const timeoutId = setTimeout(() => {
+        buttonRef.current?.focus({ preventScroll: true });
       }, 200);
+
+      return () => {
+        clearTimeout(timeoutId);
+      };
     }
   }, [focus]);
 
   return (
-    <button
+    <Button
       {...props}
       dir="auto"
+      variant="primary"
       ref={buttonRef}
       type={type}
       tabIndex={tabIndex}
-      autoFocus={focus}
-      className={cn(
-        "border-submit-button-border focus:ring-focus mb-1 flex items-center justify-center border leading-4 shadow-xs hover:opacity-90 focus:ring-2 focus:ring-offset-2 focus:outline-hidden",
-        "button-custom"
-      )}
-      style={{
-        borderRadius: "var(--fb-button-border-radius)",
-        backgroundColor: "var(--fb-button-bg-color)",
-        color: "var(--fb-button-text-color)",
-        height: "var(--fb-button-height)",
-        fontSize: "var(--fb-button-font-size)",
-        fontWeight: "var(--fb-button-font-weight)",
-        paddingLeft: "var(--fb-button-padding-x)",
-        paddingRight: "var(--fb-button-padding-x)",
-        paddingTop: "var(--fb-button-padding-y)",
-        paddingBottom: "var(--fb-button-padding-y)",
-      }}
       onClick={onClick}
       disabled={disabled}>
       {buttonLabel || (isLastQuestion ? t("common.finish") : t("common.next"))}
-    </button>
+    </Button>
   );
 }

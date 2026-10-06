@@ -1,7 +1,9 @@
 import * as Sentry from "@sentry/nextjs";
 import { type Instrumentation } from "next";
+import { logger } from "@formbricks/logger";
 import { isExpectedError } from "@formbricks/types/errors";
 import { IS_PRODUCTION, PROMETHEUS_ENABLED, SENTRY_DSN } from "@/lib/constants";
+import { assertAuthzedRuntimeConfiguration } from "@/lib/env";
 
 export const onRequestError: Instrumentation.onRequestError = (...args) => {
   const [error] = args;
@@ -17,9 +19,31 @@ export const onRequestError: Instrumentation.onRequestError = (...args) => {
 
 export const register = async () => {
   if (process.env.NEXT_RUNTIME === "nodejs") {
+    if (process.env.NEXT_PHASE !== "phase-production-build") {
+      assertAuthzedRuntimeConfiguration();
+    }
+
     // Load OpenTelemetry instrumentation when Prometheus metrics or OTLP export is enabled
     if (PROMETHEUS_ENABLED || process.env.OTEL_EXPORTER_OTLP_ENDPOINT) {
       await import("./instrumentation-node");
+    }
+
+    // Skip runtime-only BullMQ bootstrapping during production builds.
+    if (process.env.NEXT_PHASE !== "phase-production-build") {
+      try {
+        const { registerJobsWorker, registerRecurringJobs } = await import("./instrumentation-jobs");
+        void registerRecurringJobs().catch((error: unknown) => {
+          logger.error(
+            { err: error },
+            "BullMQ recurring job registration failed during Next.js instrumentation"
+          );
+        });
+        void registerJobsWorker().catch((error: unknown) => {
+          logger.error({ err: error }, "BullMQ worker registration failed during Next.js instrumentation");
+        });
+      } catch (error) {
+        logger.error({ err: error }, "BullMQ instrumentation import failed during Next.js instrumentation");
+      }
     }
   }
   // Sentry init loads after OTEL to avoid TracerProvider conflicts

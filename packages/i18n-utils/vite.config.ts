@@ -1,15 +1,22 @@
 /// <reference types="vitest" />
 import { resolve } from "node:path";
-import dts from "vite-plugin-dts";
-import { PluginOption, defineConfig } from "vitest/config";
+import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   build: {
+    // One entry per public subpath (ENG-2306). `canonical` and `utils` are entries in their own
+    // right so the bare `.` import and the named subpaths resolve to the same chunks — previously
+    // `./src/*` handed out the sources alongside `dist/index.js`, so a consumer reaching both
+    // carried two copies of the ISO-639 table.
     lib: {
-      entry: resolve(__dirname, "src/index.ts"),
-      name: "i18nUtils",
+      entry: {
+        index: resolve(__dirname, "src/index.ts"),
+        canonical: resolve(__dirname, "src/canonical.ts"),
+        "survey-runtime-languages": resolve(__dirname, "src/survey-runtime-languages.ts"),
+        utils: resolve(__dirname, "src/utils.ts"),
+      },
       formats: ["es", "cjs"],
-      fileName: (format) => `index.${format}.js`,
+      fileName: (format, entryName) => `${entryName}.${format === "es" ? "js" : "cjs"}`,
     },
     outDir: "dist",
     emptyOutDir: false,
@@ -21,9 +28,4 @@ export default defineConfig({
       reporter: ["text", "json", "html", "lcov"],
     },
   },
-  plugins: [
-    dts({
-      rollupTypes: false,
-    }) as PluginOption,
-  ],
 });

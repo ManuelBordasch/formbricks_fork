@@ -1,10 +1,11 @@
 "use client";
 
-import { ApiKeyPermission } from "@prisma/client";
+import type { TFunction } from "i18next";
 import { FilesIcon, TrashIcon } from "lucide-react";
 import { useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
+import { ApiKeyPermission } from "@formbricks/database/prisma-browser";
 import { TOrganizationAccess } from "@formbricks/types/api-key";
 import { TUserLocale } from "@formbricks/types/user";
 import { timeSince } from "@/lib/time";
@@ -13,27 +14,141 @@ import { ViewPermissionModal } from "@/modules/organization/settings/api-keys/co
 import {
   TApiKeyUpdateInput,
   TApiKeyWithEnvironmentPermission,
-  TOrganizationProject,
+  TOrganizationWorkspace,
 } from "@/modules/organization/settings/api-keys/types/api-keys";
 import { Button } from "@/modules/ui/components/button";
 import { DeleteDialog } from "@/modules/ui/components/delete-dialog";
+import { SettingsTable, type TSettingsTableColumn } from "@/modules/ui/components/settings-table";
 import { createApiKeyAction, deleteApiKeyAction, updateApiKeyAction } from "../actions";
 import { AddApiKeyModal } from "./add-api-key-modal";
+
+/** A stored key, plus the plaintext value the create response returns once and only once. */
+type TApiKeyRow = TApiKeyWithEnvironmentPermission & { actualKey?: string };
+
+const ApiKeyDisplay = ({ apiKey }: Readonly<{ apiKey: string }>) => {
+  const { t } = useTranslation();
+  const copyToClipboard = async () => {
+    try {
+      await navigator.clipboard.writeText(apiKey);
+      toast.success(t("workspace.api_keys.api_key_copied_to_clipboard"));
+    } catch {
+      toast.error(t("workspace.api_keys.unable_to_copy_api_key"));
+    }
+  };
+
+  if (!apiKey) {
+    return <span className="italic">{t("workspace.api_keys.secret")}</span>;
+  }
+
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="break-all whitespace-pre-line">{apiKey}</span>
+      {/* `copyApiKeyIcon` is load-bearing: `playwright/lib/utils.ts` waits for and clicks it to read a
+          freshly created key, which eight API specs depend on for their bearer token. */}
+      <div className="copyApiKeyIcon shrink-0">
+        <FilesIcon
+          className="size-4 cursor-pointer"
+          onClick={(e) => {
+            // Stops the click reaching the row, which would open the permissions modal. The column is
+            // deliberately not `stopRowClick`: clicking the key *text* has always opened the modal, and
+            // only the copy affordance is an exception.
+            e.stopPropagation();
+            void copyToClipboard();
+          }}
+          data-testid="copy-button"
+        />
+      </div>
+    </div>
+  );
+};
+
+/**
+ * Exported so `loading.tsx` renders its skeleton from the same column array. That is the whole point of
+ * the factory: the old skeleton hand-rolled the header and had drifted to **three** columns against the
+ * table's four, which no test could catch.
+ *
+ * Defined at module level rather than inside the component: an inline `cell` that returns JSX reads as a
+ * nested component definition to Sonar (typescript:S6478).
+ */
+export const getApiKeyColumns = ({
+  t,
+  locale,
+  onDelete,
+}: Readonly<{
+  t: TFunction;
+  locale: TUserLocale;
+  onDelete: (event: React.MouseEvent, apiKey: TApiKeyRow) => void;
+}>): TSettingsTableColumn<TApiKeyRow>[] => [
+  {
+    id: "label",
+    header: t("common.label"),
+    headerClassName: "w-[25%]",
+    cellClassName: "font-semibold",
+    skeletonWidth: "w-32",
+    cell: (apiKey) => apiKey.label,
+  },
+  {
+    id: "apiKey",
+    header: t("workspace.api_keys.api_key"),
+    headerClassName: "w-[45%]",
+    // Replaces `hidden sm:block`, which would have restored a `<td>` to `display: block` and dropped it
+    // out of the table's column layout. `hideBelow` uses `table-cell` for exactly that reason.
+    hideBelow: "sm",
+    skeletonWidth: "w-64",
+    cell: (apiKey) => <ApiKeyDisplay apiKey={apiKey.actualKey ?? ""} />,
+  },
+  {
+    id: "createdAt",
+    header: t("common.created_at"),
+    headerClassName: "w-[20%]",
+    skeletonWidth: "w-20",
+    cell: (apiKey) => timeSince(apiKey.createdAt.toString(), locale),
+  },
+  {
+    id: "actions",
+    header: null,
+    srLabel: t("common.actions"),
+    headerClassName: "w-[10%]",
+    stopRowClick: true,
+    skeletonWidth: "w-8",
+    // The flex goes on a wrapper inside the cell, never on `cellClassName`: that class lands on the `<td>`
+    // itself, and `display: flex` there stops it being a table-cell — which silently kills the shared
+    // `align-middle` (`vertical-align` applies only to inline-level and table-cell boxes) and makes the
+    // browser wrap the cell in an anonymous table-cell that defaults to baseline alignment. The button
+    // would sit high in the row instead of centred. Same reasoning as `hideBelow` above.
+    cell: (apiKey) => (
+      <div className="flex justify-end">
+        <Button
+          size="icon"
+          variant="ghost"
+          aria-label={t("common.delete")}
+          onClick={(event) => onDelete(event, apiKey)}>
+          <TrashIcon />
+        </Button>
+      </div>
+    ),
+  },
+];
 
 interface EditAPIKeysProps {
   organizationId: string;
   apiKeys: TApiKeyWithEnvironmentPermission[];
   locale: TUserLocale;
-  isReadOnly: boolean;
-  projects: TOrganizationProject[];
+  workspaces: TOrganizationWorkspace[];
+  isFormbricksCloud: boolean;
 }
 
-export const EditAPIKeys = ({ organizationId, apiKeys, locale, isReadOnly, projects }: EditAPIKeysProps) => {
+export const EditAPIKeys = ({
+  organizationId,
+  apiKeys,
+  locale,
+  workspaces,
+  isFormbricksCloud,
+}: Readonly<EditAPIKeysProps>) => {
   const { t } = useTranslation();
   const [isAddAPIKeyModalOpen, setIsAddAPIKeyModalOpen] = useState(false);
   const [isDeleteKeyModalOpen, setIsDeleteKeyModalOpen] = useState(false);
-  const [apiKeysLocal, setApiKeysLocal] =
-    useState<(TApiKeyWithEnvironmentPermission & { actualKey?: string })[]>(apiKeys);
+  const [apiKeysLocal, setApiKeysLocal] = useState<TApiKeyRow[]>(apiKeys);
   const [activeKey, setActiveKey] = useState<TApiKeyWithEnvironmentPermission | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [viewPermissionsOpen, setViewPermissionsOpen] = useState(false);
@@ -51,11 +166,11 @@ export const EditAPIKeys = ({ organizationId, apiKeys, locale, isReadOnly, proje
     if (deleteApiKeyResponse?.data) {
       const updatedApiKeys = apiKeysLocal?.filter((apiKey) => apiKey.id !== activeKey.id) || [];
       setApiKeysLocal(updatedApiKeys);
-      toast.success(t("environments.workspace.api_keys.api_key_deleted"));
+      toast.success(t("workspace.api_keys.api_key_deleted"));
       setIsDeleteKeyModalOpen(false);
       setIsLoading(false);
     } else {
-      toast.error(t("environments.workspace.api_keys.unable_to_delete_api_key"));
+      toast.error(t("workspace.api_keys.unable_to_delete_api_key"));
       setIsDeleteKeyModalOpen(false);
       setIsLoading(false);
     }
@@ -63,7 +178,10 @@ export const EditAPIKeys = ({ organizationId, apiKeys, locale, isReadOnly, proje
 
   const handleAddAPIKey = async (data: {
     label: string;
-    environmentPermissions: Array<{ environmentId: string; permission: ApiKeyPermission }>;
+    workspacePermissions: Array<{
+      permission: ApiKeyPermission;
+      workspaceId: string;
+    }>;
     organizationAccess: TOrganizationAccess;
   }): Promise<void> => {
     setIsLoading(true);
@@ -71,7 +189,7 @@ export const EditAPIKeys = ({ organizationId, apiKeys, locale, isReadOnly, proje
       organizationId: organizationId,
       apiKeyData: {
         label: data.label,
-        environmentPermissions: data.environmentPermissions,
+        workspacePermissions: data.workspacePermissions,
         organizationAccess: data.organizationAccess,
       },
     });
@@ -80,7 +198,7 @@ export const EditAPIKeys = ({ organizationId, apiKeys, locale, isReadOnly, proje
       const updatedApiKeys = [...apiKeysLocal, createApiKeyResponse.data];
       setApiKeysLocal(updatedApiKeys);
       setIsLoading(false);
-      toast.success(t("environments.workspace.api_keys.api_key_created"));
+      toast.success(t("workspace.api_keys.api_key_created"));
     } else {
       setIsLoading(false);
       const errorMessage = getFormattedErrorMessage(createApiKeyResponse);
@@ -111,7 +229,7 @@ export const EditAPIKeys = ({ organizationId, apiKeys, locale, isReadOnly, proje
         }) || [];
 
       setApiKeysLocal(updatedApiKeys);
-      toast.success(t("environments.workspace.api_keys.api_key_updated"));
+      toast.success(t("workspace.api_keys.api_key_updated"));
       setIsLoading(false);
     } else {
       const errorMessage = getFormattedErrorMessage(updateApiKeyResponse);
@@ -122,111 +240,42 @@ export const EditAPIKeys = ({ organizationId, apiKeys, locale, isReadOnly, proje
     setViewPermissionsOpen(false);
   };
 
-  const ApiKeyDisplay = ({ apiKey }: { apiKey: string }) => {
-    const copyToClipboard = () => {
-      navigator.clipboard.writeText(apiKey);
-      toast.success(t("environments.workspace.api_keys.api_key_copied_to_clipboard"));
-    };
-
-    if (!apiKey) {
-      return <span className="italic">{t("environments.workspace.api_keys.secret")}</span>;
-    }
-
-    return (
-      <div className="flex items-center justify-between gap-2">
-        <span className="whitespace-pre-line break-all">{apiKey}</span>
-        <div className="copyApiKeyIcon flex-shrink-0">
-          <FilesIcon
-            className="h-4 w-4 cursor-pointer"
-            onClick={(e) => {
-              e.stopPropagation();
-              copyToClipboard();
-            }}
-            data-testid="copy-button"
-          />
-        </div>
-      </div>
-    );
-  };
-
   return (
-    <div className="space-y-4">
-      <div className="rounded-lg border border-slate-200">
-        <div className="grid h-12 grid-cols-10 content-center rounded-t-lg bg-slate-100 px-6 text-left text-sm font-semibold text-slate-900">
-          <div className="col-span-4 sm:col-span-2">{t("common.label")}</div>
-          <div className="col-span-4 hidden sm:col-span-5 sm:block">
-            {t("environments.workspace.api_keys.api_key")}
-          </div>
-          <div className="col-span-4 sm:col-span-2">{t("common.created_at")}</div>
-          <div></div>
-        </div>
-        <div className="grid-cols-9">
-          {apiKeysLocal?.length === 0 ? (
-            <div className="flex h-12 items-center justify-center whitespace-nowrap px-6 text-sm font-medium text-slate-400">
-              {t("environments.workspace.api_keys.no_api_keys_yet")}
-            </div>
-          ) : (
-            apiKeysLocal?.map((apiKey) => (
-              <div
-                role="button"
-                className="grid h-12 w-full grid-cols-10 content-center items-center rounded-lg px-6 text-left text-sm text-slate-900 hover:bg-slate-50 focus:bg-slate-50 focus:outline-none"
-                onClick={() => {
-                  setActiveKey(apiKey);
-                  setViewPermissionsOpen(true);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setActiveKey(apiKey);
-                    setViewPermissionsOpen(true);
-                  }
-                }}
-                tabIndex={0}
-                data-testid="api-key-row"
-                key={apiKey.id}>
-                <div className="col-span-4 font-semibold sm:col-span-2">{apiKey.label}</div>
-                <div className="col-span-4 hidden pr-4 sm:col-span-5 sm:block">
-                  <ApiKeyDisplay apiKey={apiKey.actualKey ?? ""} />
-                </div>
-                <div className="col-span-4 sm:col-span-2">
-                  {timeSince(apiKey.createdAt.toString(), locale)}
-                </div>
-                {!isReadOnly && (
-                  <div className="col-span-1 text-center">
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      onClick={(e) => {
-                        handleOpenDeleteKeyModal(e, apiKey);
-                        e.stopPropagation();
-                      }}>
-                      <TrashIcon />
-                    </Button>
-                  </div>
-                )}
-              </div>
-            ))
-          )}
-        </div>
+    <>
+      {/* Moved above the table, matching every other settings table in this series — and required, since
+          a flush card body means the table has to be the last thing in it. The control carries the card's
+          gutter itself. */}
+      <div className="mb-4 flex justify-end px-4 pt-4">
+        <Button
+          size="sm"
+          onClick={() => {
+            setIsAddAPIKeyModalOpen(true);
+          }}>
+          {t("workspace.settings.api_keys.add_api_key")}
+        </Button>
       </div>
 
-      {!isReadOnly && (
-        <div>
-          <Button
-            size="sm"
-            onClick={() => {
-              setIsAddAPIKeyModalOpen(true);
-            }}>
-            {t("environments.settings.api_keys.add_api_key")}
-          </Button>
-        </div>
-      )}
+      <SettingsTable
+        columns={getApiKeyColumns({ t, locale, onDelete: handleOpenDeleteKeyModal })}
+        rows={apiKeysLocal}
+        getRowId={(apiKey) => apiKey.id}
+        emptyMessage={t("workspace.api_keys.no_api_keys_yet")}
+        getRowProps={() => ({ "data-testid": "api-key-row" })}
+        aria-label={t("common.api_keys")}
+        onRowClick={(apiKey) => {
+          setActiveKey(apiKey);
+          setViewPermissionsOpen(true);
+        }}
+        getRowLabel={(apiKey) => t("workspace.api_keys.view_permissions_for", { label: apiKey.label })}
+      />
+
       <AddApiKeyModal
         open={isAddAPIKeyModalOpen}
         setOpen={setIsAddAPIKeyModalOpen}
         onSubmit={handleAddAPIKey}
-        projects={projects}
+        workspaces={workspaces}
         isCreatingAPIKey={isLoading}
+        isFormbricksCloud={isFormbricksCloud}
       />
       {activeKey && (
         <ViewPermissionModal
@@ -234,18 +283,18 @@ export const EditAPIKeys = ({ organizationId, apiKeys, locale, isReadOnly, proje
           setOpen={setViewPermissionsOpen}
           onSubmit={handleUpdateAPIKey}
           apiKey={activeKey}
-          projects={projects}
+          workspaces={workspaces}
           isUpdating={isLoading}
         />
       )}
       <DeleteDialog
         open={isDeleteKeyModalOpen}
         setOpen={setIsDeleteKeyModalOpen}
-        deleteWhat={t("environments.workspace.api_keys.api_key")}
+        deleteWhat={t("workspace.api_keys.api_key")}
         onDelete={handleDeleteKey}
         isDeleting={isLoading}
-        text={t("environments.workspace.api_keys.delete_api_key_confirmation")}
+        text={t("workspace.api_keys.delete_api_key_confirmation")}
       />
-    </div>
+    </>
   );
 };

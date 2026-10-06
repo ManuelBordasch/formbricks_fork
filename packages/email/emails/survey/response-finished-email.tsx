@@ -1,5 +1,6 @@
 import { Column, Container, Heading, Hr, Link, Row, Section, Text } from "@react-email/components";
 import { FileDigitIcon, FileType2Icon } from "lucide-react";
+import { getComputedEmbeddedFields, getIngestedStorageKeys } from "@formbricks/types/embedded-data-resolver";
 import type { TOrganization } from "@formbricks/types/organizations";
 import type { TResponse } from "@formbricks/types/responses";
 import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
@@ -13,21 +14,30 @@ import { TEmailTemplateLegalProps } from "../../src/types/email";
 import { ProcessedResponseElement } from "../../src/types/follow-up";
 import { TFunction } from "../../src/types/translations";
 
+// `variables` / `hiddenFields` stay in the pick as the fallback the resolver reads when a survey's
+// EmbeddedData rows are not joined in; the rows themselves arrive as `embeddedFields` (ENG-1837).
+type TResponseFinishedEmailSurvey = Pick<
+  TSurvey,
+  "id" | "name" | "variables" | "hiddenFields" | "embeddedFields"
+>;
+
 export interface ResponseFinishedEmailProps extends TEmailTemplateLegalProps {
-  readonly survey: TSurvey;
+  readonly survey: TResponseFinishedEmailSurvey;
   readonly responseCount: number;
   readonly response: TResponse;
   readonly WEBAPP_URL: string;
-  readonly environmentId: string;
+  readonly workspaceId: string;
   readonly organization: TOrganization;
   readonly elements: ProcessedResponseElement[]; // Pre-processed data, not a function
+  readonly logoUrl?: string;
   readonly t?: TFunction;
 }
 
-const mockGetElementResponseMapping = (survey: TSurvey, response: TResponse) => {
+const mockGetElementResponseMapping = (survey: TResponseFinishedEmailSurvey, response: TResponse) => {
   // For preview, just return the response data as elements
+  const ingestedStorageKeys = getIngestedStorageKeys(survey);
   return Object.entries(response.data)
-    .filter(([key]) => !survey.hiddenFields.fieldIds?.includes(key))
+    .filter(([key]) => !ingestedStorageKeys.includes(key))
     .map(([key, value]) => ({
       element: key,
       response: value as string | string[],
@@ -40,14 +50,15 @@ export function ResponseFinishedEmail({
   responseCount,
   response,
   WEBAPP_URL,
-  environmentId,
+  workspaceId,
   organization,
   elements,
+  logoUrl,
   t = mockT,
   ...legalProps
 }: ResponseFinishedEmailProps): React.JSX.Element {
   return (
-    <EmailTemplate t={t} {...legalProps}>
+    <EmailTemplate logoUrl={logoUrl} t={t} {...legalProps}>
       <Container>
         <Row>
           <Column>
@@ -69,36 +80,36 @@ export function ResponseFinishedEmail({
                 </Row>
               );
             })}
-            {survey.variables
-              .filter((variable) => {
-                const variableResponse = response.variables[variable.id];
+            {getComputedEmbeddedFields(survey)
+              .filter(({ link }) => {
+                const variableResponse = response.variables[link.storageKey];
                 if (typeof variableResponse !== "string" && typeof variableResponse !== "number") {
                   return false;
                 }
                 return variableResponse !== undefined;
               })
-              .map((variable) => {
-                const variableResponse = response.variables[variable.id];
+              .map(({ field, link }) => {
+                const variableResponse = response.variables[link.storageKey];
                 return (
-                  <Row key={variable.id}>
+                  <Row key={link.storageKey}>
                     <Column className="w-full text-sm font-medium">
                       <Text className="mb-1 flex items-center gap-2">
-                        {variable.type === "number" ? (
+                        {field.dataType === "number" ? (
                           <FileDigitIcon className="h-4 w-4" />
                         ) : (
                           <FileType2Icon className="h-4 w-4" />
                         )}
-                        {variable.name}
+                        {field.name}
                       </Text>
-                      <Text className="mt-0 whitespace-pre-wrap break-words font-medium">
+                      <Text className="mt-0 font-medium break-words whitespace-pre-wrap">
                         {variableResponse}
                       </Text>
                     </Column>
                   </Row>
                 );
               })}
-            {survey.hiddenFields.fieldIds
-              ?.filter((hiddenFieldId) => {
+            {getIngestedStorageKeys(survey)
+              .filter((hiddenFieldId) => {
                 const hiddenFieldResponse = response.data[hiddenFieldId];
                 return hiddenFieldResponse && typeof hiddenFieldResponse === "string";
               })
@@ -110,7 +121,7 @@ export function ResponseFinishedEmail({
                       <Text className="mb-2 flex items-center gap-2 text-sm">
                         {hiddenFieldId} <EyeOffIcon />
                       </Text>
-                      <Text className="mt-0 whitespace-pre-wrap break-words text-sm">
+                      <Text className="mt-0 text-sm break-words whitespace-pre-wrap">
                         {hiddenFieldResponse}
                       </Text>
                     </Column>
@@ -118,7 +129,7 @@ export function ResponseFinishedEmail({
                 );
               })}
             <EmailButton
-              href={`${WEBAPP_URL}/environments/${environmentId}/surveys/${survey.id}/responses?utm_source=email_notification&utm_medium=email&utm_content=view_responses_CTA`}
+              href={`${WEBAPP_URL}/workspaces/${workspaceId}/surveys/${survey.id}/responses?utm_source=email_notification&utm_medium=email&utm_content=view_responses_CTA`}
               label={
                 responseCount > 1
                   ? t("emails.survey_response_finished_email_view_more_responses", {
@@ -135,14 +146,14 @@ export function ResponseFinishedEmail({
               <Text className="mb-0">
                 <Link
                   className="text-sm text-black underline"
-                  href={`${WEBAPP_URL}/environments/${environmentId}/settings/notifications?type=alert&elementId=${survey.id}`}>
+                  href={`${WEBAPP_URL}/workspaces/${workspaceId}/settings/notifications?type=alert&elementId=${survey.id}`}>
                   {t("emails.survey_response_finished_email_turn_off_notifications_for_this_form")}
                 </Link>
               </Text>
               <Text className="mt-0">
                 <Link
                   className="text-sm text-black underline"
-                  href={`${WEBAPP_URL}/environments/${environmentId}/settings/notifications?type=unsubscribedOrganizationIds&elementId=${organization.id}`}>
+                  href={`${WEBAPP_URL}/workspaces/${workspaceId}/settings/notifications?type=unsubscribedOrganizationIds&elementId=${organization.id}`}>
                   {t("emails.survey_response_finished_email_turn_off_notifications_for_all_new_forms")}
                 </Link>
               </Text>

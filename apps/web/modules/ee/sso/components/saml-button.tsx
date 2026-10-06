@@ -1,24 +1,22 @@
 "use client";
 
 import { LockIcon } from "lucide-react";
-import { signIn } from "next-auth/react";
 import { useState } from "react";
 import toast from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import { FORMBRICKS_LOGGED_IN_WITH_LS } from "@/lib/localStorage";
+import { authClient } from "@/modules/auth/lib/auth-client";
 import { doesSamlConnectionExistAction } from "@/modules/ee/sso/actions";
-import { getCallbackUrl } from "@/modules/ee/sso/lib/utils";
+import { getSsoReturnToUrl } from "@/modules/ee/sso/lib/utils";
 import { Button } from "@/modules/ui/components/button";
 
 interface SamlButtonProps {
-  inviteUrl?: string;
+  returnToUrl?: string;
   lastUsed?: boolean;
-  samlTenant: string;
-  samlProduct: string;
   source: "signin" | "signup";
 }
 
-export const SamlButton = ({ inviteUrl, lastUsed, samlTenant, samlProduct, source }: SamlButtonProps) => {
+export const SamlButton = ({ returnToUrl, lastUsed, source }: Readonly<SamlButtonProps>) => {
   const { t } = useTranslation();
   const [isLoading, setIsLoading] = useState(false);
 
@@ -34,19 +32,20 @@ export const SamlButton = ({ inviteUrl, lastUsed, samlTenant, samlProduct, sourc
       return;
     }
 
-    const callbackUrlWithSource = getCallbackUrl(inviteUrl, source);
+    const returnToUrlWithSource = getSsoReturnToUrl(returnToUrl, source);
 
-    signIn(
-      "saml",
-      {
-        redirect: true,
-        callbackUrl: callbackUrlWithSource,
-      },
-      {
-        tenant: samlTenant,
-        product: samlProduct,
-      }
-    );
+    // tenant/product are static and live server-side in the SAML genericOAuth provider's
+    // authorizationUrlParams (better-auth-providers.ts), so the client only selects the provider.
+    // Better Auth 1.7 rebuilt genericOAuth onto the built-in social path (ENG-2343), so
+    // signIn.oauth2({ providerId }) became signIn.social({ provider }). The callback URL is
+    // NOT affected: better-auth-providers.ts pins `redirectURI` to /api/auth/oauth2/callback/saml,
+    // the URL already registered at every customer IdP, and legacy-sso-callback.ts serves it.
+    await authClient.signIn.social({
+      provider: "saml",
+      callbackURL: returnToUrlWithSource,
+      // OAuth failures redirect here so the login page's existing ?error= UX surfaces them (parity).
+      errorCallbackURL: "/auth/login",
+    });
   };
 
   return (
@@ -54,12 +53,11 @@ export const SamlButton = ({ inviteUrl, lastUsed, samlTenant, samlProduct, sourc
       type="button"
       onClick={handleLogin}
       variant="secondary"
-      className="relative w-full justify-center"
+      className="h-11 w-full min-w-0 justify-center sm:h-9"
       loading={isLoading}>
-      {t("auth.continue_with_saml")}
-
+      <span className="truncate">{t("auth.continue_with_saml")}</span>
       <LockIcon />
-      {lastUsed && <span className="absolute right-3 text-xs opacity-50">{t("auth.last_used")}</span>}
+      {lastUsed && <span className="shrink-0 text-xs opacity-50">{t("auth.last_used")}</span>}
     </Button>
   );
 };

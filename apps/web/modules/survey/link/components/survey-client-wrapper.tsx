@@ -1,22 +1,32 @@
 "use client";
 
-import { Project } from "@prisma/client";
 import { useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
-import { TProjectStyling } from "@formbricks/types/project";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Workspace } from "@formbricks/database/prisma-browser";
+import { getIngestedStorageKeys } from "@formbricks/types/embedded-data-resolver";
 import { TResponseData } from "@formbricks/types/responses";
 import { TSurvey, TSurveyStyling } from "@formbricks/types/surveys/types";
+import { TWorkspaceStyling } from "@formbricks/types/workspace";
+import { toJsWorkspaceStateSurvey } from "@/lib/survey/client-utils";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
 import { CustomScriptsInjector } from "@/modules/survey/link/components/custom-scripts-injector";
 import { LinkSurveyWrapper } from "@/modules/survey/link/components/link-survey-wrapper";
+import { OfflineAlert } from "@/modules/survey/link/components/offline-alert";
+import { useAppLocale } from "@/modules/survey/link/hooks/use-app-locale";
+import { buildSurveyDocumentTitle } from "@/modules/survey/link/lib/document-title";
+import {
+  getHiddenFieldsFromSearchParams,
+  warnOnMissingIngestRows,
+} from "@/modules/survey/link/lib/hidden-fields";
 import { getPrefillValue } from "@/modules/survey/link/lib/prefill";
-import { isRTLLanguage } from "@/modules/survey/link/lib/utils";
+import { getUserIdFromSearchParams } from "@/modules/survey/link/lib/user-id";
+import { getSurveyLanguageTag, getWebAppLocale, isRTLLanguage } from "@/modules/survey/link/lib/utils";
 import { SurveyInline } from "@/modules/ui/components/survey";
 
 interface SurveyClientWrapperProps {
   survey: TSurvey;
-  project: Pick<Project, "styling" | "logo" | "linkSurveyBranding" | "customHeadScripts">;
-  styling: TProjectStyling | TSurveyStyling;
+  workspace: Pick<Workspace, "styling" | "logo" | "linkSurveyBranding" | "customHeadScripts">;
+  styling: TWorkspaceStyling | TSurveyStyling;
   publicDomain: string;
   responseCount?: number;
   languageCode: string;
@@ -24,13 +34,16 @@ interface SurveyClientWrapperProps {
   singleUseId?: string;
   singleUseResponseId?: string;
   contactId?: string;
+  canReadUserIdFromUrl?: boolean;
   recaptchaSiteKey?: string;
   isSpamProtectionEnabled: boolean;
   isPreview: boolean;
   verifiedEmail?: string;
   IMPRINT_URL?: string;
   PRIVACY_URL?: string;
+  TERMS_URL?: string;
   IS_FORMBRICKS_CLOUD: boolean;
+  pinAuthToken?: string;
 }
 
 let setBlockId = (_: string) => {};
@@ -38,7 +51,7 @@ let setResponseData = (_: TResponseData) => {};
 
 export const SurveyClientWrapper = ({
   survey,
-  project,
+  workspace,
   styling,
   publicDomain,
   responseCount,
@@ -47,16 +60,32 @@ export const SurveyClientWrapper = ({
   singleUseId,
   singleUseResponseId,
   contactId,
+  canReadUserIdFromUrl = false,
   recaptchaSiteKey,
   isSpamProtectionEnabled,
   isPreview,
   verifiedEmail,
   IMPRINT_URL,
   PRIVACY_URL,
+  TERMS_URL,
   IS_FORMBRICKS_CLOUD,
+  pinAuthToken,
 }: SurveyClientWrapperProps) => {
   const searchParams = useSearchParams();
+
+  // The survey's active language: starts at the server-provided code, then follows the
+  // in-survey language switch (via onLanguageChange). The whole shell (i18n strings, logo
+  // direction, page lang/dir) keys off this so it stays in sync, not just the document.
+  const [currentLanguageCode, setCurrentLanguageCode] = useState(languageCode);
+  useEffect(() => {
+    setCurrentLanguageCode(languageCode);
+  }, [languageCode]);
+
+  useAppLocale(getWebAppLocale(currentLanguageCode, survey));
+
   const skipPrefilled = searchParams.get("skipPrefilled") === "true";
+  const offlineSupport = searchParams.get("offlineSupport") === "true";
+  const userId = canReadUserIdFromUrl ? getUserIdFromSearchParams(searchParams) : undefined;
   const elements = useMemo(() => getElementsFromBlocks(survey.blocks), [survey.blocks]);
 
   const startAt = searchParams.get("startAt");
@@ -91,15 +120,30 @@ export const SurveyClientWrapper = ({
     }
   }, []);
 
-  // Extract hidden fields from URL parameters
+  // Extract ingestible Embedded Data from URL parameters.
+  //
+  // The allow-list is the survey's linked `ingested` rows, not the legacy `hiddenFields.fieldIds`
+  // column (ENG-1843). `locked` fields are deliberately included: the renderer's ingest contract
+  // drops their incoming values and logs why, and filtering them out here would silence that
+  // diagnostic while duplicating a rule that already has one home.
+  //
+  // Keyed on the ids' contents, not the array identity, which changes on every parent render
+  // (ENG-2366).
+  const ingestedStorageKeys = getIngestedStorageKeys(survey);
   const hiddenFieldsRecord = useMemo(() => {
-    const fieldsRecord: Record<string, string> = {};
-    for (const field of survey.hiddenFields.fieldIds || []) {
-      const answer = searchParams.get(field);
-      if (answer) fieldsRecord[field] = answer;
-    }
-    return fieldsRecord;
-  }, [searchParams, JSON.stringify(survey.hiddenFields.fieldIds || [])]);
+    return getHiddenFieldsFromSearchParams(ingestedStorageKeys, searchParams);
+    // eslint-disable-next-line react-hooks/use-memo -- migration ENG-1677
+  }, [searchParams, JSON.stringify(ingestedStorageKeys)]);
+
+  // The diagnostic is a side effect, so it belongs in an effect rather than in the memo above: a memo
+  // body runs twice per mount under StrictMode, so this warning printed twice on every dev page load,
+  // and it would re-run on any `searchParams` change even though what it reports depends only on the
+  // survey. Keyed on content rather than array identity, like the memo above.
+  const legacyFieldIds = survey.hiddenFields.fieldIds ?? [];
+  useEffect(() => {
+    warnOnMissingIngestRows(ingestedStorageKeys, legacyFieldIds);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on content, not array identity
+  }, [JSON.stringify(ingestedStorageKeys), JSON.stringify(legacyFieldIds)]);
 
   // Include verified email in hidden fields if available
   const getVerifiedEmail = useMemo<Record<string, string> | null>(() => {
@@ -109,6 +153,25 @@ export const SurveyClientWrapper = ({
     return null;
   }, [survey.isVerifyEmailEnabled, verifiedEmail]);
 
+  // Position label for the card the respondent is on, reported by the survey renderer and already
+  // localized in the survey's active language (see SurveyBaseProps.onPageChange).
+  const [pageLabel, setPageLabel] = useState<string | null>(null);
+  const handlePageChange = useCallback((page: { index: number; total: number; label: string }) => {
+    setPageLabel(page.label);
+  }, []);
+
+  const [offlineStatus, setOfflineStatus] = useState({
+    isOnline: true,
+    isSyncing: false,
+    pendingSyncCount: 0,
+  });
+  const handleOfflineStatusChange = useCallback(
+    (status: { isOnline: boolean; isSyncing: boolean; pendingSyncCount: number }) => {
+      setOfflineStatus(status);
+    },
+    []
+  );
+
   const handleResetSurvey = () => {
     if (survey.welcomeCard.enabled) {
       setBlockId("start");
@@ -117,24 +180,74 @@ export const SurveyClientWrapper = ({
     }
     setResponseData({});
   };
+  const jsSurvey = useMemo(() => toJsWorkspaceStateSurvey(survey), [survey]);
+  const isCardless = styling.cardArrangement?.linkSurveys === "cardless";
+  const hasLogo = !styling.isLogoHidden && !!(styling.logo?.url || workspace.logo?.url);
+
   // Determine text direction based on language code for logo positioning only
   // which checks both language code and survey content. This is only for logo UI positioning.
   const logoDir = useMemo(() => {
-    return isRTLLanguage(survey, languageCode) ? "rtl" : "auto";
-  }, [languageCode, survey]);
+    return isRTLLanguage(jsSurvey, currentLanguageCode) ? "rtl" : "auto";
+  }, [currentLanguageCode, jsSurvey]);
+
+  // Keep the page lang/dir aligned with the survey's active language so the browser
+  // and screen readers announce content in the right language, and RTL languages flip
+  // direction (WCAG 3.1.1 / 1.3.2). Link surveys own their document; the embedded JS
+  // widget never reaches this component, so host pages are never mutated.
+  useEffect(() => {
+    const html = document.documentElement;
+    const previousLang = html.getAttribute("lang");
+    const previousDir = html.getAttribute("dir");
+
+    const tag = getSurveyLanguageTag(jsSurvey, currentLanguageCode);
+    if (tag) html.setAttribute("lang", tag);
+    html.setAttribute("dir", isRTLLanguage(jsSurvey, currentLanguageCode) ? "rtl" : "ltr");
+
+    return () => {
+      if (previousLang === null) html.removeAttribute("lang");
+      else html.setAttribute("lang", previousLang);
+      if (previousDir === null) html.removeAttribute("dir");
+      else html.setAttribute("dir", previousDir);
+    };
+  }, [currentLanguageCode, jsSurvey]);
+
+  // Give every page of the survey a title that says which page it is (WCAG 2.4.2). generateMetadata
+  // cannot do this: the step lives in the renderer's state, which the server never sees.
+  //
+  // The base is the server-rendered title, captured once on mount, so the author's custom link
+  // metadata title and the "| Formbricks" template are respected without reimplementing
+  // getBasicSurveyMetadata's priority chain here. Restored on unmount for the same reason the
+  // lang/dir effect restores: a client-side navigation away must not leave a stale title behind.
+  //
+  // Link surveys own their document. The embedded JS widget never reaches this component, so a host
+  // page's title is never touched.
+  const baseTitleRef = useRef<string | null>(null);
+  useEffect(() => {
+    baseTitleRef.current ??= document.title;
+    const baseTitle = baseTitleRef.current;
+    return () => {
+      document.title = baseTitle;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (baseTitleRef.current === null || !pageLabel) return;
+    document.title = buildSurveyDocumentTitle(baseTitleRef.current, pageLabel);
+  }, [pageLabel]);
 
   return (
     <>
       {/* Inject custom scripts for tracking/analytics (self-hosted only) */}
       {!IS_FORMBRICKS_CLOUD && !isPreview && (
         <CustomScriptsInjector
-          projectScripts={project.customHeadScripts}
+          workspaceScripts={workspace.customHeadScripts}
           surveyScripts={survey.customHeadScripts}
           scriptsMode={survey.customHeadScriptsMode}
         />
       )}
       <LinkSurveyWrapper
-        project={project}
+        workspace={workspace}
+        workspaceId={survey.workspaceId}
         surveyId={survey.id}
         isWelcomeCardEnabled={survey.welcomeCard.enabled}
         isPreview={isPreview}
@@ -146,16 +259,19 @@ export const SurveyClientWrapper = ({
         IS_FORMBRICKS_CLOUD={IS_FORMBRICKS_CLOUD}
         IMPRINT_URL={IMPRINT_URL}
         PRIVACY_URL={PRIVACY_URL}
-        isBrandingEnabled={project.linkSurveyBranding}
+        TERMS_URL={TERMS_URL}
+        isBrandingEnabled={workspace.linkSurveyBranding}
         dir={logoDir}>
         <SurveyInline
           appUrl={publicDomain}
-          environmentId={survey.environmentId}
+          workspaceId={survey.workspaceId}
           isPreviewMode={isPreview}
-          survey={survey}
+          survey={jsSurvey}
           styling={styling}
           languageCode={languageCode}
-          isBrandingEnabled={project.linkSurveyBranding}
+          onLanguageChange={setCurrentLanguageCode}
+          onPageChange={handlePageChange}
+          isBrandingEnabled={workspace.linkSurveyBranding}
           shouldResetQuestionId={false}
           autoFocus={autoFocus}
           prefillResponseData={prefillValue}
@@ -175,12 +291,24 @@ export const SurveyClientWrapper = ({
           }}
           singleUseId={singleUseId}
           singleUseResponseId={singleUseResponseId}
+          pinAuthToken={pinAuthToken}
           getSetIsResponseSendingFinished={(_f: (value: boolean) => void) => {}}
           contactId={contactId}
+          userId={userId}
           recaptchaSiteKey={recaptchaSiteKey}
           isSpamProtectionEnabled={isSpamProtectionEnabled}
+          offlineSupport={offlineSupport}
+          onOfflineStatusChange={offlineSupport ? handleOfflineStatusChange : undefined}
+          showCardlessPreviewLogoSlot={isCardless && hasLogo}
         />
       </LinkSurveyWrapper>
+      {offlineSupport && !isEmbed && (
+        <OfflineAlert
+          isOnline={offlineStatus.isOnline}
+          isSyncing={offlineStatus.isSyncing}
+          pendingSyncCount={offlineStatus.pendingSyncCount}
+        />
+      )}
     </>
   );
 };

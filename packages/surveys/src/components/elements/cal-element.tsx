@@ -53,17 +53,14 @@ export function CalElement({
       className="w-full">
       <div>
         {isMediaAvailable ? <ElementMedia imgUrl={element.imageUrl} videoUrl={element.videoUrl} /> : null}
-        <Headline
-          headline={getLocalizedValue(element.headline, languageCode)}
-          elementId={element.id}
-          required={element.required}
-        />
-        <Subheader
-          subheader={element.subheader ? getLocalizedValue(element.subheader, languageCode) : ""}
-          elementId={element.id}
-        />
+        <Headline headline={getLocalizedValue(element.headline, languageCode)} required={element.required} />
+        <Subheader subheader={element.subheader ? getLocalizedValue(element.subheader, languageCode) : ""} />
         <CalEmbed key={element.id} element={element} onSuccessfulBooking={onSuccessfulBooking} />
-        {errorMessage ? <span className="text-red-500">{errorMessage}</span> : null}
+        {errorMessage ? (
+          <span className="text-red-500" role="alert" aria-live="assertive" aria-atomic="true">
+            {errorMessage}
+          </span>
+        ) : null}
       </div>
     </form>
   );

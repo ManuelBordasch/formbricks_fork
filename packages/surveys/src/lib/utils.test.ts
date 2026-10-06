@@ -1,17 +1,21 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/constants";
-import type { TJsEnvironmentStateSurvey } from "../../../types/js";
+import type { TJsWorkspaceStateSurvey } from "../../../types/js";
 import { type TAllowedFileExtension, mimeTypes } from "../../../types/storage";
 import type { TSurveyLanguage } from "../../../types/surveys/types";
 import {
+  cn,
   findBlockByElementId,
   getDefaultLanguageCode,
   getElementsFromSurveyBlocks,
   getMimeType,
   getShuffledChoicesIds,
   getShuffledRowIndices,
+  getSurveyLanguageTag,
   isRTL,
   isRTLLanguage,
+  mirrorPlacementForDir,
+  resolveSelectedLanguageCode,
 } from "./utils";
 
 // Mock crypto.getRandomValues for deterministic shuffle tests
@@ -29,8 +33,8 @@ describe("getMimeType", () => {
   });
 });
 
-// Base mock for TJsEnvironmentStateSurvey to satisfy stricter type checks
-const baseMockSurvey: TJsEnvironmentStateSurvey = {
+// Base mock for TJsWorkspaceStateSurvey to satisfy stricter type checks
+const baseMockSurvey: TJsWorkspaceStateSurvey = {
   id: "survey1",
   name: "Test Survey",
   type: "link",
@@ -47,10 +51,10 @@ const baseMockSurvey: TJsEnvironmentStateSurvey = {
   languages: [],
   segment: null,
   hiddenFields: { enabled: false, fieldIds: [] },
-  projectOverwrites: null,
+  workspaceOverwrites: null,
   triggers: [],
   displayOption: "displayOnce",
-} as unknown as TJsEnvironmentStateSurvey;
+} as unknown as TJsWorkspaceStateSurvey;
 
 describe("getDefaultLanguageCode", () => {
   const mockSurveyLanguageEn: TSurveyLanguage = {
@@ -62,7 +66,7 @@ describe("getDefaultLanguageCode", () => {
       alias: null,
       createdAt: new Date(),
       updatedAt: new Date(),
-      projectId: "proj1",
+      workspaceId: "proj1",
     },
   };
   const mockSurveyLanguageEs: TSurveyLanguage = {
@@ -74,32 +78,139 @@ describe("getDefaultLanguageCode", () => {
       alias: null,
       createdAt: new Date(),
       updatedAt: new Date(),
-      projectId: "proj1",
+      workspaceId: "proj1",
     },
   };
 
   test("should return the code of the default language", () => {
-    const survey: TJsEnvironmentStateSurvey = {
+    const survey: TJsWorkspaceStateSurvey = {
       ...baseMockSurvey,
       languages: [mockSurveyLanguageEs, mockSurveyLanguageEn],
-    } as TJsEnvironmentStateSurvey;
+    } as TJsWorkspaceStateSurvey;
     expect(getDefaultLanguageCode(survey)).toBe("en");
   });
 
   test("should return undefined if no default language", () => {
-    const survey: TJsEnvironmentStateSurvey = {
+    const survey: TJsWorkspaceStateSurvey = {
       ...baseMockSurvey,
       languages: [{ ...mockSurveyLanguageEs, default: false }], // Ensure 'default' is explicitly false
-    } as TJsEnvironmentStateSurvey;
+    } as TJsWorkspaceStateSurvey;
     expect(getDefaultLanguageCode(survey)).toBeUndefined();
   });
 
   test("should return undefined if languages array is empty", () => {
-    const survey: TJsEnvironmentStateSurvey = {
+    const survey: TJsWorkspaceStateSurvey = {
       ...baseMockSurvey,
       languages: [],
-    } as TJsEnvironmentStateSurvey;
+    } as TJsWorkspaceStateSurvey;
     expect(getDefaultLanguageCode(survey)).toBeUndefined();
+  });
+});
+
+describe("resolveSelectedLanguageCode", () => {
+  test("returns the sentinel when the pick is the default language", () => {
+    // Selecting the default must record the same thing as never touching the switcher, because
+    // survey.tsx resolves "default" to the default language's stored code for response.language.
+    expect(resolveSelectedLanguageCode("en-US", "en-US")).toBe("default");
+  });
+
+  test("returns the picked code for a non-default language", () => {
+    expect(resolveSelectedLanguageCode("de-DE", "en-US")).toBe("de-DE");
+  });
+
+  test("returns the sentinel when a canonical pick matches a legacy default code", () => {
+    // The dedupe keeps the canonical row, so the visible default option reads "hi-IN" on a survey
+    // whose default row stores "hi". Comparing raw strings would store "hi-IN" instead of the
+    // sentinel, and response.language would then differ from the untouched-switcher path.
+    expect(resolveSelectedLanguageCode("hi-IN", "hi")).toBe("default");
+  });
+
+  test("returns the sentinel when a legacy pick matches a canonical default code", () => {
+    expect(resolveSelectedLanguageCode("hi", "hi-IN")).toBe("default");
+  });
+
+  test("does not collapse two different languages that share nothing canonical", () => {
+    expect(resolveSelectedLanguageCode("hi-IN", "en-US")).toBe("hi-IN");
+  });
+
+  test("passes the code through untouched when the survey has no default language", () => {
+    expect(resolveSelectedLanguageCode("de-DE", undefined)).toBe("de-DE");
+  });
+});
+
+describe("getSurveyLanguageTag", () => {
+  const languageWithCode = (code: string, isDefault: boolean): TSurveyLanguage => ({
+    default: isDefault,
+    enabled: true,
+    language: {
+      id: `lang-${code}`,
+      code,
+      alias: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      workspaceId: "proj1",
+    },
+  });
+
+  const surveyWithLanguages = (languages: TSurveyLanguage[]): TJsWorkspaceStateSurvey =>
+    ({ ...baseMockSurvey, languages }) as TJsWorkspaceStateSurvey;
+
+  const multiLanguageSurvey = surveyWithLanguages([
+    languageWithCode("en-US", true),
+    languageWithCode("de-DE", false),
+  ]);
+
+  test("returns a configured language code unchanged", () => {
+    expect(getSurveyLanguageTag(multiLanguageSurvey, "de-DE")).toBe("de-DE");
+  });
+
+  test('resolves the "default" sentinel to the default language code', () => {
+    // "default" is the renderer's internal marker, not a language tag: putting it in a lang
+    // attribute would declare a language that does not exist.
+    expect(getSurveyLanguageTag(multiLanguageSurvey, "default")).toBe("en-US");
+  });
+
+  test("resolves an empty language code to the default language code", () => {
+    expect(getSurveyLanguageTag(multiLanguageSurvey, "")).toBe("en-US");
+  });
+
+  test("returns null when the survey has no languages configured", () => {
+    // A single-language survey declares nothing, so the host document's language stands.
+    expect(getSurveyLanguageTag(surveyWithLanguages([]), "default")).toBeNull();
+  });
+
+  test("returns null when no language is marked default", () => {
+    expect(
+      getSurveyLanguageTag(surveyWithLanguages([languageWithCode("de-DE", false)]), "default")
+    ).toBeNull();
+  });
+
+  test("falls back to the default for a code the survey does not have", () => {
+    // The tag lands in a DOM lang attribute, so an unconfigured code would declare a language whose
+    // content is not being rendered — getLocalizedValue falls back to the default text, and a screen
+    // reader would read that text with the wrong pronunciation rules. The offline restore path can
+    // replay a persisted language that has since been removed from the survey.
+    expect(getSurveyLanguageTag(multiLanguageSurvey, "fr-FR")).toBe("en-US");
+  });
+
+  test("falls back to the default for a configured but disabled language", () => {
+    // Same rule the server applies to ?lang=: a language that is not offered is not declared.
+    const survey = surveyWithLanguages([
+      languageWithCode("en-US", true),
+      { ...languageWithCode("de-DE", false), enabled: false },
+    ]);
+    expect(getSurveyLanguageTag(survey, "de-DE")).toBe("en-US");
+  });
+
+  test("resolves a legacy alias to the stored canonical code", () => {
+    // The stored code is what content is keyed under, so that is what the tag has to be.
+    const survey = surveyWithLanguages([languageWithCode("en-US", true), languageWithCode("hi-IN", false)]);
+    expect(getSurveyLanguageTag(survey, "hi")).toBe("hi-IN");
+  });
+
+  test("returns null when nothing matches and there is no default either", () => {
+    const survey = surveyWithLanguages([languageWithCode("de-DE", false)]);
+    expect(getSurveyLanguageTag(survey, "fr-FR")).toBeNull();
   });
 });
 
@@ -286,7 +397,7 @@ describe("getShuffledChoicesIds", () => {
 });
 describe("getQuestionsFromSurvey", () => {
   test("should return elements from blocks", () => {
-    const survey: TJsEnvironmentStateSurvey = {
+    const survey: TJsWorkspaceStateSurvey = {
       ...baseMockSurvey,
       blocks: [
         {
@@ -339,13 +450,13 @@ describe("getQuestionsFromSurvey", () => {
     const survey = {
       ...baseMockSurvey,
       blocks: [],
-    } as TJsEnvironmentStateSurvey;
+    } as TJsWorkspaceStateSurvey;
 
     expect(getElementsFromSurveyBlocks(survey.blocks)).toEqual([]);
   });
 
   test("should handle blocks with no elements", () => {
-    const survey: TJsEnvironmentStateSurvey = {
+    const survey: TJsWorkspaceStateSurvey = {
       ...baseMockSurvey,
       blocks: [
         { id: "block1", name: "Block 1", elements: [] },
@@ -373,7 +484,7 @@ describe("getQuestionsFromSurvey", () => {
 });
 
 describe("findBlockByElementId", () => {
-  const survey: TJsEnvironmentStateSurvey = {
+  const survey: TJsWorkspaceStateSurvey = {
     ...baseMockSurvey,
     blocks: [
       {
@@ -445,7 +556,7 @@ describe("isRTL", () => {
 
 describe("isRTLLanguage", () => {
   test("returns true for RTL language codes when multi-language enabled", () => {
-    const survey: TJsEnvironmentStateSurvey = {
+    const survey: TJsWorkspaceStateSurvey = {
       ...baseMockSurvey,
       languages: [
         {
@@ -455,19 +566,19 @@ describe("isRTLLanguage", () => {
             alias: null,
             createdAt: new Date(),
             updatedAt: new Date(),
-            projectId: "p1",
+            workspaceId: "p1",
           },
           default: true,
           enabled: true,
         },
       ],
-    } as TJsEnvironmentStateSurvey;
+    } as TJsWorkspaceStateSurvey;
     expect(isRTLLanguage(survey, "ar")).toBe(true);
     expect(isRTLLanguage(survey, "he")).toBe(true);
   });
 
   test("returns false for LTR language codes", () => {
-    const survey: TJsEnvironmentStateSurvey = {
+    const survey: TJsWorkspaceStateSurvey = {
       ...baseMockSurvey,
       languages: [
         {
@@ -477,18 +588,18 @@ describe("isRTLLanguage", () => {
             alias: null,
             createdAt: new Date(),
             updatedAt: new Date(),
-            projectId: "p1",
+            workspaceId: "p1",
           },
           default: true,
           enabled: true,
         },
       ],
-    } as TJsEnvironmentStateSurvey;
+    } as TJsWorkspaceStateSurvey;
     expect(isRTLLanguage(survey, "en")).toBe(false);
   });
 
   test("checks survey content when no languages configured", () => {
-    const survey: TJsEnvironmentStateSurvey = {
+    const survey: TJsWorkspaceStateSurvey = {
       ...baseMockSurvey,
       blocks: [
         {
@@ -506,7 +617,83 @@ describe("isRTLLanguage", () => {
           ],
         },
       ],
-    } as TJsEnvironmentStateSurvey;
+    } as TJsWorkspaceStateSurvey;
     expect(isRTLLanguage(survey, "default")).toBe(true);
+  });
+});
+
+describe("cn", () => {
+  test("joins multiple classes", () => {
+    expect(cn("foo", "bar")).toBe("foo bar");
+  });
+
+  test("filters out undefined values", () => {
+    expect(cn("foo", undefined, "bar")).toBe("foo bar");
+  });
+
+  test("filters out empty strings", () => {
+    expect(cn("foo", "", "bar")).toBe("foo bar");
+  });
+
+  test("merges conflicting tailwind classes (last wins)", () => {
+    expect(cn("mb-6", "mb-8")).toBe("mb-8");
+  });
+
+  test("merges conflicting min-h classes", () => {
+    expect(cn("min-h-40", "min-h-0")).toBe("min-h-0");
+  });
+
+  test("merges conflicting padding classes", () => {
+    expect(cn("p-4", "p-2")).toBe("p-2");
+  });
+
+  test("keeps non-conflicting classes", () => {
+    expect(cn("mb-6 block rounded-md", "w-1/4")).toBe("mb-6 block rounded-md w-1/4");
+  });
+
+  test("handles single class", () => {
+    expect(cn("foo")).toBe("foo");
+  });
+
+  test("handles no arguments", () => {
+    expect(cn()).toBe("");
+  });
+
+  test("handles all undefined", () => {
+    expect(cn(undefined, undefined)).toBe("");
+  });
+
+  test("handles nested arrays of classes", () => {
+    expect(cn(["foo", ["foo", ["foo", "bar"]]])).toBe("foo foo foo bar");
+  });
+
+  test("handles nulls, booleans and undefined values", () => {
+    expect(cn(null, true, false, undefined, [null, true, false, undefined])).toBe("");
+  });
+});
+
+describe("mirrorPlacementForDir", () => {
+  test("mirrors the horizontal side of every corner placement in RTL", () => {
+    expect(mirrorPlacementForDir("bottomRight", "rtl")).toBe("bottomLeft");
+    expect(mirrorPlacementForDir("bottomLeft", "rtl")).toBe("bottomRight");
+    expect(mirrorPlacementForDir("topRight", "rtl")).toBe("topLeft");
+    expect(mirrorPlacementForDir("topLeft", "rtl")).toBe("topRight");
+  });
+
+  test("leaves center untouched in RTL — it has no side to flip", () => {
+    expect(mirrorPlacementForDir("center", "rtl")).toBe("center");
+  });
+
+  test("returns the authored placement unchanged for ltr and auto", () => {
+    expect(mirrorPlacementForDir("bottomRight", "ltr")).toBe("bottomRight");
+    expect(mirrorPlacementForDir("topLeft", "ltr")).toBe("topLeft");
+    expect(mirrorPlacementForDir("bottomRight", "auto")).toBe("bottomRight");
+  });
+
+  test("is its own inverse, so a survey switched back to an LTR language returns to its corner", () => {
+    const placements = ["bottomRight", "bottomLeft", "topRight", "topLeft", "center"] as const;
+    for (const placement of placements) {
+      expect(mirrorPlacementForDir(mirrorPlacementForDir(placement, "rtl"), "rtl")).toBe(placement);
+    }
   });
 });

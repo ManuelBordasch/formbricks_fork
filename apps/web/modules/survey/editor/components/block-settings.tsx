@@ -5,26 +5,22 @@ import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TI18nString } from "@formbricks/types/i18n";
-import { TSurveyBlock, TSurveyBlockLogic } from "@formbricks/types/surveys/blocks";
+import { TSurveyBlock } from "@formbricks/types/surveys/blocks";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
 import { addMultiLanguageLabels, extractLanguageCodes } from "@/lib/i18n/utils";
 import { ElementFormInput } from "@/modules/survey/components/element-form-input";
-import { ConditionalLogic } from "@/modules/survey/editor/components/conditional-logic";
 
 interface BlockSettingsProps {
   localSurvey: TSurvey;
   block: TSurveyBlock;
   blockIndex: number;
   selectedLanguageCode: string;
-  setSelectedLanguageCode: (languageCode: string) => void;
   updateBlockButtonLabel: (
     blockIndex: number,
     labelKey: "buttonLabel" | "backButtonLabel",
     labelValue: TI18nString | undefined
   ) => void;
-  updateBlockLogic: (blockIdx: number, logic: TSurveyBlockLogic[]) => void;
-  updateBlockLogicFallback: (blockIdx: number, logicFallback: string | undefined) => void;
   locale: TUserLocale;
   isStorageConfigured: boolean;
   isLastBlock: boolean;
@@ -35,22 +31,14 @@ export const BlockSettings = ({
   block,
   blockIndex,
   selectedLanguageCode,
-  setSelectedLanguageCode,
   updateBlockButtonLabel,
-  updateBlockLogic,
-  updateBlockLogicFallback,
   locale,
   isStorageConfigured,
   isLastBlock,
-}: BlockSettingsProps) => {
+}: Readonly<BlockSettingsProps>) => {
   const { t } = useTranslation();
 
-  // Use the first element in the block as a representative for logic
-  const firstElement = block.elements[0];
-  const blockLogic = block.logic ?? [];
-
-  // Auto-open if block has logic configured
-  const [open, setOpen] = useState(blockLogic.length > 0);
+  const [open, setOpen] = useState(false);
 
   const updateEmptyButtonLabels = (
     labelKey: "buttonLabel" | "backButtonLabel",
@@ -74,17 +62,17 @@ export const BlockSettings = ({
         aria-label="Toggle advanced settings">
         {open ? <ChevronDownIcon className="mr-1 h-4 w-3" /> : <ChevronRightIcon className="mr-2 h-4 w-3" />}
         {open
-          ? t("environments.surveys.edit.hide_block_settings")
-          : t("environments.surveys.edit.show_block_settings")}
+          ? t("workspace.surveys.edit.hide_block_settings")
+          : t("workspace.surveys.edit.show_block_settings")}
       </Collapsible.CollapsibleTrigger>
       <Collapsible.CollapsibleContent>
         <div className="mt-2 space-y-4">
-          <div className="flex space-x-2">
+          <div className="flex gap-x-2">
             {blockIndex !== 0 && (
               <ElementFormInput
                 id="backButtonLabel"
                 value={block.backButtonLabel}
-                label={t("environments.surveys.edit.back_button_label")}
+                label={t("workspace.surveys.edit.back_button_label")}
                 localSurvey={localSurvey}
                 elementIdx={blockIndex}
                 isInvalid={false}
@@ -97,8 +85,6 @@ export const BlockSettings = ({
                     });
                   }
                 }}
-                selectedLanguageCode={selectedLanguageCode}
-                setSelectedLanguageCode={setSelectedLanguageCode}
                 placeholder={t("common.back")}
                 locale={locale}
                 isStorageConfigured={isStorageConfigured}
@@ -120,7 +106,7 @@ export const BlockSettings = ({
             <ElementFormInput
               id="buttonLabel"
               value={block.buttonLabel}
-              label={t("environments.surveys.edit.button_label")}
+              label={t("workspace.surveys.edit.button_label")}
               localSurvey={localSurvey}
               elementIdx={blockIndex}
               isInvalid={false}
@@ -139,8 +125,6 @@ export const BlockSettings = ({
                   updateBlockButtonLabel(blockIndex, "buttonLabel", updatedButtonLabel);
                 }
               }}
-              selectedLanguageCode={selectedLanguageCode}
-              setSelectedLanguageCode={setSelectedLanguageCode}
               placeholder={t("common.next")}
               locale={locale}
               isStorageConfigured={isStorageConfigured}
@@ -163,17 +147,6 @@ export const BlockSettings = ({
               }}
             />
           </div>
-
-          {/* Conditional Logic */}
-          {firstElement && (
-            <ConditionalLogic
-              localSurvey={localSurvey}
-              block={block}
-              blockIdx={blockIndex}
-              updateBlockLogic={updateBlockLogic}
-              updateBlockLogicFallback={updateBlockLogicFallback}
-            />
-          )}
         </div>
       </Collapsible.CollapsibleContent>
     </Collapsible.Root>

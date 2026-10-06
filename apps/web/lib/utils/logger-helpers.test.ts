@@ -26,9 +26,6 @@ vi.mock("@/modules/ee/license-check/lib/utils", () => ({
 vi.mock("@formbricks/logger", () => ({
   logger: { error: vi.fn() },
 }));
-vi.mock("@/lib/utils/helper", () => ({
-  getOrganizationIdFromEnvironmentId: vi.fn().mockResolvedValue("org-env-id"),
-}));
 
 // Mocks
 vi.mock("@/lib/constants", () => ({
@@ -108,7 +105,7 @@ describe("withAuditLogging", () => {
         id: "u1",
         name: "Test User",
         email: "test@example.com",
-        emailVerified: null,
+        emailVerified: false,
         twoFactorEnabled: false,
         identityProvider: "email" as const,
         createdAt: new Date(),
@@ -146,7 +143,7 @@ describe("withAuditLogging", () => {
         id: "u1",
         name: "Test User",
         email: "test@example.com",
-        emailVerified: null,
+        emailVerified: false,
         twoFactorEnabled: false,
         identityProvider: "email" as const,
         createdAt: new Date(),

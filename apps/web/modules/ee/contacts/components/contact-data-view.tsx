@@ -1,16 +1,15 @@
 "use client";
 
-import { debounce } from "lodash";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import { TContactAttributeKey } from "@formbricks/types/contact-attribute-key";
-import { TEnvironment } from "@formbricks/types/environment";
+import { debounce } from "@/lib/utils/debounce";
 import { getContactsAction } from "../actions";
 import { TContactTableData, TContactWithAttributes } from "../types/contact";
 import { ContactsTable } from "./contacts-table";
 
 interface ContactDataViewProps {
-  environment: TEnvironment;
+  workspaceId: string;
   contactAttributeKeys: TContactAttributeKey[];
   initialContacts: TContactWithAttributes[];
   itemsPerPage: number;
@@ -20,7 +19,7 @@ interface ContactDataViewProps {
 }
 
 export const ContactDataView = ({
-  environment,
+  workspaceId,
   itemsPerPage,
   contactAttributeKeys,
   isReadOnly,
@@ -34,21 +33,30 @@ export const ContactDataView = ({
   const [searchValue, setSearchValue] = useState<string>("");
 
   const isFirstRender = useRef(true);
-  const prevEnvironmentId = useRef(environment.id);
+  const prevWorkspaceId = useRef(workspaceId);
   const isResettingSearch = useRef(false);
   const prevInitialContactsLength = useRef(initialContacts.length);
 
-  // Sync state with server data only when environment changes (real tab navigation)
+  // Sync state with server data only when workspace changes (real tab navigation)
   useEffect(() => {
-    if (prevEnvironmentId.current !== environment.id) {
-      prevEnvironmentId.current = environment.id;
+    if (prevWorkspaceId.current !== workspaceId) {
+      prevWorkspaceId.current = workspaceId;
       setContacts([...initialContacts]);
       setHasMore(initialHasMore);
-      isResettingSearch.current = true;
+      // Arm the skip only when there is a search to clear. `setSearchValue("")` on an already-empty
+      // value is a no-op, so the `[searchValue]` effect never runs to lower the flag again — and the
+      // next time the user does type, that effect consumes their first search as the "reset" it was
+      // waiting for. Switching workspace without having searched is the common path, so the flag was
+      // usually left armed.
+      if (searchValue) {
+        isResettingSearch.current = true;
+      }
       setSearchValue("");
       prevInitialContactsLength.current = initialContacts.length;
     }
-  }, [environment.id, initialContacts, initialHasMore]);
+    // `searchValue` is read above, so it belongs here; the whole body is behind the workspace-change
+    // guard, which updates `prevWorkspaceId` immediately, so the extra runs are a comparison.
+  }, [workspaceId, initialContacts, initialHasMore, searchValue]);
 
   // Sync state when initialContacts changes from server refresh (e.g., after CSV upload)
   // Only update if we're viewing the first page without search
@@ -56,13 +64,13 @@ export const ContactDataView = ({
     if (
       !searchValue &&
       initialContacts.length !== prevInitialContactsLength.current &&
-      prevEnvironmentId.current === environment.id
+      prevWorkspaceId.current === workspaceId
     ) {
       setContacts([...initialContacts]);
       setHasMore(initialHasMore);
       prevInitialContactsLength.current = initialContacts.length;
     }
-  }, [initialContacts, initialHasMore, searchValue, environment.id]);
+  }, [initialContacts, initialHasMore, searchValue, workspaceId]);
 
   const environmentAttributes = useMemo(() => {
     return contactAttributeKeys.filter(
@@ -75,7 +83,7 @@ export const ContactDataView = ({
     // Don't show loading state - fetch in background
     try {
       const contactsResponse = await getContactsAction({
-        environmentId: environment.id,
+        workspaceId,
         offset: 0,
         searchValue,
       });
@@ -88,7 +96,7 @@ export const ContactDataView = ({
       console.error("Error fetching contacts:", error);
       toast.error("Error fetching contacts. Please try again.");
     }
-  }, [environment.id, itemsPerPage, searchValue]);
+  }, [workspaceId, itemsPerPage, searchValue]);
 
   // Only refetch when search value actually changes (debounced)
   useEffect(() => {
@@ -106,7 +114,7 @@ export const ContactDataView = ({
     if (isResettingSearch.current) {
       isResettingSearch.current = false;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- debounced search must fire only on searchValue change; `fetchContactsFromStart` is keyed on `searchValue` itself, so listing it would re-trigger the search whenever `workspaceId` or `itemsPerPage` changed too
   }, [searchValue]);
 
   useEffect(() => {
@@ -121,7 +129,7 @@ export const ContactDataView = ({
       setLoadingNextPage(true);
       try {
         const contactsResponse = await getContactsAction({
-          environmentId: environment.id,
+          workspaceId,
           offset: contacts.length,
           searchValue,
         });
@@ -169,7 +177,7 @@ export const ContactDataView = ({
       hasMore={hasMore}
       isDataLoaded={true}
       updateContactList={updateContactList}
-      environmentId={environment.id}
+      workspaceId={workspaceId}
       searchValue={searchValue}
       setSearchValue={setSearchValue}
       isReadOnly={isReadOnly}

@@ -1,21 +1,27 @@
-import { getServerSession } from "next-auth";
 import { type NextRequest } from "next/server";
 import { z } from "zod";
 import { logger } from "@formbricks/logger";
 import { TooManyRequestsError } from "@formbricks/types/errors";
 import { authenticateRequest } from "@/app/api/v1/auth";
-import { authOptions } from "@/modules/auth/lib/authOptions";
+import { RequestBodyTooLargeError, parseJsonBodyWithLimit } from "@/app/lib/api/request-body";
+import { withAuthorizationSurface } from "@/lib/authorization/context";
+import { getApiKeyFromHeaders } from "@/modules/api/lib/api-key-auth";
+import { getSession } from "@/modules/auth/lib/session";
 import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
 import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
 import type { TRateLimitConfig } from "@/modules/core/rate-limit/types/rate-limit";
+import { TAuditAction, TAuditTarget } from "@/modules/ee/audit-logs/types/audit-log";
+import { buildV3AuditLog, queueV3AuditLog } from "./audit";
 import {
   type InvalidParam,
+  isInvalidParamCode,
   problemBadRequest,
   problemInternalError,
+  problemPayloadTooLarge,
   problemTooManyRequests,
   problemUnauthorized,
 } from "./response";
-import type { TV3Authentication } from "./types";
+import type { TV3AuditLog, TV3Authentication } from "./types";
 
 type TV3Schema = z.ZodTypeAny;
 type MaybePromise<T> = T | Promise<T>;
@@ -38,6 +44,7 @@ export type TV3HandlerParams<TParsedInput = Record<string, never>, TProps = unkn
   req: NextRequest;
   props: TProps;
   authentication: TV3Authentication;
+  auditLog?: TV3AuditLog;
   parsedInput: TParsedInput;
   requestId: string;
   instance: string;
@@ -48,6 +55,8 @@ export type TWithV3ApiWrapperParams<S extends TV3Schemas | undefined, TProps = u
   schemas?: S;
   rateLimit?: boolean;
   customRateLimitConfig?: TRateLimitConfig;
+  action?: TAuditAction;
+  targetType?: TAuditTarget;
   handler: (params: TV3HandlerParams<TV3ParsedInput<S>, TProps>) => MaybePromise<Response>;
 };
 
@@ -63,12 +72,29 @@ function getUnauthenticatedDetail(authMode: TV3AuthMode): string {
   return "Not authenticated";
 }
 
-function formatZodIssues(error: z.ZodError, fallbackName: "body" | "query" | "params"): InvalidParam[] {
-  return error.issues.map((issue) => ({
-    name: issue.path.length > 0 ? issue.path.join(".") : fallbackName,
-    reason: issue.message,
-  }));
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+function formatZodIssues(error: z.ZodError, fallbackName: "body" | "query" | "params"): InvalidParam[] {
+  return error.issues.map((issue) => {
+    const params = "params" in issue && isPlainObject(issue.params) ? issue.params : {};
+    const code = isInvalidParamCode(params.code) ? params.code : undefined;
+
+    return {
+      name: issue.path.length > 0 ? issue.path.join(".") : fallbackName,
+      reason: issue.message,
+      ...(code ? { code } : {}),
+    };
+  });
+}
+
+type TV3InputParseFailure = {
+  ok: false;
+  response: Response;
+  detail: string;
+  invalidParams: InvalidParam[];
+};
 
 function searchParamsToObject(searchParams: URLSearchParams): Record<string, string | string[]> {
   const query: Record<string, string | string[]> = {};
@@ -122,15 +148,12 @@ async function authenticateV3Request(req: NextRequest, authMode: TV3AuthMode): P
     return null;
   }
 
-  if (authMode === "both" && req.headers.has("x-api-key")) {
-    const apiKeyAuth = await authenticateRequest(req);
-    if (apiKeyAuth) {
-      return apiKeyAuth;
-    }
+  if (authMode === "both" && getApiKeyFromHeaders(req.headers)) {
+    return await authenticateRequest(req);
   }
 
   if (authMode === "session" || authMode === "both") {
-    const session = await getServerSession(authOptions);
+    const session = await getSession();
     if (session?.user?.id) {
       return session;
     }
@@ -153,37 +176,48 @@ async function parseV3Input<S extends TV3Schemas | undefined, TProps>(
   schemas: S | undefined,
   requestId: string,
   instance: string
-): Promise<
-  | { ok: true; parsedInput: TV3ParsedInput<S> }
-  | {
-      ok: false;
-      response: Response;
-    }
-> {
+): Promise<{ ok: true; parsedInput: TV3ParsedInput<S> } | TV3InputParseFailure> {
   const parsedInput = {} as TV3ParsedInput<S>;
 
   if (schemas?.body) {
     let bodyData: unknown;
 
     try {
-      bodyData = await req.json();
-    } catch {
+      bodyData = await parseJsonBodyWithLimit(req);
+    } catch (error) {
+      if (error instanceof RequestBodyTooLargeError) {
+        return {
+          ok: false,
+          detail: error.message,
+          invalidParams: [],
+          response: problemPayloadTooLarge(requestId, error.message, instance),
+        };
+      }
+
+      const invalidParams = [
+        { name: "body", reason: "Malformed JSON input, please check your request body" },
+      ];
       return {
         ok: false,
+        detail: "Invalid request body",
+        invalidParams,
         response: problemBadRequest(requestId, "Invalid request body", {
           instance,
-          invalid_params: [{ name: "body", reason: "Malformed JSON input, please check your request body" }],
+          invalid_params: invalidParams,
         }),
       };
     }
 
     const bodyResult = schemas.body.safeParse(bodyData);
     if (!bodyResult.success) {
+      const invalidParams = formatZodIssues(bodyResult.error, "body");
       return {
         ok: false,
+        detail: "Invalid request body",
+        invalidParams,
         response: problemBadRequest(requestId, "Invalid request body", {
           instance,
-          invalid_params: formatZodIssues(bodyResult.error, "body"),
+          invalid_params: invalidParams,
         }),
       };
     }
@@ -194,11 +228,14 @@ async function parseV3Input<S extends TV3Schemas | undefined, TProps>(
   if (schemas?.query) {
     const queryResult = schemas.query.safeParse(searchParamsToObject(req.nextUrl.searchParams));
     if (!queryResult.success) {
+      const invalidParams = formatZodIssues(queryResult.error, "query");
       return {
         ok: false,
+        detail: "Invalid query parameters",
+        invalidParams,
         response: problemBadRequest(requestId, "Invalid query parameters", {
           instance,
-          invalid_params: formatZodIssues(queryResult.error, "query"),
+          invalid_params: invalidParams,
         }),
       };
     }
@@ -209,11 +246,14 @@ async function parseV3Input<S extends TV3Schemas | undefined, TProps>(
   if (schemas?.params) {
     const paramsResult = schemas.params.safeParse(await getRouteParams(props));
     if (!paramsResult.success) {
+      const invalidParams = formatZodIssues(paramsResult.error, "params");
       return {
         ok: false,
+        detail: "Invalid route parameters",
+        invalidParams,
         response: problemBadRequest(requestId, "Invalid route parameters", {
           instance,
-          invalid_params: formatZodIssues(paramsResult.error, "params"),
+          invalid_params: invalidParams,
         }),
       };
     }
@@ -296,7 +336,15 @@ async function applyV3RateLimitOrRespond(params: {
 export const withV3ApiWrapper = <S extends TV3Schemas | undefined, TProps = unknown>(
   params: TWithV3ApiWrapperParams<S, TProps>
 ): ((req: NextRequest, props: TProps) => Promise<Response>) => {
-  const { auth = "both", schemas, rateLimit = true, customRateLimitConfig, handler } = params;
+  const {
+    auth = "both",
+    schemas,
+    rateLimit = true,
+    customRateLimitConfig,
+    handler,
+    action,
+    targetType,
+  } = params;
 
   return async (req: NextRequest, props: TProps): Promise<Response> => {
     const requestId = req.headers.get("x-request-id") ?? crypto.randomUUID();
@@ -306,18 +354,16 @@ export const withV3ApiWrapper = <S extends TV3Schemas | undefined, TProps = unkn
       method: req.method,
       path: instance,
     });
+    let auditLog: TV3AuditLog | undefined;
 
     try {
       const authResult = await authenticateV3RequestOrRespond(req, auth, requestId, instance);
       if (authResult.response) {
-        log.warn({ statusCode: authResult.response.status }, "V3 API authentication failed");
+        log.warn(
+          { statusCode: authResult.response.status, detail: getUnauthenticatedDetail(auth) },
+          "V3 API authentication failed"
+        );
         return authResult.response;
-      }
-
-      const parsedInputResult = await parseV3Input(req, props, schemas, requestId, instance);
-      if (!parsedInputResult.ok) {
-        log.warn({ statusCode: parsedInputResult.response.status }, "V3 API request validation failed");
-        return parsedInputResult.response;
       }
 
       const rateLimitResponse = await applyV3RateLimitOrRespond({
@@ -331,17 +377,50 @@ export const withV3ApiWrapper = <S extends TV3Schemas | undefined, TProps = unkn
         return rateLimitResponse;
       }
 
-      const response = await handler({
-        req,
-        props,
-        authentication: authResult.authentication,
-        parsedInput: parsedInputResult.parsedInput,
-        requestId,
-        instance,
-      });
+      const parsedInputResult = await parseV3Input(req, props, schemas, requestId, instance);
+      if (!parsedInputResult.ok) {
+        log.warn(
+          {
+            statusCode: parsedInputResult.response.status,
+            detail: parsedInputResult.detail,
+            invalidParams: parsedInputResult.invalidParams,
+          },
+          "V3 API request validation failed"
+        );
+        return parsedInputResult.response;
+      }
 
+      auditLog = buildV3AuditLog(authResult.authentication, action, targetType, req.url);
+
+      const execute = () =>
+        handler({
+          req,
+          props,
+          authentication: authResult.authentication,
+          auditLog,
+          parsedInput: parsedInputResult.parsedInput,
+          requestId,
+          instance,
+        });
+      const response = authResult.authentication
+        ? await withAuthorizationSurface("api_v3", execute)
+        : await execute();
+
+      if (auditLog) {
+        if (response.ok) {
+          auditLog.status = "success";
+        } else {
+          auditLog.eventId = requestId;
+        }
+      }
+
+      await queueV3AuditLog(auditLog, requestId, log);
       return ensureRequestIdHeader(response, requestId);
     } catch (error) {
+      if (auditLog) {
+        auditLog.eventId = requestId;
+        await queueV3AuditLog(auditLog, requestId, log);
+      }
       log.error({ error, statusCode: 500 }, "V3 API unexpected error");
       return problemInternalError(requestId, "An unexpected error occurred.", instance);
     }

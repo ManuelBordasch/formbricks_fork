@@ -1,6 +1,6 @@
 
 
-{{ .Release.Name | camelcase }} with {{ .Values.deployment.image.repository }}:{{ .Values.deployment.image.tag }} has been deployed successfully on {{ template "formbricks.namespace" .}} namespace !
+{{ .Release.Name | camelcase }} with {{ include "formbricks.deploymentImage" . }} has been deployed successfully on {{ template "formbricks.namespace" .}} namespace !
 
 Here's how you can access and manage your deployment:
 ---
@@ -43,19 +43,16 @@ Database (PostgreSQL) Access:
    PostgreSQL is deployed within your cluster.
    Retrieve the password using:
    ```sh
-   kubectl get secret --namespace {{ .Release.Namespace }} {{ include "formbricks.name" . }}-app-secrets -o jsonpath="{.data.POSTGRES_USER_PASSWORD}" | base64 --decode
+   kubectl get secret --namespace {{ .Release.Namespace }} {{ include "formbricks.name" . }}-app-secrets -o jsonpath="{.data.{{ include "formbricks.postgresqlAppPasswordKey" . }}}" | base64 --decode
    ```
    Connection details:
-   - **Host**: `{{ include "formbricks.name" . }}-postgresql`
-   - **Port**: `5432`
-   - **Database**: `{{ .Values.postgresql.auth.database }}`
-   - **Username**: `{{ .Values.postgresql.auth.username }}`
+   - **Host**: `{{ include "formbricks.postgresqlPrimaryHost" . }}`
+   - **Port**: `{{ include "formbricks.postgresqlServicePort" . }}`
+   - **Database**: `{{ include "formbricks.postgresqlDatabase" . }}`
+   - **Username**: `{{ include "formbricks.postgresqlUsername" . }}`
 {{- else if .Values.postgresql.externalDatabaseUrl }}
    You're using an external PostgreSQL database.
-   Connection URL:
-   ```sh
-   echo "{{ .Values.postgresql.externalDatabaseUrl }}"
-   ```
+   The connection URL is intentionally omitted from these notes because it may contain credentials.
 {{- end }}
 
 ---
@@ -64,12 +61,14 @@ Redis Access:
 
 {{- if .Values.redis.enabled }}
    Redis is deployed within your cluster.
+   {{- if .Values.redis.auth.enabled }}
    Retrieve the password using:
    ```sh
-   kubectl get secret --namespace {{ .Release.Namespace }} {{ include "formbricks.name" . }}-app-secrets -o jsonpath="{.data.REDIS_PASSWORD}" | base64 --decode
+   kubectl get secret --namespace {{ .Release.Namespace }} {{ include "formbricks.redisSecretName" . }} -o jsonpath="{.data.{{ include "formbricks.redisSecretKey" . }}}" | base64 --decode
    ```
+   {{- end }}
    Connection details:
-   - **Host**: `{{ include "formbricks.name" . }}-redis-master`
+   - **Host**: `{{ include "formbricks.redisMasterName" . }}`
    - **Port**: `6379`
 {{- else if .Values.redis.externalRedisUrl }}
    You're using an external Redis instance.
@@ -171,6 +170,36 @@ External Secrets:
 {{- end }}
 
 ---
+
+{{- if .Values.authzed.enabled }}
+SpiceDB Authorization Operations:
+
+   SpiceDB is configured in `{{ .Values.authzed.mode }}` mode. It is not part of the Formbricks
+   readiness probe, and its gRPC endpoint should remain private.
+
+   Check the release-matched client connection:
+   ```sh
+   kubectl exec -n {{ .Release.Namespace }} deployment/{{ include "formbricks.name" . }} -- formbricks-authzed health
+   ```
+
+   Check whether the installed authorization schema matches this Formbricks release:
+   ```sh
+   kubectl exec -n {{ .Release.Namespace }} deployment/{{ include "formbricks.name" . }} -- formbricks-authzed schema check
+   ```
+
+   Existing v5 installations: stop all writers/controllers, take recoverable backups, and use an
+   explicit target-image maintenance Job running `formbricks-authzed-prepare`. It delegates graph
+   preparation to `formbricks-authzed upgrade prepare` and `formbricks-authzed upgrade check`.
+   Do not execute the upgrade through the old application pod. After preparation passes, set
+   `authzed.migrationAcknowledged=true` for the v6 upgrade. Follow the complete procedure:
+   https://formbricks.com/docs/self-hosting/advanced/v6-maintenance-upgrade
+
+   Fresh installs initialize the graph. The upgrade hook is read-only; schema application and
+   relationship repair during upgrades are explicit maintenance operations:
+   https://formbricks.com/docs/self-hosting/advanced/authzed-operations
+
+---
+{{- end }}
 
 Persistence:
 

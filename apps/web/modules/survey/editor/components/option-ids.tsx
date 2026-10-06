@@ -3,13 +3,13 @@ import { useTranslation } from "react-i18next";
 import { TSurveyElement, TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import { TSurveyVariable } from "@formbricks/types/surveys/types";
 import { getLocalizedValue } from "@/lib/i18n/utils";
+import { isExternalImageSrc } from "@/lib/image-hosts";
 import { IdBadge } from "@/modules/ui/components/id-badge";
 import { Label } from "@/modules/ui/components/label";
 
 interface OptionIdsElementProps {
   type: "element";
   element: TSurveyElement;
-  selectedLanguageCode: string;
 }
 
 interface OptionIdsVariablesProps {
@@ -21,6 +21,7 @@ type OptionIdsProps = OptionIdsElementProps | OptionIdsVariablesProps;
 
 export const OptionIds = (props: OptionIdsProps) => {
   const { t } = useTranslation();
+  const selectedLanguageCode = "default";
 
   const renderChoiceIds = (element: TSurveyElement, selectedLanguageCode: string) => {
     switch (element.type) {
@@ -54,6 +55,7 @@ export const OptionIds = (props: OptionIdsProps) => {
                       style={{ objectFit: "cover" }}
                       quality={75}
                       className="rounded-lg transition-opacity duration-200"
+                      unoptimized={isExternalImageSrc(imageUrl)}
                     />
                   </div>
                   <IdBadge id={choice.id} />
@@ -92,7 +94,7 @@ export const OptionIds = (props: OptionIdsProps) => {
   return (
     <div className="space-y-3">
       <Label className="text-sm font-medium text-gray-700">{t("common.option_ids")}</Label>
-      <div className="w-full">{renderChoiceIds(props.element, props.selectedLanguageCode)}</div>
+      <div className="w-full">{renderChoiceIds(props.element, selectedLanguageCode)}</div>
     </div>
   );
 };

@@ -1,29 +1,23 @@
 import { createId } from "@paralleldrive/cuid2";
-import { Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { logger } from "@formbricks/logger";
 import { TActionClassType } from "@formbricks/types/action-classes";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
-import { getOrganizationByEnvironmentId } from "@/lib/organization/service";
+import { getOrganizationByWorkspaceId } from "@/lib/organization/service";
 import { checkForInvalidMediaInBlocks } from "@/lib/survey/utils";
 import { validateInputs } from "@/lib/utils/validate";
 import { getIsQuotasEnabled } from "@/modules/ee/license-check/lib/utils";
-import { buildOrderByClause, buildWhereClause } from "@/modules/survey/lib/utils";
-import { doesEnvironmentExist } from "@/modules/survey/list/lib/environment";
-import { getProjectWithLanguagesByEnvironmentId } from "@/modules/survey/list/lib/project";
-import { TProjectWithLanguages, TSurvey } from "../types/surveys";
+import { getQuotas } from "@/modules/ee/quotas/lib/quotas";
+import { buildWhereClause } from "@/modules/survey/lib/utils";
+import { doesWorkspaceExist, getWorkspaceWithLanguages } from "@/modules/survey/list/lib/workspace";
+import { TWorkspaceWithLanguages } from "../types/surveys";
 // Import the module to be tested
-import {
-  copySurveyToOtherEnvironment,
-  deleteSurvey,
-  getSurvey,
-  getSurveyCount,
-  getSurveys,
-  getSurveysSortedByRelevance,
-} from "./survey";
-import { surveySelect } from "./survey-record";
+import { copySurveyToOtherWorkspace, getSurveyCount, getWorkspaceSurveyCount } from "./survey";
+
+vi.mock("server-only", () => ({}));
 
 vi.mock("react", async (importOriginal) => {
   const actual = await importOriginal<typeof import("react")>();
@@ -42,20 +36,16 @@ vi.mock("@/lib/utils/validate", () => ({
 }));
 
 vi.mock("@/lib/organization/service", () => ({
-  getOrganizationByEnvironmentId: vi.fn(),
+  getOrganizationByWorkspaceId: vi.fn(),
 }));
 
 vi.mock("@/modules/survey/lib/utils", () => ({
-  buildOrderByClause: vi.fn((sortBy) => (sortBy ? [{ [sortBy]: "desc" }] : [])),
   buildWhereClause: vi.fn((filterCriteria) => (filterCriteria ? { name: filterCriteria.name } : {})),
 }));
 
-vi.mock("@/modules/survey/list/lib/environment", () => ({
-  doesEnvironmentExist: vi.fn(),
-}));
-
-vi.mock("@/modules/survey/list/lib/project", () => ({
-  getProjectWithLanguagesByEnvironmentId: vi.fn(),
+vi.mock("@/modules/survey/list/lib/workspace", () => ({
+  doesWorkspaceExist: vi.fn(),
+  getWorkspaceWithLanguages: vi.fn(),
 }));
 
 vi.mock("@paralleldrive/cuid2", () => ({
@@ -64,6 +54,10 @@ vi.mock("@paralleldrive/cuid2", () => ({
 
 vi.mock("@/modules/ee/license-check/lib/utils", () => ({
   getIsQuotasEnabled: vi.fn(),
+}));
+
+vi.mock("@/modules/ee/quotas/lib/quotas", () => ({
+  getQuotas: vi.fn(),
 }));
 
 vi.mock("@/lingodotdev/server", () => ({
@@ -79,6 +73,7 @@ vi.mock("@formbricks/database", () => ({
     survey: {
       findMany: vi.fn(),
       findUnique: vi.fn(),
+      findFirst: vi.fn(),
       count: vi.fn(),
       delete: vi.fn(),
       create: vi.fn(),
@@ -101,6 +96,19 @@ vi.mock("@formbricks/database", () => ({
     organization: {
       findFirst: vi.fn(),
     },
+    // Added for the Embedded Data reconcile the copy runs (ENG-1978)
+    embeddedData: {
+      create: vi.fn(),
+      update: vi.fn(),
+      deleteMany: vi.fn(),
+    },
+    surveyEmbeddedData: {
+      findMany: vi.fn(),
+      create: vi.fn(),
+      deleteMany: vi.fn(),
+      updateMany: vi.fn(),
+    },
+    $transaction: vi.fn(),
   },
 }));
 
@@ -115,21 +123,37 @@ const resetMocks = () => {
   vi.mocked(reactCache).mockClear();
   vi.mocked(checkForInvalidMediaInBlocks).mockClear();
   vi.mocked(validateInputs).mockClear();
-  vi.mocked(buildOrderByClause).mockClear();
   vi.mocked(buildWhereClause).mockClear();
-  vi.mocked(doesEnvironmentExist).mockClear();
-  vi.mocked(getProjectWithLanguagesByEnvironmentId).mockClear();
-  vi.mocked(getOrganizationByEnvironmentId).mockClear();
+  vi.mocked(doesWorkspaceExist).mockClear();
+  vi.mocked(getWorkspaceWithLanguages).mockClear();
+  vi.mocked(getOrganizationByWorkspaceId).mockClear();
   vi.mocked(createId).mockClear();
   vi.mocked(prisma.survey.findMany).mockReset();
   vi.mocked(prisma.survey.findUnique).mockReset();
+  vi.mocked(prisma.survey.findFirst).mockReset();
   vi.mocked(prisma.survey.count).mockReset();
   vi.mocked(prisma.survey.delete).mockReset();
   vi.mocked(prisma.survey.create).mockReset();
   vi.mocked(prisma.segment.delete).mockReset();
   vi.mocked(prisma.segment.findFirst).mockReset();
   vi.mocked(prisma.actionClass.findMany).mockReset();
+  vi.mocked(getQuotas).mockReset();
   vi.mocked(logger.error).mockClear();
+
+  // copySurveyToOtherWorkspace wraps its writes in a transaction (ENG-1978) so the survey and its
+  // Embedded Data rows land together. Reset first like every mock above — otherwise the call history
+  // these tests assert on accumulates across tests — then run the callback against the same mocked
+  // client, and start the copy with no existing links so the reconcile is a no-op unless a test says
+  // otherwise.
+  vi.mocked(prisma.$transaction).mockReset();
+  vi.mocked(prisma.surveyEmbeddedData.findMany).mockReset();
+  vi.mocked(prisma.surveyEmbeddedData.create).mockReset();
+  vi.mocked(prisma.embeddedData.create).mockReset();
+
+  vi.mocked(prisma.$transaction).mockImplementation(async (callback) => callback(prisma));
+  vi.mocked(prisma.surveyEmbeddedData.findMany).mockResolvedValue([]);
+  vi.mocked(prisma.embeddedData.create).mockResolvedValue({ id: "ed_1" } as never);
+  vi.mocked(prisma.surveyEmbeddedData.create).mockResolvedValue({} as never);
 };
 
 const makePrismaKnownError = () =>
@@ -140,22 +164,9 @@ const makePrismaKnownError = () =>
   });
 
 // Sample data
-const environmentId = "env_1";
+const workspaceId = "ws_1";
 const surveyId = "survey_1";
 const userId = "user_1";
-
-const mockSurveyPrisma = {
-  id: surveyId,
-  createdAt: new Date(),
-  updatedAt: new Date(),
-  name: "Test Survey",
-  type: "web" as any,
-  creator: { name: "Test User" },
-  status: "draft" as any,
-  singleUse: null,
-  environmentId,
-  _count: { responses: 10 },
-};
 
 describe("getSurveyCount", () => {
   beforeEach(() => {
@@ -164,310 +175,25 @@ describe("getSurveyCount", () => {
 
   test("should return survey count successfully", async () => {
     vi.mocked(prisma.survey.count).mockResolvedValue(5);
-    const count = await getSurveyCount(environmentId);
+    const count = await getSurveyCount(workspaceId);
     expect(count).toBe(5);
     expect(prisma.survey.count).toHaveBeenCalledWith({
-      where: { environmentId },
+      where: { workspaceId },
     });
-    expect(validateInputs).toHaveBeenCalledWith([environmentId, expect.any(Object)]);
+    expect(validateInputs).toHaveBeenCalledWith([workspaceId, expect.any(Object)]);
   });
 
   test("should throw DatabaseError on Prisma error", async () => {
     const prismaError = makePrismaKnownError();
     vi.mocked(prisma.survey.count).mockRejectedValue(prismaError);
-    await expect(getSurveyCount(environmentId)).rejects.toThrow(DatabaseError);
+    await expect(getSurveyCount(workspaceId)).rejects.toThrow(DatabaseError);
     expect(logger.error).toHaveBeenCalledWith(prismaError, "Error getting survey count");
   });
 
   test("should rethrow unknown error", async () => {
     const unknownError = new Error("Unknown error");
     vi.mocked(prisma.survey.count).mockRejectedValue(unknownError);
-    await expect(getSurveyCount(environmentId)).rejects.toThrow(unknownError);
-  });
-});
-
-describe("getSurvey", () => {
-  beforeEach(() => {
-    resetMocks();
-  });
-
-  test("should return a survey if found", async () => {
-    const prismaSurvey = { ...mockSurveyPrisma, _count: { responses: 5 } };
-    vi.mocked(prisma.survey.findUnique).mockResolvedValue(prismaSurvey as any);
-
-    const survey = await getSurvey(surveyId);
-
-    expect(survey).toEqual({
-      id: prismaSurvey.id,
-      createdAt: prismaSurvey.createdAt,
-      updatedAt: prismaSurvey.updatedAt,
-      name: prismaSurvey.name,
-      type: prismaSurvey.type,
-      creator: prismaSurvey.creator,
-      status: prismaSurvey.status,
-      singleUse: prismaSurvey.singleUse,
-      environmentId: prismaSurvey.environmentId,
-      responseCount: 5,
-    });
-    expect(survey).not.toHaveProperty("_count");
-    expect(prisma.survey.findUnique).toHaveBeenCalledWith({
-      where: { id: surveyId },
-      select: surveySelect,
-    });
-  });
-
-  test("should return null if survey not found", async () => {
-    vi.mocked(prisma.survey.findUnique).mockResolvedValue(null);
-    const survey = await getSurvey(surveyId);
-    expect(survey).toBeNull();
-  });
-
-  test("should throw DatabaseError on Prisma error", async () => {
-    const prismaError = makePrismaKnownError();
-    vi.mocked(prisma.survey.findUnique).mockRejectedValue(prismaError);
-    await expect(getSurvey(surveyId)).rejects.toThrow(DatabaseError);
-    expect(logger.error).toHaveBeenCalledWith(prismaError, "Error getting survey");
-  });
-
-  test("should rethrow unknown error", async () => {
-    const unknownError = new Error("Unknown error");
-    vi.mocked(prisma.survey.findUnique).mockRejectedValue(unknownError);
-    await expect(getSurvey(surveyId)).rejects.toThrow(unknownError);
-  });
-});
-
-describe("getSurveys", () => {
-  beforeEach(() => {
-    resetMocks();
-  });
-
-  const mockPrismaSurveys = [
-    { ...mockSurveyPrisma, id: "s1", name: "Survey 1", _count: { responses: 1 } },
-    { ...mockSurveyPrisma, id: "s2", name: "Survey 2", _count: { responses: 2 } },
-  ];
-  const expectedSurveys: TSurvey[] = mockPrismaSurveys.map((s) => ({
-    id: s.id,
-    createdAt: s.createdAt,
-    updatedAt: s.updatedAt,
-    name: s.name,
-    type: s.type,
-    creator: s.creator,
-    status: s.status,
-    singleUse: s.singleUse,
-    environmentId: s.environmentId,
-    responseCount: s._count.responses,
-  }));
-
-  test("should return surveys with default parameters", async () => {
-    vi.mocked(prisma.survey.findMany).mockResolvedValue(mockPrismaSurveys as any);
-    const surveys = await getSurveys(environmentId);
-
-    expect(surveys).toEqual(expectedSurveys);
-    expect(surveys[0]).not.toHaveProperty("_count");
-    expect(prisma.survey.findMany).toHaveBeenCalledWith({
-      where: { environmentId, ...buildWhereClause() },
-      select: surveySelect,
-      orderBy: buildOrderByClause(),
-      take: undefined,
-      skip: undefined,
-    });
-  });
-
-  test("should return surveys with limit and offset", async () => {
-    vi.mocked(prisma.survey.findMany).mockResolvedValue([mockPrismaSurveys[0]] as any);
-    const surveys = await getSurveys(environmentId, 1, 1);
-
-    expect(surveys).toEqual([expectedSurveys[0]]);
-    expect(prisma.survey.findMany).toHaveBeenCalledWith({
-      where: { environmentId, ...buildWhereClause() },
-      select: surveySelect,
-      orderBy: buildOrderByClause(),
-      take: 1,
-      skip: 1,
-    });
-  });
-
-  test("should return surveys with filterCriteria", async () => {
-    const filterCriteria: any = { name: "Test", sortBy: "createdAt" };
-    vi.mocked(buildWhereClause).mockReturnValue({ AND: [{ name: { contains: "Test" } }] }); // Mock correct return type
-    vi.mocked(buildOrderByClause).mockReturnValue([{ createdAt: "desc" }]); // Mock specific return
-    vi.mocked(prisma.survey.findMany).mockResolvedValue(mockPrismaSurveys as any);
-
-    const surveys = await getSurveys(environmentId, undefined, undefined, filterCriteria);
-
-    expect(surveys).toEqual(expectedSurveys);
-    expect(buildWhereClause).toHaveBeenCalledWith(filterCriteria);
-    expect(buildOrderByClause).toHaveBeenCalledWith("createdAt");
-    expect(prisma.survey.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { environmentId, AND: [{ name: { contains: "Test" } }] }, // Check with correct structure
-        orderBy: [{ createdAt: "desc" }], // Check the mocked order by
-      })
-    );
-  });
-
-  test("should throw DatabaseError on Prisma error", async () => {
-    const prismaError = makePrismaKnownError();
-    vi.mocked(prisma.survey.findMany).mockRejectedValue(prismaError);
-    await expect(getSurveys(environmentId)).rejects.toThrow(DatabaseError);
-    expect(logger.error).toHaveBeenCalledWith(prismaError, "Error getting surveys");
-  });
-
-  test("should rethrow unknown error", async () => {
-    const unknownError = new Error("Unknown error");
-    vi.mocked(prisma.survey.findMany).mockRejectedValue(unknownError);
-    await expect(getSurveys(environmentId)).rejects.toThrow(unknownError);
-  });
-});
-
-describe("getSurveysSortedByRelevance", () => {
-  beforeEach(() => {
-    resetMocks();
-  });
-
-  const mockInProgressPrisma = {
-    ...mockSurveyPrisma,
-    id: "s_inprog",
-    status: "inProgress" as any,
-    _count: { responses: 3 },
-  };
-  const mockOtherPrisma = {
-    ...mockSurveyPrisma,
-    id: "s_other",
-    status: "completed" as any,
-    _count: { responses: 5 },
-  };
-
-  const expectedInProgressSurvey: TSurvey = {
-    id: mockInProgressPrisma.id,
-    createdAt: mockInProgressPrisma.createdAt,
-    updatedAt: mockInProgressPrisma.updatedAt,
-    name: mockInProgressPrisma.name,
-    type: mockInProgressPrisma.type,
-    creator: mockInProgressPrisma.creator,
-    status: mockInProgressPrisma.status,
-    singleUse: mockInProgressPrisma.singleUse,
-    environmentId: mockInProgressPrisma.environmentId,
-    responseCount: 3,
-  };
-  const expectedOtherSurvey: TSurvey = {
-    id: mockOtherPrisma.id,
-    createdAt: mockOtherPrisma.createdAt,
-    updatedAt: mockOtherPrisma.updatedAt,
-    name: mockOtherPrisma.name,
-    type: mockOtherPrisma.type,
-    creator: mockOtherPrisma.creator,
-    status: mockOtherPrisma.status,
-    singleUse: mockOtherPrisma.singleUse,
-    environmentId: mockOtherPrisma.environmentId,
-    responseCount: 5,
-  };
-
-  test("should fetch inProgress surveys first, then others if limit not met", async () => {
-    vi.mocked(prisma.survey.count).mockResolvedValue(1); // 1 inProgress survey
-    vi.mocked(prisma.survey.findMany)
-      .mockResolvedValueOnce([mockInProgressPrisma] as any) // In-progress surveys
-      .mockResolvedValueOnce([mockOtherPrisma] as any); // Additional surveys
-
-    const surveys = await getSurveysSortedByRelevance(environmentId, 2, 0);
-
-    expect(surveys).toEqual([expectedInProgressSurvey, expectedOtherSurvey]);
-    expect(surveys[0]).not.toHaveProperty("_count");
-    expect(prisma.survey.count).toHaveBeenCalledWith({
-      where: { environmentId, status: "inProgress", ...buildWhereClause() },
-    });
-    expect(prisma.survey.findMany).toHaveBeenNthCalledWith(1, {
-      where: { environmentId, status: "inProgress", ...buildWhereClause() },
-      select: surveySelect,
-      orderBy: buildOrderByClause("updatedAt"),
-      take: 2,
-      skip: 0,
-    });
-    expect(prisma.survey.findMany).toHaveBeenNthCalledWith(2, {
-      where: { environmentId, status: { not: "inProgress" }, ...buildWhereClause() },
-      select: surveySelect,
-      orderBy: buildOrderByClause("updatedAt"),
-      take: 1,
-      skip: 0,
-    });
-  });
-
-  test("should only fetch inProgress surveys if limit is met", async () => {
-    vi.mocked(prisma.survey.count).mockResolvedValue(1);
-    vi.mocked(prisma.survey.findMany).mockResolvedValueOnce([mockInProgressPrisma] as any);
-
-    const surveys = await getSurveysSortedByRelevance(environmentId, 1, 0);
-    expect(surveys).toEqual([expectedInProgressSurvey]);
-    expect(prisma.survey.findMany).toHaveBeenCalledTimes(1);
-  });
-
-  test("should throw DatabaseError on Prisma error", async () => {
-    const prismaError = makePrismaKnownError();
-    vi.mocked(prisma.survey.count).mockRejectedValue(prismaError);
-    await expect(getSurveysSortedByRelevance(environmentId)).rejects.toThrow(DatabaseError);
-    expect(logger.error).toHaveBeenCalledWith(prismaError, "Error getting surveys sorted by relevance");
-
-    resetMocks(); // Reset for the next part of the test
-    vi.mocked(prisma.survey.count).mockResolvedValue(0); // Make count succeed
-    vi.mocked(prisma.survey.findMany).mockRejectedValue(prismaError); // Error on findMany
-    await expect(getSurveysSortedByRelevance(environmentId)).rejects.toThrow(DatabaseError);
-  });
-
-  test("should rethrow unknown error", async () => {
-    const unknownError = new Error("Unknown error");
-    vi.mocked(prisma.survey.count).mockRejectedValue(unknownError);
-    await expect(getSurveysSortedByRelevance(environmentId)).rejects.toThrow(unknownError);
-  });
-});
-
-describe("deleteSurvey", () => {
-  beforeEach(() => {
-    resetMocks();
-  });
-
-  const mockDeletedSurveyData = {
-    id: surveyId,
-    environmentId,
-    segment: null,
-    type: "web" as any,
-    triggers: [{ actionClass: { id: "action_1" } }],
-  };
-
-  test("should delete a survey and revalidate caches (no private segment)", async () => {
-    vi.mocked(prisma.survey.delete).mockResolvedValue(mockDeletedSurveyData as any);
-    const result = await deleteSurvey(surveyId);
-
-    expect(result).toBe(true);
-    expect(prisma.survey.delete).toHaveBeenCalledWith({
-      where: { id: surveyId },
-      select: expect.objectContaining({ id: true, environmentId: true, segment: expect.anything() }),
-    });
-    expect(prisma.segment.delete).not.toHaveBeenCalled();
-  });
-
-  test("should revalidate segment cache for non-private segment if segment exists", async () => {
-    const surveyWithPublicSegment = {
-      ...mockDeletedSurveyData,
-      segment: { id: "segment_public_1", isPrivate: false },
-    };
-    vi.mocked(prisma.survey.delete).mockResolvedValue(surveyWithPublicSegment as any);
-
-    await deleteSurvey(surveyId);
-
-    expect(prisma.segment.delete).not.toHaveBeenCalled();
-  });
-
-  test("should throw DatabaseError on Prisma error", async () => {
-    const prismaError = makePrismaKnownError();
-    vi.mocked(prisma.survey.delete).mockRejectedValue(prismaError);
-    await expect(deleteSurvey(surveyId)).rejects.toThrow(DatabaseError);
-    expect(logger.error).toHaveBeenCalledWith(prismaError, "Error deleting survey");
-  });
-
-  test("should rethrow unknown error", async () => {
-    const unknownError = new Error("Unknown error");
-    vi.mocked(prisma.survey.delete).mockRejectedValue(unknownError);
-    await expect(deleteSurvey(surveyId)).rejects.toThrow(unknownError);
+    await expect(getSurveyCount(workspaceId)).rejects.toThrow(unknownError);
   });
 });
 
@@ -489,7 +215,7 @@ const mockExistingSurveyDetails = {
   hiddenFields: { enabled: true, fieldIds: ["hf1"] },
   surveyClosedMessage: { enabled: false },
   singleUse: { enabled: false },
-  projectOverwrites: null,
+  workspaceOverwrites: null,
   styling: { theme: {} },
   segment: null,
   followUps: [{ name: "Follow Up 1", trigger: {}, action: {} }],
@@ -501,7 +227,7 @@ const mockExistingSurveyDetails = {
       actionClass: {
         id: "ac1",
         name: "Code Action",
-        environmentId,
+        workspaceId,
         description: "",
         type: "code" as TActionClassType,
         key: "code_action_key",
@@ -512,7 +238,7 @@ const mockExistingSurveyDetails = {
       actionClass: {
         id: "ac2",
         name: "No-Code Action",
-        environmentId,
+        workspaceId,
         description: "",
         type: "noCode" as TActionClassType,
         key: null,
@@ -522,27 +248,30 @@ const mockExistingSurveyDetails = {
   ],
 };
 
-describe("copySurveyToOtherEnvironment", () => {
-  const targetEnvironmentId = "env_target";
-  const sourceProjectId = "proj_source";
-  const targetProjectId = "proj_target";
+describe("copySurveyToOtherWorkspace", () => {
+  const sourceWorkspaceId = "proj_source";
+  const targetWorkspaceId = "proj_target";
 
-  const mockSourceProject: TProjectWithLanguages = {
-    id: sourceProjectId,
+  const mockSourceWorkspace: TWorkspaceWithLanguages = {
+    id: sourceWorkspaceId,
     languages: [{ code: "en", alias: "English" }],
   };
-  const mockTargetProject: TProjectWithLanguages = {
-    id: targetProjectId,
+  const mockTargetWorkspace: TWorkspaceWithLanguages = {
+    id: targetWorkspaceId,
     languages: [{ code: "en", alias: "English" }],
   };
 
   const mockNewSurveyResult = {
     id: "new_cuid2_id",
-    environmentId: targetEnvironmentId,
+    workspaceId: targetWorkspaceId,
+    // The copy carries the source survey's Embedded Data, which the reconcile re-creates for the new
+    // survey (ENG-1978).
+    variables: [{ id: "var_cuid", name: "score", type: "number", value: 0 }],
+    hiddenFields: { enabled: true, fieldIds: ["plan"] },
     segment: null,
     triggers: [
-      { actionClass: { id: "new_ac1", name: "Code Action", environmentId: targetEnvironmentId } },
-      { actionClass: { id: "new_ac2", name: "No-Code Action", environmentId: targetEnvironmentId } },
+      { actionClass: { id: "new_ac1", name: "Code Action", workspaceId: targetWorkspaceId } },
+      { actionClass: { id: "new_ac2", name: "No-Code Action", workspaceId: targetWorkspaceId } },
     ],
     languages: [{ language: { code: "en" } }],
   };
@@ -551,26 +280,27 @@ describe("copySurveyToOtherEnvironment", () => {
     resetMocks();
     vi.mocked(createId).mockReturnValue("new_cuid2_id");
     vi.mocked(prisma.survey.findUnique).mockResolvedValue(mockExistingSurveyDetails as any);
-    vi.mocked(doesEnvironmentExist).mockResolvedValue(environmentId);
-    vi.mocked(getProjectWithLanguagesByEnvironmentId)
-      .mockResolvedValueOnce(mockSourceProject)
-      .mockResolvedValueOnce(mockTargetProject);
+    vi.mocked(doesWorkspaceExist).mockResolvedValue(sourceWorkspaceId);
+    vi.mocked(getWorkspaceWithLanguages)
+      .mockResolvedValueOnce(mockSourceWorkspace)
+      .mockResolvedValueOnce(mockTargetWorkspace);
     vi.mocked(getIsQuotasEnabled).mockResolvedValue(true);
     vi.mocked(prisma.survey.create).mockResolvedValue(mockNewSurveyResult as any);
     vi.mocked(prisma.segment.findFirst).mockResolvedValue(null);
     vi.mocked(prisma.actionClass.findMany).mockResolvedValue([]);
     vi.mocked(prisma.surveyQuota.findMany).mockResolvedValue([]);
-    vi.mocked(getOrganizationByEnvironmentId).mockResolvedValue({
+    vi.mocked(getQuotas).mockResolvedValue([]);
+    vi.mocked(getOrganizationByWorkspaceId).mockResolvedValue({
       billing: {},
       id: "org_123",
     } as any);
   });
 
-  test("should copy survey to a different environment successfully", async () => {
-    const newSurvey = await copySurveyToOtherEnvironment(
-      environmentId,
+  test("should copy survey to a different workspace successfully", async () => {
+    const newSurvey = await copySurveyToOtherWorkspace(
+      sourceWorkspaceId,
       surveyId,
-      targetEnvironmentId,
+      targetWorkspaceId,
       userId
     );
 
@@ -580,7 +310,7 @@ describe("copySurveyToOtherEnvironment", () => {
         data: expect.objectContaining({
           id: "new_cuid2_id",
           name: `${mockExistingSurveyDetails.name} (copy)`,
-          environment: { connect: { id: targetEnvironmentId } },
+          workspace: { connect: { id: targetWorkspaceId } },
           creator: { connect: { id: userId } },
           status: "draft",
           triggers: {
@@ -589,7 +319,7 @@ describe("copySurveyToOtherEnvironment", () => {
                 actionClass: {
                   connectOrCreate: {
                     where: {
-                      key_environmentId: { key: "code_action_key", environmentId: targetEnvironmentId },
+                      key_workspaceId: { key: "code_action_key", workspaceId: targetWorkspaceId },
                     },
                     create: expect.objectContaining({ name: "Code Action", key: "code_action_key" }),
                   },
@@ -599,7 +329,7 @@ describe("copySurveyToOtherEnvironment", () => {
                 actionClass: {
                   connectOrCreate: {
                     where: {
-                      name_environmentId: { name: "No-Code Action", environmentId: targetEnvironmentId },
+                      name_workspaceId: { name: "No-Code Action", workspaceId: targetWorkspaceId },
                     },
                     create: expect.objectContaining({
                       name: "No-Code Action",
@@ -616,17 +346,47 @@ describe("copySurveyToOtherEnvironment", () => {
     expect(checkForInvalidMediaInBlocks).toHaveBeenCalledWith(mockExistingSurveyDetails.blocks);
   });
 
-  test("should copy survey to the same environment successfully", async () => {
-    vi.mocked(getProjectWithLanguagesByEnvironmentId).mockReset();
-    vi.mocked(getProjectWithLanguagesByEnvironmentId).mockResolvedValue(mockSourceProject);
+  test("defines the copied survey's embedded data in the TARGET workspace, not the source", async () => {
+    // The function's `workspaceId` argument is the source. Reading it instead of the created
+    // survey's own workspace would define the fields in the wrong tenant — which the composite
+    // foreign keys then reject, leaving the copy with no fields at all.
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
 
-    await copySurveyToOtherEnvironment(environmentId, surveyId, environmentId, userId);
+    const workspaces = vi
+      .mocked(prisma.embeddedData.create)
+      .mock.calls.map(([args]) => (args as { data: { workspaceId: string } }).data.workspaceId);
 
-    expect(getProjectWithLanguagesByEnvironmentId).toHaveBeenCalledTimes(1);
+    expect(workspaces).toHaveLength(2);
+    expect(new Set(workspaces)).toEqual(new Set([targetWorkspaceId]));
+  });
+
+  test("re-creates the copied survey's variables and hidden fields under their original keys", async () => {
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
+
+    const links = vi
+      .mocked(prisma.surveyEmbeddedData.create)
+      .mock.calls.map(([args]) => (args as { data: { storageKey: string; order: number } }).data);
+
+    // A variable keeps its cuid and a hidden field its name, so the copy's recall tokens — cloned
+    // verbatim from the source — still resolve. The positions come across too, so the copy exports
+    // its columns in the same order as the survey it was made from.
+    expect(links.map(({ storageKey, order }) => [storageKey, order])).toEqual([
+      ["var_cuid", 0],
+      ["plan", 1],
+    ]);
+  });
+
+  test("should copy survey to the same workspace successfully", async () => {
+    vi.mocked(getWorkspaceWithLanguages).mockReset();
+    vi.mocked(getWorkspaceWithLanguages).mockResolvedValue(mockSourceWorkspace);
+
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, sourceWorkspaceId, userId);
+
+    expect(getWorkspaceWithLanguages).toHaveBeenCalledTimes(1);
     expect(prisma.survey.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          environment: { connect: { id: environmentId } },
+          workspace: { connect: { id: sourceWorkspaceId } },
           triggers: {
             create: [
               { actionClass: { connect: { id: "ac1" } } },
@@ -648,7 +408,7 @@ describe("copySurveyToOtherEnvironment", () => {
     const mockNewSurveyWithSegment = { ...mockNewSurveyResult, segment: { id: "new_seg_private" } };
     vi.mocked(prisma.survey.create).mockResolvedValue(mockNewSurveyWithSegment as any);
 
-    await copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId);
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
 
     expect(prisma.survey.create).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -658,7 +418,7 @@ describe("copySurveyToOtherEnvironment", () => {
               title: "new_cuid2_id",
               isPrivate: true,
               filters: surveyWithPrivateSegment.segment.filters,
-              environment: { connect: { id: targetEnvironmentId } },
+              workspace: { connect: { id: targetWorkspaceId } },
             },
           },
         }),
@@ -666,18 +426,18 @@ describe("copySurveyToOtherEnvironment", () => {
     );
   });
 
-  test("should handle public segment: connect if same env, create new if different env (no existing in target)", async () => {
+  test("should handle public segment: connect if same workspace, create new if different workspace (no existing in target)", async () => {
     const surveyWithPublicSegment = {
       ...mockExistingSurveyDetails,
       segment: { id: "seg_public", title: "Public Segment", isPrivate: false, filters: [] },
     };
     vi.mocked(prisma.survey.findUnique).mockResolvedValue(surveyWithPublicSegment as any);
-    vi.mocked(getProjectWithLanguagesByEnvironmentId)
-      .mockReset() // for same env part
-      .mockResolvedValueOnce(mockSourceProject);
+    vi.mocked(getWorkspaceWithLanguages)
+      .mockReset() // for same workspace part
+      .mockResolvedValueOnce(mockSourceWorkspace);
 
-    // Case 1: Same environment
-    await copySurveyToOtherEnvironment(environmentId, surveyId, environmentId, userId); // target is same
+    // Case 1: Same workspace
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, sourceWorkspaceId, userId); // target is same
     expect(prisma.survey.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -690,16 +450,22 @@ describe("copySurveyToOtherEnvironment", () => {
     resetMocks();
     vi.mocked(createId).mockReturnValue("new_cuid2_id");
     vi.mocked(prisma.survey.findUnique).mockResolvedValue(surveyWithPublicSegment as any);
-    vi.mocked(doesEnvironmentExist).mockResolvedValue(environmentId);
-    vi.mocked(getProjectWithLanguagesByEnvironmentId)
-      .mockResolvedValueOnce(mockSourceProject)
-      .mockResolvedValueOnce(mockTargetProject);
+    vi.mocked(doesWorkspaceExist).mockResolvedValue(sourceWorkspaceId);
+    vi.mocked(getWorkspaceWithLanguages)
+      .mockResolvedValueOnce(mockSourceWorkspace)
+      .mockResolvedValueOnce(mockTargetWorkspace);
     vi.mocked(prisma.survey.create).mockResolvedValue(mockNewSurveyResult as any);
     vi.mocked(prisma.segment.findFirst).mockResolvedValue(null); // No existing public segment with same title in target
     vi.mocked(prisma.actionClass.findMany).mockResolvedValue([]);
+    vi.mocked(getQuotas).mockResolvedValue([]);
+    vi.mocked(getIsQuotasEnabled).mockResolvedValue(true);
+    vi.mocked(getOrganizationByWorkspaceId).mockResolvedValue({
+      billing: {},
+      id: "org_123",
+    } as any);
 
-    // Case 2: Different environment, segment with same title does not exist in target
-    await copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId);
+    // Case 2: Different workspace, segment with same title does not exist in target
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
     expect(prisma.survey.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -708,7 +474,7 @@ describe("copySurveyToOtherEnvironment", () => {
               title: "Public Segment",
               isPrivate: false,
               filters: [],
-              environment: { connect: { id: targetEnvironmentId } },
+              workspace: { connect: { id: targetWorkspaceId } },
             },
           },
         }),
@@ -716,7 +482,7 @@ describe("copySurveyToOtherEnvironment", () => {
     );
   });
 
-  test("should handle public segment: create new with appended timestamp if different env and segment with same title exists in target", async () => {
+  test("should handle public segment: create new with appended timestamp if different workspace and segment with same title exists in target", async () => {
     const surveyWithPublicSegment = {
       ...mockExistingSurveyDetails,
       segment: { id: "seg_public", title: "Public Segment", isPrivate: false, filters: [] },
@@ -724,16 +490,22 @@ describe("copySurveyToOtherEnvironment", () => {
     resetMocks();
     vi.mocked(createId).mockReturnValue("new_cuid2_id");
     vi.mocked(prisma.survey.findUnique).mockResolvedValue(surveyWithPublicSegment as any);
-    vi.mocked(doesEnvironmentExist).mockResolvedValue(environmentId);
-    vi.mocked(getProjectWithLanguagesByEnvironmentId)
-      .mockResolvedValueOnce(mockSourceProject)
-      .mockResolvedValueOnce(mockTargetProject);
+    vi.mocked(doesWorkspaceExist).mockResolvedValue(sourceWorkspaceId);
+    vi.mocked(getWorkspaceWithLanguages)
+      .mockResolvedValueOnce(mockSourceWorkspace)
+      .mockResolvedValueOnce(mockTargetWorkspace);
     vi.mocked(prisma.survey.create).mockResolvedValue(mockNewSurveyResult as any);
     vi.mocked(prisma.segment.findFirst).mockResolvedValue({ id: "existing_target_seg" } as any); // Segment with same title EXISTS
     vi.mocked(prisma.actionClass.findMany).mockResolvedValue([]);
+    vi.mocked(getQuotas).mockResolvedValue([]);
+    vi.mocked(getIsQuotasEnabled).mockResolvedValue(true);
+    vi.mocked(getOrganizationByWorkspaceId).mockResolvedValue({
+      billing: {},
+      id: "org_123",
+    } as any);
     const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(1234567890);
 
-    await copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId);
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
     expect(prisma.survey.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -742,7 +514,7 @@ describe("copySurveyToOtherEnvironment", () => {
               title: `Public Segment-1234567890`,
               isPrivate: false,
               filters: [],
-              environment: { connect: { id: targetEnvironmentId } },
+              workspace: { connect: { id: targetWorkspaceId } },
             },
           },
         }),
@@ -751,48 +523,52 @@ describe("copySurveyToOtherEnvironment", () => {
     dateNowSpy.mockRestore();
   });
 
-  test("should throw ResourceNotFoundError if source environment not found", async () => {
-    vi.mocked(doesEnvironmentExist).mockResolvedValueOnce(null);
+  test("should throw ResourceNotFoundError if source workspace not found", async () => {
+    vi.mocked(doesWorkspaceExist).mockResolvedValueOnce(null);
     await expect(
-      copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId)
-    ).rejects.toThrow(new ResourceNotFoundError("Environment", environmentId));
+      copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId)
+    ).rejects.toThrow(new ResourceNotFoundError("Workspace", sourceWorkspaceId));
   });
 
-  test("should throw ResourceNotFoundError if source project not found", async () => {
-    vi.mocked(getProjectWithLanguagesByEnvironmentId).mockReset().mockResolvedValueOnce(null);
+  test("should throw ResourceNotFoundError if source workspace with languages not found", async () => {
+    vi.mocked(getWorkspaceWithLanguages).mockReset().mockResolvedValueOnce(null);
     await expect(
-      copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId)
-    ).rejects.toThrow(new ResourceNotFoundError("Project", environmentId));
+      copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId)
+    ).rejects.toThrow(new ResourceNotFoundError("Workspace", sourceWorkspaceId));
   });
 
   test("should throw ResourceNotFoundError if existing survey not found", async () => {
     vi.mocked(prisma.survey.findUnique).mockResolvedValue(null);
     await expect(
-      copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId)
+      copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId)
     ).rejects.toThrow(new ResourceNotFoundError("Survey", surveyId));
   });
 
-  test("should throw ResourceNotFoundError if target environment not found (different env copy)", async () => {
-    vi.mocked(doesEnvironmentExist).mockResolvedValueOnce(environmentId).mockResolvedValueOnce(null);
+  test("should throw ResourceNotFoundError if target workspace not found (different workspace copy)", async () => {
+    vi.mocked(doesWorkspaceExist).mockResolvedValueOnce(sourceWorkspaceId).mockResolvedValueOnce(null);
+    vi.mocked(getWorkspaceWithLanguages).mockReset();
+    vi.mocked(getWorkspaceWithLanguages)
+      .mockResolvedValueOnce(mockSourceWorkspace)
+      .mockResolvedValueOnce(null);
     await expect(
-      copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId)
-    ).rejects.toThrow(new ResourceNotFoundError("Environment", targetEnvironmentId));
+      copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId)
+    ).rejects.toThrow(new ResourceNotFoundError("Workspace", targetWorkspaceId));
   });
 
   test("should throw DatabaseError on Prisma create error", async () => {
     const prismaError = makePrismaKnownError();
     vi.mocked(prisma.survey.create).mockRejectedValue(prismaError);
     await expect(
-      copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId)
+      copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId)
     ).rejects.toThrow(DatabaseError);
-    expect(logger.error).toHaveBeenCalledWith(prismaError, "Error copying survey to other environment");
+    expect(logger.error).toHaveBeenCalledWith(prismaError, "Error copying survey to other workspace");
   });
 
   test("should rethrow unknown error during copy", async () => {
     const unknownError = new Error("Some unknown error during copy");
     vi.mocked(prisma.survey.create).mockRejectedValue(unknownError);
     await expect(
-      copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId)
+      copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId)
     ).rejects.toThrow(unknownError);
   });
 
@@ -800,7 +576,7 @@ describe("copySurveyToOtherEnvironment", () => {
     const surveyWithoutLanguages = { ...mockExistingSurveyDetails, languages: [] };
     vi.mocked(prisma.survey.findUnique).mockResolvedValue(surveyWithoutLanguages as any);
 
-    await copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId);
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
     expect(prisma.survey.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -814,7 +590,7 @@ describe("copySurveyToOtherEnvironment", () => {
     const surveyWithoutTriggers = { ...mockExistingSurveyDetails, triggers: [] };
     vi.mocked(prisma.survey.findUnique).mockResolvedValue(surveyWithoutTriggers as any);
 
-    await copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId);
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
     expect(prisma.survey.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -825,7 +601,7 @@ describe("copySurveyToOtherEnvironment", () => {
   });
 
   test("should copy recontact options (displayOption, recontactDays, displayLimit)", async () => {
-    await copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId);
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
 
     expect(prisma.survey.create).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -847,7 +623,7 @@ describe("copySurveyToOtherEnvironment", () => {
     };
     vi.mocked(prisma.survey.findUnique).mockResolvedValue(surveyWithNullRecontact as any);
 
-    await copySurveyToOtherEnvironment(environmentId, surveyId, targetEnvironmentId, userId);
+    await copySurveyToOtherWorkspace(sourceWorkspaceId, surveyId, targetWorkspaceId, userId);
 
     expect(prisma.survey.create).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -858,5 +634,38 @@ describe("copySurveyToOtherEnvironment", () => {
         }),
       })
     );
+  });
+});
+
+describe("getWorkspaceSurveyCount", () => {
+  const workspaceId = "clq5n7p1q0000m7z0h5p6g3r3";
+
+  beforeEach(() => {
+    resetMocks();
+    vi.mocked(validateInputs).mockReturnValue([] as never);
+  });
+
+  test("counts archived surveys too, so an all-archived workspace is not empty", async () => {
+    vi.mocked(prisma.survey.count).mockResolvedValue(3 as never);
+
+    await expect(getWorkspaceSurveyCount(workspaceId)).resolves.toBe(3);
+    // No archivedAt narrowing: an archived survey still makes the workspace non-empty.
+    expect(prisma.survey.count).toHaveBeenCalledWith({ where: { workspaceId } });
+  });
+
+  test("returns 0 when the workspace has no surveys at all", async () => {
+    vi.mocked(prisma.survey.count).mockResolvedValue(0 as never);
+
+    await expect(getWorkspaceSurveyCount(workspaceId)).resolves.toBe(0);
+  });
+
+  test("throws DatabaseError on a Prisma known request error", async () => {
+    const prismaError = new Prisma.PrismaClientKnownRequestError("db down", {
+      code: "P2010",
+      clientVersion: "4.0.0",
+    });
+    vi.mocked(prisma.survey.count).mockRejectedValue(prismaError);
+
+    await expect(getWorkspaceSurveyCount(workspaceId)).rejects.toThrow(DatabaseError);
   });
 });

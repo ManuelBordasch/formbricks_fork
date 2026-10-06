@@ -1,5 +1,6 @@
 import { expect } from "@playwright/test";
 import { test } from "./lib/fixtures";
+import { createSurveyFromScratch } from "./utils/helper";
 
 test.describe("Survey Styling", async () => {
   // Shared Helpers
@@ -39,10 +40,11 @@ test.describe("Survey Styling", async () => {
     const user = await users.create();
     await user.login();
 
-    // Navigate to Look & Feel settings
-    await page.getByRole("link", { name: "Configuration" }).click();
-    await page.getByRole("link", { name: "Look & Feel" }).click();
-    await page.waitForURL(/\/environments\/[^/]+\/workspace\/look/);
+    // Navigate to Appearance settings
+    await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
+    const workspaceId = /\/workspaces\/([^/]+)\//.exec(page.url())?.[1];
+    await page.goto(`/workspaces/${workspaceId}/settings/workspace/look`);
+    await page.waitForURL(/\/workspaces\/[^/]+\/settings\/workspace\/look/);
 
     // Toggle "Enable custom styling"
     const addCustomStyles = page.getByLabel("Enable custom styling");
@@ -60,9 +62,9 @@ test.describe("Survey Styling", async () => {
     await setDimension(page, "Headline Font Size", "24");
     await setDimension(page, "Description Font Size", "18");
     await setDimension(page, "Headline Font Weight", "700");
-    await setColor(page, "Headline Label Color", "0000aa"); // Blue-ish
-    await setDimension(page, "Headline Label Font Size", "14");
-    await setDimension(page, "Headline Label Font Weight", "600");
+    await setColor(page, "Label Color", "0000aa"); // Blue-ish
+    await setDimension(page, "Label Font Size", "14");
+    await setDimension(page, "Label Font Weight", "600");
 
     // Verify Typography Variables
     await page.waitForTimeout(1000);
@@ -172,10 +174,11 @@ test.describe("Survey Styling", async () => {
     const user = await users.create();
     await user.login();
 
-    // Navigate to Look & Feel settings
-    await page.getByRole("link", { name: "Configuration" }).click();
-    await page.getByRole("link", { name: "Look & Feel" }).click();
-    await page.waitForURL(/\/environments\/[^/]+\/workspace\/look/);
+    // Navigate to Appearance settings
+    await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
+    const workspaceId = /\/workspaces\/([^/]+)\//.exec(page.url())?.[1];
+    await page.goto(`/workspaces/${workspaceId}/settings/workspace/look`);
+    await page.waitForURL(/\/workspaces\/[^/]+\/settings\/workspace\/look/);
 
     // Toggle "Enable custom styling"
     const addCustomStyles = page.getByLabel("Enable custom styling");
@@ -206,8 +209,8 @@ test.describe("Survey Styling", async () => {
     await setColor(page, "Brand color", "e11d48");
     await page.waitForTimeout(500);
 
-    // Click "Suggest colors" button
-    await page.getByRole("button", { name: "Suggest colors" }).click();
+    // Click "Suggest colors" button (the top-level one, not the disabled one inside FormStylingSettings)
+    await page.getByRole("button", { name: "Suggest colors" }).first().click();
 
     // Confirm the dialog
     await page.getByRole("button", { name: "Generate" }).click();
@@ -227,9 +230,8 @@ test.describe("Survey Styling", async () => {
     expect(css).toContain("--fb-input-background-color:");
     expect(css).not.toContain("--fb-input-background-color: #ffffff");
 
-    // Card/survey background should be brand-tinted, NOT hardcoded #ffffff
-    expect(css).toContain("--fb-survey-background-color:");
-    expect(css).not.toContain("--fb-survey-background-color: #ffffff");
+    // Card/survey background should always be white
+    expect(css).toContain("--fb-survey-background-color: #ffffff");
 
     // Question/heading color should be derived, NOT the old hardcoded #2b2524
     expect(css).toContain("--fb-heading-color:");
@@ -261,10 +263,11 @@ test.describe("Survey Styling", async () => {
     const user = await users.create();
     await user.login();
 
-    // Navigate to Look & Feel settings
-    await page.getByRole("link", { name: "Configuration" }).click();
-    await page.getByRole("link", { name: "Look & Feel" }).click();
-    await page.waitForURL(/\/environments\/[^/]+\/workspace\/look/);
+    // Navigate to Appearance settings
+    await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
+    const workspaceId = /\/workspaces\/([^/]+)\//.exec(page.url())?.[1];
+    await page.goto(`/workspaces/${workspaceId}/settings/workspace/look`);
+    await page.waitForURL(/\/workspaces\/[^/]+\/settings\/workspace\/look/);
 
     // Toggle "Enable custom styling"
     const addCustomStyles = page.getByLabel("Enable custom styling");
@@ -278,7 +281,7 @@ test.describe("Survey Styling", async () => {
     const css = await page.evaluate(() => document.getElementById("formbricks__css__custom")?.innerHTML);
     expect(css).toBeDefined();
 
-    // On initial load (no saved styling), button and progress bar should derive from brand color (#64748b)
+    // On initial load (no saved styling), button and progress bar should derive from brand color (#1e40af)
     // NOT from the old hardcoded dark navy (#0f172a)
     expect(css).not.toContain("--fb-button-bg-color: #0f172a");
     expect(css).not.toContain("--fb-progress-indicator-bg-color: #0f172a");
@@ -300,12 +303,9 @@ test.describe("Survey Styling", async () => {
   test("Survey Specific Styling (Survey Editor Override)", async ({ page, users }) => {
     const user = await users.create();
     await user.login();
-    await page.waitForURL(/\/environments\/[^/]+\/surveys/);
+    await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
 
-    // Create a new survey
-    await page.getByText("Start from scratch").click();
-    await page.getByRole("button", { name: "Create survey", exact: true }).click();
-    await page.waitForURL(/\/environments\/[^/]+\/surveys\/[^/]+\/edit$/);
+    await createSurveyFromScratch(page);
 
     // Ensure Welcome Card is active so we can see it
     await page.locator("p", { hasText: "Welcome card" }).first().click({ force: true });

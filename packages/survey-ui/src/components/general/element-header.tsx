@@ -1,12 +1,12 @@
-import DOMPurify from "isomorphic-dompurify";
 import * as React from "react";
 import { ElementMedia } from "@/components/general/element-media";
 import { Label } from "@/components/general/label";
-import { cn, stripInlineStyles } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 
 interface ElementHeaderProps extends React.ComponentProps<"div"> {
   headline: string;
   description?: string;
+  descriptionId?: string;
   required?: boolean;
   /** Custom label for the required indicator. Defaults to "Required" */
   requiredLabel?: string;
@@ -14,36 +14,25 @@ interface ElementHeaderProps extends React.ComponentProps<"div"> {
   imageUrl?: string;
   videoUrl?: string;
   imageAltText?: string;
+  /**
+   * Id placed on the headline element. For grouped questions (radio/checkbox/matrix) the
+   * surrounding native <fieldset> references this id via aria-labelledby instead of pointing
+   * a htmlFor at a non-input, which keeps the group name correct without nesting block content
+   * (media, etc.) inside a <legend> (invalid HTML).
+   */
+  headlineId?: string;
+  /**
+   * Heading level the element prompt is exposed at (WCAG 2.4.6). Defaults to 2: the survey name
+   * is the page's only h1, so every card prompt sits one level under it. A block that renders
+   * several elements gets sibling headings at the same level, never a nested run.
+   */
+  headingLevel?: 2 | 3;
 }
-
-/**
- * Checks if a string contains valid HTML markup
- * @param str - The input string to test
- * @returns true if the string contains valid HTML elements, false otherwise
- */
-const isValidHTML = (str: string): boolean => {
-  if (!str) return false;
-
-  try {
-    const doc = new DOMParser().parseFromString(str, "text/html");
-    const errorNode = doc.querySelector("parsererror");
-    if (errorNode) return false;
-    return Array.from(doc.body.childNodes).some((node) => node.nodeType === 1);
-  } catch {
-    return false;
-  }
-};
-
-/**
- * Strips inline style attributes to prevent CSP violations
- * Uses a safe regex pattern to avoid ReDoS (Regular Expression Denial of Service) vulnerabilities
- * @param html - The HTML string to clean
- * @returns HTML string without inline style attributes
- */
 
 function ElementHeader({
   headline,
   description,
+  descriptionId,
   required = false,
   requiredLabel = "Required",
   htmlFor,
@@ -51,20 +40,17 @@ function ElementHeader({
   imageUrl,
   videoUrl,
   imageAltText,
+  headlineId,
+  headingLevel = 2,
   ...props
 }: Readonly<ElementHeaderProps>): React.JSX.Element {
-  const isMediaAvailable = imageUrl ?? videoUrl;
-
-  // Check if headline is HTML
-  const strippedHeadline = stripInlineStyles(headline);
-  const isHeadlineHtml = isValidHTML(strippedHeadline);
-  const safeHeadlineHtml =
-    isHeadlineHtml && strippedHeadline
-      ? DOMPurify.sanitize(strippedHeadline, {
-          ADD_ATTR: ["target"],
-          FORBID_ATTR: ["style"],
-        })
-      : "";
+  const isMediaAvailable = Boolean(imageUrl) || Boolean(videoUrl);
+  // The heading WRAPS the Label rather than replacing it: the six call sites that pass `htmlFor`
+  // need the prompt to stay a real <label> bound to their input, the grouped questions need
+  // `headlineId` to stay on the element whose text names the fieldset via aria-labelledby, and
+  // user theming targets the `label-headline` class (styles.ts `addCustomThemeToDom`), not the tag.
+  // A <label> nested inside a heading is valid HTML and changes neither association.
+  const HeadingTag = `h${headingLevel.toString()}` as "h2" | "h3";
 
   return (
     <div className={cn("space-y-2", className)} {...props}>
@@ -75,23 +61,17 @@ function ElementHeader({
 
       {/* Headline */}
       <div>
-        <div>{required ? <span className="label-upper mb-[3px]">{requiredLabel}</span> : null}</div>
-        <div className="flex">
-          {isHeadlineHtml && safeHeadlineHtml ? (
-            <Label htmlFor={htmlFor} variant="headline">
-              {headline}
-            </Label>
-          ) : (
-            <Label htmlFor={htmlFor} variant="headline">
-              {headline}
-            </Label>
-          )}
-        </div>
+        <div>{required ? <span className="label-card mb-[3px]">{requiredLabel}</span> : null}</div>
+        <HeadingTag className="flex" data-slot="element-headline">
+          <Label htmlFor={htmlFor} id={headlineId} variant="headline">
+            {headline}
+          </Label>
+        </HeadingTag>
       </div>
 
       {/* Description/Subheader */}
       {description ? (
-        <Label htmlFor={htmlFor} variant="description">
+        <Label id={descriptionId} variant="description">
           {description}
         </Label>
       ) : null}

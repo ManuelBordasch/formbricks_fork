@@ -1,36 +1,32 @@
 /**
- * V3 API auth — session (browser) or API key with environment-scoped access.
+ * V3 API auth — session (browser) or API key with workspace-scoped access.
  */
-import { ApiKeyPermission } from "@prisma/client";
 import { logger } from "@formbricks/logger";
 import type { TAuthenticationApiKey } from "@formbricks/types/auth";
 import { AuthorizationError, ResourceNotFoundError } from "@formbricks/types/errors";
-import { checkAuthorizationUpdated } from "@/lib/utils/action-client/action-client-middleware";
-import type { TTeamPermission } from "@/modules/ee/teams/project-teams/types/team";
+import { type TAuthorizationActor, assertCan, can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationAction } from "@/lib/authorization/permission-action";
+import type { TTeamPermission } from "@/modules/ee/teams/workspace-teams/types/team";
 import { problemForbidden, problemUnauthorized } from "./response";
 import type { TV3Authentication } from "./types";
 import { type V3WorkspaceContext, resolveV3WorkspaceContext } from "./workspace-context";
 
-function apiKeyPermissionAllows(permission: ApiKeyPermission, minPermission: TTeamPermission): boolean {
-  const grantedRank = {
-    [ApiKeyPermission.read]: 1,
-    [ApiKeyPermission.write]: 2,
-    [ApiKeyPermission.manage]: 3,
-  }[permission];
+export const getV3AuthorizationActor = (authentication: TV3Authentication): TAuthorizationActor | null => {
+  if (authentication && "user" in authentication && authentication.user?.id) {
+    return { type: "user", id: authentication.user.id };
+  }
 
-  const requiredRank = {
-    read: 1,
-    readWrite: 2,
-    manage: 3,
-  }[minPermission];
+  if (authentication && "apiKeyId" in authentication && authentication.apiKeyId) {
+    return { type: "apiKey", id: authentication.apiKeyId };
+  }
 
-  return grantedRank >= requiredRank;
-}
+  return null;
+};
 
 /**
  * Require session and workspace access. workspaceId is resolved via the V3 workspace-context layer.
  * Returns a Response (401 or 403) on failure, or the resolved workspace context on success so callers
- * use internal IDs (environmentId, projectId, organizationId) without resolving again.
+ * use internal IDs (workspaceId, organizationId) without resolving again.
  * We use 403 (not 404) when the workspace is not found to avoid leaking resource existence.
  */
 export async function requireSessionWorkspaceAccess(
@@ -52,17 +48,12 @@ export async function requireSessionWorkspaceAccess(
   const log = logger.withContext({ requestId, workspaceId });
 
   try {
-    // Resolve workspaceId → environmentId, projectId, organizationId (single place to change when Workspace exists).
+    // Resolve workspaceId → workspaceId, organizationId (single place to change when Workspace exists).
     const context = await resolveV3WorkspaceContext(workspaceId);
 
-    // Org + project-team access; we use internal IDs from context.
-    await checkAuthorizationUpdated({
-      userId,
-      organizationId: context.organizationId,
-      access: [
-        { type: "organization", roles: ["owner", "manager"] },
-        { type: "projectTeam", projectId: context.projectId, minPermission },
-      ],
+    await assertCan({ type: "user", id: userId }, getWorkspaceAuthorizationAction(minPermission), {
+      type: "workspace",
+      id: context.workspaceId,
     });
 
     return context;
@@ -93,16 +84,18 @@ export async function requireV3WorkspaceAccess(
   }
 
   const keyAuth = authentication as TAuthenticationApiKey;
-  if (keyAuth.apiKeyId && Array.isArray(keyAuth.environmentPermissions)) {
+  if (keyAuth.apiKeyId && Array.isArray(keyAuth.workspacePermissions)) {
     const log = logger.withContext({ requestId, workspaceId, apiKeyId: keyAuth.apiKeyId });
 
     try {
       const context = await resolveV3WorkspaceContext(workspaceId);
-      const permission = keyAuth.environmentPermissions.find(
-        (environmentPermission) => environmentPermission.environmentId === context.environmentId
+      const allowed = await can(
+        { type: "apiKey", id: keyAuth.apiKeyId },
+        getWorkspaceAuthorizationAction(minPermission),
+        { type: "workspace", id: context.workspaceId }
       );
 
-      if (!permission || !apiKeyPermissionAllows(permission.permission, minPermission)) {
+      if (!allowed) {
         log.warn({ statusCode: 403 }, "API key not allowed for workspace");
         return problemForbidden(requestId, "You are not authorized to access this resource", instance);
       }

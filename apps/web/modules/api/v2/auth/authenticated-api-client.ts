@@ -1,3 +1,4 @@
+import { TAuthenticationApiKey } from "@formbricks/types/auth";
 import { buildAuditLogBaseObject } from "@/app/lib/api/with-api-logging";
 import { handleApiError, logApiRequest } from "@/modules/api/v2/lib/utils";
 import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
@@ -12,6 +13,8 @@ export const authenticatedApiClient = async <S extends ExtendedSchemas>({
   handler,
   action,
   targetType,
+  bodyTransform,
+  allowOrganizationOnlyApiKey = false,
 }: {
   request: Request;
   schemas?: S;
@@ -20,6 +23,15 @@ export const authenticatedApiClient = async <S extends ExtendedSchemas>({
   handler: HandlerFn<ParsedSchemas<S>>;
   action?: TAuditAction;
   targetType?: TAuditTarget;
+  bodyTransform?: (
+    body: Record<string, unknown>,
+    auth: TAuthenticationApiKey
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  /**
+   * Forwarded to {@link apiWrapper}. Set to true on organization-scoped endpoints so API
+   * keys with only organization access (no workspace permissions) can authenticate.
+   */
+  allowOrganizationOnlyApiKey?: boolean;
 }): Promise<Response> => {
   try {
     const auditLog =
@@ -32,6 +44,8 @@ export const authenticatedApiClient = async <S extends ExtendedSchemas>({
       rateLimit,
       handler,
       auditLog,
+      bodyTransform,
+      allowOrganizationOnlyApiKey,
     });
 
     if (response.ok) {

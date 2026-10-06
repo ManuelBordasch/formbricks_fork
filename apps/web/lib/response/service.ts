@@ -1,10 +1,12 @@
 import "server-only";
-import { Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
 import { z } from "zod";
 import { prisma } from "@formbricks/database";
-import { logger } from "@formbricks/logger";
+import { Prisma } from "@formbricks/database/prisma";
+import { PrismaErrorType } from "@formbricks/database/types/error";
 import { ZId, ZOptionalNumber, ZString } from "@formbricks/types/common";
+import { type TIngestFlag, mergeIngestFlags } from "@formbricks/types/embedded-data-ingest";
+import { type TEmbeddedValueResponse } from "@formbricks/types/embedded-data-resolver";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
 import {
   TResponse,
@@ -15,31 +17,37 @@ import {
   ZResponseFilterCriteria,
   ZResponseUpdateInput,
 } from "@formbricks/types/responses";
-import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
 import { TSurvey } from "@formbricks/types/surveys/types";
 import { TTag } from "@formbricks/types/tags";
-import { getElementsFromBlocks } from "@/lib/survey/utils";
 import { getIsQuotasEnabled } from "@/modules/ee/license-check/lib/utils";
 import { reduceQuotaLimits } from "@/modules/ee/quotas/lib/quotas";
-import { deleteFile } from "@/modules/storage/service";
-import { resolveStorageUrlsInObject } from "@/modules/storage/utils";
-import { getOrganizationIdFromEnvironmentId } from "@/modules/survey/lib/organization";
+import { deleteResponseFileUrls } from "@/modules/storage/lib/delete-response-files";
+import {
+  collectResponseFileUrls,
+  getSurveyFileUploadElementIds,
+  resolveStorageUrlsInObject,
+} from "@/modules/storage/utils";
+import { getOrganizationIdFromWorkspaceId } from "@/modules/survey/lib/organization";
 import { getOrganizationBilling } from "@/modules/survey/lib/survey";
 import { ITEMS_PER_PAGE } from "../constants";
 import { deleteDisplay } from "../display/service";
+import { getOrganization } from "../organization/service";
 import { getSurvey } from "../survey/service";
 import { convertToCsv, convertToXlsxBuffer } from "../utils/file-conversion";
 import { validateInputs } from "../utils/validate";
 import {
-  buildWhereClause,
   calculateTtcTotal,
   extractSurveyDetails,
   getResponseContactAttributes,
   getResponseHiddenFields,
   getResponseMeta,
+  getResponseReservedFilterValues,
+  getResponseVariableFilterValues,
   getResponsesFileName,
   getResponsesJson,
+  normalizeResponseLanguage,
 } from "./utils";
+import { buildWhereClause } from "./where-clause";
 
 const RESPONSES_PER_PAGE = 10;
 
@@ -74,7 +82,7 @@ export const responseSelection = {
           createdAt: true,
           updatedAt: true,
           name: true,
-          environmentId: true,
+          workspaceId: true,
         },
       },
     },
@@ -93,14 +101,28 @@ export const getResponseContact = (
   };
 };
 
+const mapResponsePrismaToResponse = (
+  responsePrisma: Prisma.ResponseGetPayload<{ select: typeof responseSelection }>
+): TResponse => ({
+  ...responsePrisma,
+  contact: getResponseContact(responsePrisma),
+  tags: responsePrisma.tags.map((tagPrisma: { tag: TTag }) => tagPrisma.tag),
+});
+
+/**
+ * Scoped by workspace on purpose: this feeds the contact detail page, which is reached through a
+ * workspace id in the URL. A contact id alone is not a tenant boundary, so the responses are
+ * filtered through the workspace of the contact they belong to.
+ */
 export const getResponsesByContactId = reactCache(
-  async (contactId: string, page?: number): Promise<TResponseWithQuotas[]> => {
-    validateInputs([contactId, ZId], [page, ZOptionalNumber]);
+  async (contactId: string, workspaceId: string, page?: number): Promise<TResponseWithQuotas[]> => {
+    validateInputs([contactId, ZId], [workspaceId, ZId], [page, ZOptionalNumber]);
 
     try {
       const responsePrisma = await prisma.response.findMany({
         where: {
           contactId,
+          contact: { workspaceId },
         },
         select: {
           ...responseSelection,
@@ -172,13 +194,7 @@ export const getResponseBySingleUseId = reactCache(
         return null;
       }
 
-      const response: TResponse = {
-        ...responsePrisma,
-        contact: getResponseContact(responsePrisma),
-        tags: responsePrisma.tags.map((tagPrisma: { tag: TTag }) => tagPrisma.tag),
-      };
-
-      return response;
+      return mapResponsePrismaToResponse(responsePrisma);
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError) {
         throw new DatabaseError(error.message);
@@ -204,13 +220,7 @@ export const getResponse = reactCache(async (responseId: string): Promise<TRespo
       return null;
     }
 
-    const response: TResponse = {
-      ...responsePrisma,
-      contact: getResponseContact(responsePrisma),
-      tags: responsePrisma.tags.map((tagPrisma: { tag: TTag }) => tagPrisma.tag),
-    };
-
-    return response;
+    return mapResponsePrismaToResponse(responsePrisma);
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
       throw new DatabaseError(error.message);
@@ -219,6 +229,86 @@ export const getResponse = reactCache(async (responseId: string): Promise<TRespo
     throw error;
   }
 });
+
+export const getResponseWithQuotas = reactCache(
+  async (responseId: string): Promise<TResponseWithQuotas | null> => {
+    validateInputs([responseId, ZId]);
+
+    try {
+      const responsePrisma = await prisma.response.findUnique({
+        where: {
+          id: responseId,
+        },
+        select: {
+          ...responseSelection,
+          quotaLinks: {
+            where: { status: "screenedIn" },
+            include: { quota: { select: { id: true, name: true } } },
+          },
+        },
+      });
+
+      if (!responsePrisma) {
+        return null;
+      }
+
+      const { quotaLinks, ...rest } = responsePrisma;
+      return {
+        ...mapResponsePrismaToResponse(rest),
+        quotas: quotaLinks.map((ql) => ql.quota),
+      };
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError) {
+        throw new DatabaseError(error.message);
+      }
+
+      throw error;
+    }
+  }
+);
+
+export const getResponseSnapshotForPipeline = async (responseId: string): Promise<TResponse | null> => {
+  validateInputs([responseId, ZId]);
+
+  try {
+    const responsePrisma = await prisma.response.findUnique({
+      where: {
+        id: responseId,
+      },
+      select: responseSelection,
+    });
+
+    if (!responsePrisma) {
+      return null;
+    }
+
+    return mapResponsePrismaToResponse(responsePrisma);
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      throw new DatabaseError(error.message);
+    }
+
+    throw error;
+  }
+};
+
+// The full TEmbeddedValueResponse shape, so reserved values run through the shared projection
+// (redactQuery, type coercion) instead of raw meta reads (ENG-1848). Kept as a named selection so
+// the row type stays checked against TEmbeddedValueResponse — a field added there without being
+// selected here must fail the build, not read undefined at runtime.
+const filteringValuesSelection = {
+  id: true,
+  surveyId: true,
+  createdAt: true,
+  updatedAt: true,
+  finished: true,
+  language: true,
+  data: true,
+  variables: true,
+  ttc: true,
+  meta: true,
+  contactAttributes: true,
+} satisfies Prisma.ResponseSelect;
 
 export const getResponseFilteringValues = reactCache(async (surveyId: string) => {
   validateInputs([surveyId, ZId]);
@@ -233,18 +323,17 @@ export const getResponseFilteringValues = reactCache(async (surveyId: string) =>
       where: {
         surveyId,
       },
-      select: {
-        data: true,
-        meta: true,
-        contactAttributes: true,
-      },
+      select: filteringValuesSelection,
     });
 
+    const embeddedValueResponses: TEmbeddedValueResponse[] = responses;
     const contactAttributes = getResponseContactAttributes(responses);
     const meta = getResponseMeta(responses);
     const hiddenFields = getResponseHiddenFields(survey, responses);
+    const reservedValues = getResponseReservedFilterValues(survey, embeddedValueResponses);
+    const variableValues = getResponseVariableFilterValues(survey, embeddedValueResponses);
 
-    return { contactAttributes, meta, hiddenFields };
+    return { contactAttributes, meta, hiddenFields, reservedValues, variableValues };
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
       throw new DatabaseError(error.message);
@@ -316,17 +405,15 @@ export const getResponses = reactCache(
         skip: offset,
       });
 
-      const transformedResponses: TResponseWithQuotas[] = await Promise.all(
-        responses.map((responsePrisma) => {
-          const { quotaLinks, ...response } = responsePrisma;
-          return {
-            ...response,
-            contact: getResponseContact(responsePrisma),
-            tags: responsePrisma.tags.map((tagPrisma: { tag: TTag }) => tagPrisma.tag),
-            quotas: quotaLinks.map((quotaLinkPrisma) => quotaLinkPrisma.quota),
-          };
-        })
-      );
+      const transformedResponses: TResponseWithQuotas[] = responses.map((responsePrisma) => {
+        const { quotaLinks, ...response } = responsePrisma;
+        return {
+          ...response,
+          contact: getResponseContact(responsePrisma),
+          tags: responsePrisma.tags.map((tagPrisma: { tag: TTag }) => tagPrisma.tag),
+          quotas: quotaLinks.map((quotaLinkPrisma) => quotaLinkPrisma.quota),
+        };
+      });
 
       return transformedResponses;
     } catch (error) {
@@ -376,12 +463,15 @@ export const getResponseDownloadFile = async (
       responses
     );
 
-    const organizationId = await getOrganizationIdFromEnvironmentId(survey.environmentId);
+    const organizationId = await getOrganizationIdFromWorkspaceId(survey.workspaceId);
     if (!organizationId) {
       throw new ResourceNotFoundError("Organization", null);
     }
 
-    const organizationBilling = await getOrganizationBilling(organizationId);
+    const [organizationBilling, organization] = await Promise.all([
+      getOrganizationBilling(organizationId),
+      getOrganization(organizationId),
+    ]);
 
     if (!organizationBilling) {
       throw new ResourceNotFoundError("OrganizationBilling", organizationId);
@@ -402,7 +492,7 @@ export const getResponseDownloadFile = async (
       ...elements.flat(),
       ...variables,
       ...hiddenFields,
-      ...userAttributes,
+      ...userAttributes.map((attribute) => `person.${attribute}`),
     ];
 
     if (survey.isVerifyEmailEnabled) {
@@ -415,7 +505,8 @@ export const getResponseDownloadFile = async (
       elements,
       userAttributes,
       hiddenFields,
-      isQuotasAllowed
+      isQuotasAllowed,
+      organization?.displayTimeZone ?? "UTC"
     );
 
     const fileName = getResponsesFileName(survey?.name || "", format);
@@ -441,15 +532,15 @@ export const getResponseDownloadFile = async (
   }
 };
 
-export const getResponsesByEnvironmentId = reactCache(
-  async (environmentId: string, limit?: number, offset?: number): Promise<TResponse[]> => {
-    validateInputs([environmentId, ZId], [limit, ZOptionalNumber], [offset, ZOptionalNumber]);
+export const getResponsesByWorkspaceId = reactCache(
+  async (workspaceId: string, limit?: number, offset?: number): Promise<TResponse[]> => {
+    validateInputs([workspaceId, ZId], [limit, ZOptionalNumber], [offset, ZOptionalNumber]);
 
     try {
       const responses = await prisma.response.findMany({
         where: {
           survey: {
-            environmentId,
+            workspaceId,
           },
         },
         select: responseSelection,
@@ -483,10 +574,20 @@ export const getResponsesByEnvironmentId = reactCache(
   }
 );
 
+/**
+ * `ingestFlags` is the Embedded Data ingest contract's verdict on `responseInput.data` (ENG-1845),
+ * computed server-side by the caller and passed separately so it can never arrive from the client.
+ *
+ * Omitting it leaves the stored column untouched — the authenticated management routes update a
+ * response without running the contract, and must not clear what a client ingest wrote. Passing it
+ * unions by key: a key this payload rewrote takes its new verdict, including none at all, so a value
+ * corrected on a later block stops being flagged.
+ */
 export const updateResponse = async (
   responseId: string,
   responseInput: TResponseUpdateInput,
-  tx?: Prisma.TransactionClient
+  tx?: Prisma.TransactionClient,
+  ingestFlags?: readonly TIngestFlag[]
 ): Promise<TResponse> => {
   validateInputs([responseId, ZId], [responseInput, ZResponseUpdateInput]);
   try {
@@ -496,7 +597,10 @@ export const updateResponse = async (
       where: {
         id: responseId,
       },
-      select: responseSelection,
+      // `ingestFlags` is read here and nowhere else: it is not part of `responseSelection`, so it
+      // stays off every response this module returns rather than riding along into API payloads that
+      // never declared it.
+      select: { ...responseSelection, ingestFlags: true },
     });
 
     if (!currentResponse) {
@@ -518,11 +622,19 @@ export const updateResponse = async (
       : currentTtc;
     // Calculate total only when finished
     const ttc = responseInput.finished ? calculateTtcTotal(mergedTtc) : mergedTtc;
-    const language = responseInput.language;
+    // Canonicalize on write (ENG-1067), same as response creation — see normalizeResponseLanguage.
+    const language = normalizeResponseLanguage(responseInput.language);
     const variables = {
       ...currentResponse.variables,
       ...responseInput.variables,
     };
+    const mergedIngestFlags =
+      ingestFlags === undefined
+        ? undefined
+        : mergeIngestFlags(currentResponse.ingestFlags ?? [], {
+            data: responseInput.data ?? {},
+            flags: ingestFlags,
+          });
 
     const responsePrisma = await prismaClient.response.update({
       where: {
@@ -535,6 +647,9 @@ export const updateResponse = async (
         ttc,
         language,
         variables,
+        // Written whenever the contract ran, empty included — see `buildPrismaResponseData` for why
+        // `null` has to stay reserved for "no ingest boundary has written this".
+        ...(mergedIngestFlags !== undefined && { ingestFlags: mergedIngestFlags }),
       },
       select: responseSelection,
     });
@@ -548,6 +663,13 @@ export const updateResponse = async (
     return response;
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      if (
+        error.code === PrismaErrorType.RelatedRecordNotFound ||
+        error.code === PrismaErrorType.RecordNotFound
+      ) {
+        throw new ResourceNotFoundError("Response", responseId);
+      }
+
       throw new DatabaseError(error.message);
     }
 
@@ -556,32 +678,9 @@ export const updateResponse = async (
 };
 
 const findAndDeleteUploadedFilesInResponse = async (response: TResponse, survey: TSurvey): Promise<void> => {
-  const elements = getElementsFromBlocks(survey.blocks);
+  const fileUrls = collectResponseFileUrls(response.data, getSurveyFileUploadElementIds(survey));
 
-  const fileUploadElements = new Set(
-    elements.filter((element) => element.type === TSurveyElementTypeEnum.FileUpload).map((q) => q.id)
-  );
-
-  const fileUrls = Object.entries(response.data)
-    .filter(([elementId]) => fileUploadElements.has(elementId))
-    .flatMap(([, elementResponse]) => elementResponse as string[]);
-
-  const deletionPromises = fileUrls.map(async (fileUrl) => {
-    try {
-      const { pathname } = new URL(fileUrl);
-      const [, environmentId, accessType, fileName] = pathname.split("/").filter(Boolean);
-
-      if (!environmentId || !accessType || !fileName) {
-        throw new Error(`Invalid file path: ${pathname}`);
-      }
-
-      return deleteFile(environmentId, accessType as "private" | "public", fileName);
-    } catch (error) {
-      logger.error(error, `Failed to delete file ${fileUrl}`);
-    }
-  });
-
-  await Promise.all(deletionPromises);
+  await deleteResponseFileUrls(fileUrls, survey.workspaceId);
 };
 
 export const deleteResponse = async (

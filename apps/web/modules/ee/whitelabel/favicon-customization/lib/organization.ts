@@ -1,6 +1,6 @@
 import "server-only";
-import { Prisma } from "@prisma/client";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { PrismaErrorType } from "@formbricks/database/types/error";
 import { ZId, ZStorageUrl } from "@formbricks/types/common";
 import { ResourceNotFoundError } from "@formbricks/types/errors";
@@ -39,7 +39,7 @@ export const updateOrganizationFaviconUrl = async (
   } catch (error) {
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
-      error.code === PrismaErrorType.RecordDoesNotExist
+      error.code === PrismaErrorType.RecordNotFound
     ) {
       throw new ResourceNotFoundError("Organization", organizationId);
     }

@@ -1,12 +1,12 @@
 "use client";
 
-import { ActionClass } from "@prisma/client";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ActionClass } from "@formbricks/database/prisma-browser";
 import { TSurvey } from "@formbricks/types/surveys/types";
-import { ACTION_TYPE_ICON_LOOKUP } from "@/modules/projects/settings/(setup)/app-connection/utils";
 import { ActionClassInfo } from "@/modules/ui/components/action-class-info";
 import { Input } from "@/modules/ui/components/input";
+import { ACTION_TYPE_ICON_LOOKUP } from "@/modules/workspaces/settings/(setup)/app-connection/utils";
 
 interface SavedActionsTabProps {
   actionClasses: ActionClass[];
@@ -69,17 +69,18 @@ export const SavedActionsTab = ({
           (actions, i) =>
             actions.length > 0 && (
               <div key={i} className="me-4">
-                <h2 className="mb-2 mt-4 font-semibold">
+                <h2 className="mt-4 mb-2 font-semibold">
                   {i === 0 ? t("common.no_code") : t("common.code")}
                 </h2>
                 <div className="flex flex-col gap-2">
                   {actions.map((action) => (
                     <button
+                      type="button"
                       key={action.id}
                       className="flex cursor-pointer flex-col items-start rounded-md border border-slate-300 bg-white px-4 py-2 hover:bg-slate-100"
                       onClick={() => handleActionClick(action)}>
                       <div className="mt-1 flex items-center">
-                        <div className="mr-1.5 h-4 w-4 text-slate-600">
+                        <div className="mr-1.5 size-4 text-slate-600">
                           {ACTION_TYPE_ICON_LOOKUP[action.type]}
                         </div>
                         <h4 className="text-sm font-semibold text-slate-600">{action.name}</h4>

@@ -9,9 +9,14 @@ export const getSurveyQuestions = reactCache(async (surveyId: string) => {
         id: surveyId,
       },
       select: {
-        environmentId: true,
         questions: true,
         blocks: true,
+        workspaceId: true,
+        // Not a question, like `workspaceId` above: the response routes need the survey's
+        // "Anonymize responses" setting to suppress the sensitive `meta` a management caller may have
+        // sent, and this is the survey read they already make. One more column on an existing
+        // `reactCache`d query rather than a second round trip per response.
+        isAnonymizeResponsesEnabled: true,
       },
     });
 

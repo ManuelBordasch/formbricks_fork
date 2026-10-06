@@ -7,20 +7,19 @@ test.describe("Invite, accept and remove organization member", async () => {
     const user = await users.create();
     await user.login();
 
-    await page.waitForURL(/\/environments\/[^/]+\/surveys/);
+    await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
   });
 
   test("Invite organization member", async ({ page }) => {
+    const inviteEmail = `org-invite-${Date.now()}@formbricks.com`;
+
     await test.step("Invite User", async () => {
-      const organizationDropdownTrigger = page.locator("#organizationDropdownTrigger");
-      await expect(organizationDropdownTrigger).toBeVisible();
-      await organizationDropdownTrigger.click();
-      await page.getByRole("menuitemcheckbox", { name: "General" }).click();
-      await page.waitForURL(/\/environments\/[^/]+\/settings\/general/);
+      const workspaceId = /\/workspaces\/([^/]+)\//.exec(page.url())?.[1];
+      // Old workspace-scoped org settings URL is redirected to the org-scoped route.
+      await page.goto(`/workspaces/${workspaceId}/settings/organization/teams`);
+      await page.waitForURL(/\/organizations\/[^/]+\/settings\/teams/);
 
       await page.locator('[data-testid="members-loading-card"]:first-child').waitFor({ state: "hidden" });
-
-      await page.getByRole("link", { name: "Members & Teams" }).click();
 
       // Add member button
       await expect(page.getByRole("button", { name: "Invite member" })).toBeVisible();
@@ -31,26 +30,22 @@ test.describe("Invite, accept and remove organization member", async () => {
       await page.getByLabel("Full Name").fill(invites.addMember.name);
 
       await expect(page.getByLabel("Email")).toBeVisible();
-      await page.getByLabel("Email").fill(invites.addMember.email);
+      await page.getByLabel("Email").fill(inviteEmail);
 
       await page.getByRole("button", { name: "Invite", exact: true }).click();
 
-      await page.waitForTimeout(5000);
-
-      // const successToast = await page.waitForSelector(".formbricks__toast__success");
-      // expect(successToast).toBeTruthy();
+      await expect(page.locator(".formbricks__toast__success")).toBeVisible({ timeout: 15000 });
     });
 
     await test.step("Copy invite Link", async () => {
       await expect(page.locator("#membersInfoWrapper")).toBeVisible();
 
-      const lastMemberInfo = page.locator("#membersInfoWrapper > #singleMemberInfo:last-child");
-      await expect(lastMemberInfo).toBeVisible();
+      const invitedMemberInfo = page.locator("#singleMemberInfo").filter({ hasText: inviteEmail });
+      await expect(invitedMemberInfo).toBeVisible({ timeout: 10000 });
 
-      const pendingSpan = lastMemberInfo.locator("span").locator("span").filter({ hasText: "Pending" });
-      await expect(pendingSpan).toBeVisible();
+      await expect(invitedMemberInfo.getByText("Pending", { exact: true })).toBeVisible();
 
-      const shareInviteButton = page.locator("#shareInviteButton").last();
+      const shareInviteButton = invitedMemberInfo.locator("#shareInviteButton");
       await expect(shareInviteButton).toBeVisible();
 
       await shareInviteButton.click();
@@ -78,14 +73,14 @@ test.describe("Invite, accept and remove organization member", async () => {
   //   await page.getByRole("link", { name: "Create account" }).click();
 
   //   await signupUsingInviteToken(page, name, email, name);
-  //   await page.waitForURL(/\/environments\/[^/]+\/surveys/);
+  //   await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
   // });
 
   // test("Remove member", async ({ page }) => {
   //   await apiLogin(page, email, name);
 
   //   await page.goto("/");
-  //   await page.waitForURL(/\/environments\/[^/]+\/surveys/);
+  //   await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
 
   //   const dropdownTrigger = page.locator("#userDropdownTrigger");
   //   await expect(dropdownTrigger).toBeVisible();
@@ -96,7 +91,7 @@ test.describe("Invite, accept and remove organization member", async () => {
 
   //   await page.getByRole("link", { name: "Organization" }).click();
 
-  //   await page.waitForURL(/\/environments\/[^/]+\/settings\/members/);
+  //   await page.waitForURL(/\/workspaces\/[^/]+\/settings\/members/);
 
   //   await page.locator('[data-testid="members-loading-card"]:first-child').waitFor({ state: "hidden" });
 
@@ -120,25 +115,19 @@ test.describe("Create, update and delete team", async () => {
     const user = await users.create();
     await user.login();
 
-    await page.waitForURL(/\/environments\/[^/]+\/surveys/);
+    await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
   });
 
   test("Create and update team", async ({ page }) => {
-    const organizationDropdownTrigger = page.locator("#organizationDropdownTrigger");
-    await expect(organizationDropdownTrigger).toBeVisible();
-    await organizationDropdownTrigger.click();
-    await page.getByRole("menuitemcheckbox", { name: "General" }).click();
-    await page.waitForURL(/\/environments\/[^/]+\/settings\/general/);
-
-    await page.waitForTimeout(2000);
-    await expect(page.getByText("Members & Teams")).toBeVisible();
-    await page.getByText("Members & Teams").click();
-    await page.waitForURL(/\/environments\/[^/]+\/settings\/teams/);
+    const workspaceId = /\/workspaces\/([^/]+)\//.exec(page.url())?.[1];
+    // Old workspace-scoped org settings URL is redirected to the org-scoped route.
+    await page.goto(`/workspaces/${workspaceId}/settings/organization/teams`);
+    await page.waitForURL(/\/organizations\/[^/]+\/settings\/teams/);
     await expect(page.getByRole("button", { name: "Create new team" })).toBeVisible();
     await page.getByRole("button", { name: "Create new team" }).click();
     await page.locator("#team-name").fill("E2E");
     await page.getByRole("button", { name: "Create" }).click();
-    await expect(page.locator("#E2E")).toBeVisible();
+    await expect(page.getByTestId("team-row").filter({ hasText: "E2E" })).toBeVisible();
 
     await page.getByRole("button", { name: "Manage team" }).click();
 
@@ -149,7 +138,7 @@ test.describe("Create, update and delete team", async () => {
     await page.locator("#member-select-0").click();
     await page.locator('[data-slot="command-item"]').first().click();
 
-    await page.locator("#project-select-0").click();
+    await page.locator("#workspace-select-0").click();
     await page.locator('[data-slot="command-item"]').first().click();
 
     await page.getByRole("button", { name: "Save" }).click();
@@ -166,7 +155,7 @@ test.describe("Create, update and delete team", async () => {
 
     await page.getByRole("button", { name: "Delete", exact: true }).click();
 
-    await expect(page.getByRole("heading", { name: "Organization Settings" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Teams", level: 1 })).toBeVisible();
 
     await expect(page.getByRole("cell", { name: "E2E Updated" })).not.toBeVisible();
   });

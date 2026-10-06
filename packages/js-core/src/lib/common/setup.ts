@@ -1,20 +1,20 @@
-/* eslint-disable no-console -- required for logging */
 import { Config } from "@/lib/common/config";
 import { JS_LOCAL_STORAGE_KEY } from "@/lib/common/constants";
 import { addCleanupEventListeners, addEventListeners } from "@/lib/common/event-listeners";
+import { FORMBRICKS_EVENTS, emitFormbricksEvent } from "@/lib/common/events";
 import { Logger } from "@/lib/common/logger";
 import { getIsSetup, setIsSetup } from "@/lib/common/status";
 import { filterSurveys, getIsDebug, isNowExpired, wrapThrows } from "@/lib/common/utils";
-import { fetchEnvironmentState } from "@/lib/environment/state";
-import { closeSurvey, preloadSurveysScript } from "@/lib/survey/widget";
+import { addLiveRegionContainer, closeSurvey, prefetchSurveysScript } from "@/lib/survey/widget";
 import { DEFAULT_USER_STATE_NO_USER_ID } from "@/lib/user/state";
 import { sendUpdatesToBackend } from "@/lib/user/update";
+import { fetchWorkspaceState } from "@/lib/workspace/state";
 import {
   type TConfig,
   type TConfigInput,
-  type TEnvironmentState,
   type TLegacyConfig,
   type TUserState,
+  type TWorkspaceState,
 } from "@/types/config";
 import {
   type MissingFieldError,
@@ -25,41 +25,86 @@ import {
   okVoid,
 } from "@/types/error";
 
-const migrateLocalStorage = (): { changed: boolean; newState?: TConfig } => {
+const migrateLocalStorage = (): { changed: boolean; newState?: TLegacyConfig } => {
   const existingConfig = localStorage.getItem(JS_LOCAL_STORAGE_KEY);
 
   if (existingConfig) {
-    const parsedConfig = JSON.parse(existingConfig) as TLegacyConfig;
+    let parsedConfig = JSON.parse(existingConfig) as TLegacyConfig;
+    let changed = false;
 
-    // Check if we need to migrate (if it has environmentState, it's old format)
-    if (parsedConfig.environmentState) {
-      const { apiHost, environmentState, personState, attributes, ...rest } = parsedConfig;
+    // Migrate intermediate format: environmentId → workspaceId, environment → workspace
+    if (parsedConfig.environmentId ?? parsedConfig.environment) {
+      const { environmentId, environment, ...rest } = parsedConfig;
+      const workspace = environment
+        ? (() => {
+            const envData = environment.data as unknown as Record<string, unknown>;
+            const migratedData = { ...envData };
 
-      // Create new config structure
-      const newLocalStorageConfig: TConfig = {
+            if (migratedData.project) {
+              migratedData.settings = migratedData.project;
+              delete migratedData.project;
+            }
+
+            if (migratedData.workspace) {
+              migratedData.settings = migratedData.workspace;
+              delete migratedData.workspace;
+            }
+            return { ...environment, data: migratedData };
+          })()
+        : undefined;
+
+      parsedConfig = {
         ...rest,
-        ...(apiHost && { appUrl: apiHost }),
-        environment: environmentState,
-        ...(personState && {
-          user: {
-            ...personState,
-            data: {
-              ...personState.data,
-              // Copy over language from attributes if it exists
-              ...(attributes?.language && { language: attributes.language as string }),
-            },
-          },
-        }),
-      };
+        workspaceId: environmentId ?? (rest as unknown as TConfig).workspaceId,
+        ...(workspace && { workspace }),
+      } as TLegacyConfig;
+      changed = true;
+    }
 
-      return {
-        changed: true,
-        newState: newLocalStorageConfig,
-      };
+    if (changed) {
+      return { changed: true, newState: parsedConfig };
     }
   }
 
   return { changed: false };
+};
+
+/**
+ * Rebuild a legacy `user` into a complete `TUserState`.
+ *
+ * A legacy blob is unchecked JSON: `data` can be absent, or present with missing fields or wrong
+ * types. Spreading it over the default is not enough on its own — a spread only fills keys that are
+ * absent, so a stored `displays: null` would win over the default and reach `filterSurveys`, which
+ * calls `.filter` on it. The three fields it destructures as arrays are therefore type-checked.
+ *
+ * A repaired state is marked already-expired rather than trusted, because a half-empty one is not
+ * merely incomplete, it is wrong: an identified user completed to `segments: []` is filtered down
+ * to no surveys at all. Expiring it makes setup re-sync instead of rendering nothing.
+ */
+const completeLegacyUserState = (legacyUser: TLegacyConfig["user"]): TUserState => {
+  const legacyData = legacyUser?.data;
+
+  if (!legacyData) {
+    return DEFAULT_USER_STATE_NO_USER_ID;
+  }
+
+  const defaults = DEFAULT_USER_STATE_NO_USER_ID.data;
+  const wasRepaired =
+    !Array.isArray(legacyData.segments) ||
+    !Array.isArray(legacyData.displays) ||
+    !Array.isArray(legacyData.responses);
+
+  return {
+    // `new Date(0)` reads as expired wherever `expiresAt` is checked, which is what forces the sync.
+    expiresAt: wasRepaired ? new Date(0) : (legacyUser.expiresAt ?? null),
+    data: {
+      ...defaults,
+      ...legacyData,
+      segments: Array.isArray(legacyData.segments) ? legacyData.segments : defaults.segments,
+      displays: Array.isArray(legacyData.displays) ? legacyData.displays : defaults.displays,
+      responses: Array.isArray(legacyData.responses) ? legacyData.responses : defaults.responses,
+    },
+  };
 };
 
 export const setup = async (
@@ -80,11 +125,11 @@ export const setup = async (
     config.resetConfig();
     config = Config.getInstance();
 
-    // If the js sdk is being used for non identified users, and we have a new state to update to after migrating, we update the state
-    // otherwise, we just sync again!
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- user could be undefined
-    if (newState && !newState.user?.data?.userId) {
-      config.update(newState);
+    // Persist the migrated state for every legacy config, identified or not. `resetConfig()` has
+    // just wiped storage, so skipping the write leaves no config at all and the fresh-setup path
+    // below would silently downgrade an identified user to anonymous.
+    if (newState) {
+      config.update({ ...newState, user: completeLegacyUserState(newState.user) });
     }
   }
 
@@ -124,12 +169,21 @@ export const setup = async (
 
   logger.debug("Start setup");
 
-  if (!configInput.environmentId) {
-    logger.debug("No environmentId provided");
+  // Resolve effective ID: prefer workspaceId, fall back to environmentId
+  const effectiveId = configInput.workspaceId ?? configInput.environmentId;
+
+  if (!effectiveId) {
+    logger.debug("No workspaceId or environmentId provided");
     return err({
       code: "missing_field",
-      field: "environmentId",
+      field: "workspaceId",
     });
+  }
+
+  if (configInput.environmentId && !configInput.workspaceId) {
+    logger.debug(
+      "environmentId is deprecated and will be removed in a future version. Please use workspaceId instead."
+    );
   }
 
   if (!configInput.appUrl) {
@@ -142,19 +196,19 @@ export const setup = async (
   }
 
   if (
-    existingConfig?.environment &&
-    existingConfig.environmentId === configInput.environmentId &&
+    existingConfig?.workspace &&
+    existingConfig.workspaceId === effectiveId &&
     existingConfig.appUrl === configInput.appUrl
   ) {
     logger.debug("Configuration fits setup parameters.");
-    let isEnvironmentStateExpired = false;
+    let isWorkspaceStateExpired = false;
     let isUserStateExpired = false;
 
-    const environmentStateExpiresAt = new Date(existingConfig.environment.expiresAt);
+    const workspaceExpiresAt = new Date(existingConfig.workspace.expiresAt);
 
-    if (isNowExpired(environmentStateExpiresAt)) {
-      logger.debug("Environment state expired. Syncing.");
-      isEnvironmentStateExpired = true;
+    if (isNowExpired(workspaceExpiresAt)) {
+      logger.debug("Workspace state expired. Syncing.");
+      isWorkspaceStateExpired = true;
     }
 
     if (existingConfig.user.expiresAt && isNowExpired(new Date(existingConfig.user.expiresAt))) {
@@ -163,33 +217,33 @@ export const setup = async (
     }
 
     try {
-      // fetch the environment state (if expired)
-      let environmentState: TEnvironmentState = existingConfig.environment;
+      // fetch the workspace state (if expired)
+      let workspace: TWorkspaceState = existingConfig.workspace;
       let userState: TUserState = existingConfig.user;
 
-      if (isEnvironmentStateExpired || isDebug) {
+      if (isWorkspaceStateExpired || isDebug) {
         if (isDebug) {
-          logger.debug("Debug mode is active, refetching environment state");
+          logger.debug("Debug mode is active, refetching workspace state");
         }
 
-        const environmentStateResponse = await fetchEnvironmentState({
+        const workspaceResponse = await fetchWorkspaceState({
           appUrl: configInput.appUrl,
-          environmentId: configInput.environmentId,
+          workspaceId: effectiveId,
         });
 
-        if (environmentStateResponse.ok) {
-          environmentState = environmentStateResponse.data;
-          logger.debug(`Fetched ${environmentState.data.surveys.length.toString()} surveys from the backend`);
+        if (workspaceResponse.ok) {
+          workspace = workspaceResponse.data;
+          logger.debug(`Fetched ${workspace.data.surveys.length.toString()} surveys from the backend`);
         } else {
           logger.error(
-            `Error fetching environment state: ${environmentStateResponse.error.code} - ${environmentStateResponse.error.responseMessage ?? ""}`
+            `Error fetching workspace state: ${workspaceResponse.error.code} - ${workspaceResponse.error.responseMessage ?? ""}`
           );
           return err({
             code: "network_error",
-            message: "Error fetching environment state",
+            message: "Error fetching workspace state",
             status: 500,
-            url: new URL(`${configInput.appUrl}/api/v1/client/${configInput.environmentId}/environment`),
-            responseMessage: environmentStateResponse.error.message,
+            url: new URL(`${configInput.appUrl}/api/v1/client/${effectiveId}/environment`),
+            responseMessage: workspaceResponse.error.message,
           });
         }
       }
@@ -205,7 +259,7 @@ export const setup = async (
         if (userState.data.userId) {
           const updatesResponse = await sendUpdatesToBackend({
             appUrl: configInput.appUrl,
-            environmentId: configInput.environmentId,
+            workspaceId: effectiveId,
             updates: {
               userId: userState.data.userId,
             },
@@ -222,7 +276,7 @@ export const setup = async (
               message: "Error updating user state",
               status: 500,
               url: new URL(
-                `${configInput.appUrl}/api/v1/client/${configInput.environmentId}/update/contacts/${userState.data.userId}`
+                `${configInput.appUrl}/api/v1/client/${effectiveId}/update/contacts/${userState.data.userId}`
               ),
               responseMessage: "Unknown error",
             });
@@ -232,20 +286,20 @@ export const setup = async (
         }
       }
 
-      // filter the environment state wrt the person state
-      const filteredSurveys = filterSurveys(environmentState, userState);
+      // filter the workspace state wrt the person state
+      const filteredSurveys = filterSurveys(workspace, userState);
 
       // update the appConfig with the new filtered surveys and person state
       config.update({
         ...existingConfig,
-        environment: environmentState,
+        workspace,
         user: userState,
         filteredSurveys,
       });
 
-      const surveyNames = filteredSurveys.map((s) => s.name);
+      const surveyIds = filteredSurveys.map((s) => s.id);
       logger.debug(
-        `${surveyNames.length.toString()} surveys could be shown to current user on trigger: ${surveyNames.join(", ")}`
+        `${surveyIds.length.toString()} surveys could be shown to current user on trigger: ${surveyIds.join(", ")}`
       );
     } catch {
       logger.debug("Error during sync. Please try again.");
@@ -255,30 +309,43 @@ export const setup = async (
     config.resetConfig();
     logger.debug("Syncing.");
 
-    // During setup, if we don't have a valid config, we need to fetch the environment state
+    // During setup, if we don't have a valid config, we need to fetch the workspace state
     // but not the person state, we can set it to the default value.
     // The person state will be fetched when the `setUserId` method is called.
 
     try {
-      const environmentStateResponse = await fetchEnvironmentState({
+      const workspaceResponse = await fetchWorkspaceState({
         appUrl: configInput.appUrl,
-        environmentId: configInput.environmentId,
+        workspaceId: effectiveId,
       });
 
-      if (!environmentStateResponse.ok) {
-        // eslint-disable-next-line @typescript-eslint/only-throw-error -- error is ApiErrorResponse
-        throw environmentStateResponse.error;
+      if (!workspaceResponse.ok) {
+        // eslint-disable-next-line @typescript-eslint/only-throw-error -- the catch below feeds this structured ApiErrorResponse (code/responseMessage) to handleErrorOnFirstSetup
+        throw workspaceResponse.error;
       }
 
       let userState: TUserState = DEFAULT_USER_STATE_NO_USER_ID;
 
-      if ("userId" in configInput && configInput.userId) {
+      // A migrated legacy config reaches this branch whenever it carried no workspace state to
+      // reuse. It can still carry an identified user, so fall back to that id when setup was not
+      // given one — otherwise the migration would turn an identified user into an anonymous one.
+      // Scoped to the config the migration just wrote: another workspace or app URL is another
+      // integration, and its user must not be carried across.
+      const migratedUser =
+        changed && existingConfig?.workspaceId === effectiveId && existingConfig.appUrl === configInput.appUrl
+          ? existingConfig.user
+          : null;
+      const setupUserId = "userId" in configInput && configInput.userId ? configInput.userId : null;
+      const userId = setupUserId ?? migratedUser?.data.userId ?? null;
+
+      if (userId) {
         const updatesResponse = await sendUpdatesToBackend({
           appUrl: configInput.appUrl,
-          environmentId: configInput.environmentId,
+          workspaceId: effectiveId,
           updates: {
-            userId: configInput.userId,
-            attributes: configInput.attributes,
+            userId,
+            // Attributes only ever come from the setup call, never from the migrated state.
+            ...(setupUserId && "attributes" in configInput ? { attributes: configInput.attributes } : {}),
           },
         });
 
@@ -288,24 +355,32 @@ export const setup = async (
           logger.error(
             `Error updating user state: ${updatesResponse.error.code} - ${updatesResponse.error.responseMessage ?? ""}`
           );
+
+          // The migration is one-shot: the config just written no longer looks legacy, so `changed`
+          // is false on every later load and this id is gone for good if it is not kept now. Keep
+          // the migrated state, expired, so the next load retries the sync instead of persisting
+          // the default and stranding the user as anonymous.
+          if (!setupUserId && migratedUser) {
+            userState = { ...migratedUser, expiresAt: new Date(0) };
+          }
         }
       }
 
-      const environmentState = environmentStateResponse.data;
-      logger.debug(`Fetched ${environmentState.data.surveys.length.toString()} surveys from the backend`);
-      const filteredSurveys = filterSurveys(environmentState, userState);
+      const workspace = workspaceResponse.data;
+      logger.debug(`Fetched ${workspace.data.surveys.length.toString()} surveys from the backend`);
+      const filteredSurveys = filterSurveys(workspace, userState);
 
       config.update({
         appUrl: configInput.appUrl,
-        environmentId: configInput.environmentId,
+        workspaceId: effectiveId,
         user: userState,
-        environment: environmentState,
+        workspace,
         filteredSurveys,
       });
 
-      const surveyNames = filteredSurveys.map((s) => s.name);
+      const surveyIds = filteredSurveys.map((s) => s.id);
       logger.debug(
-        `${surveyNames.length.toString()} surveys could be shown to current user on trigger: ${surveyNames.join(", ")}`
+        `${surveyIds.length.toString()} surveys could be shown to current user on trigger: ${surveyIds.join(", ")}`
       );
     } catch (e) {
       await handleErrorOnFirstSetup(e as { code: string; responseMessage: string });
@@ -316,11 +391,25 @@ export const setup = async (
   addEventListeners();
   addCleanupEventListeners();
 
-  // Preload surveys script so it's ready when a survey triggers
-  preloadSurveysScript(configInput.appUrl);
+  // Mount the status live region now so assistive tech has registered it long before the
+  // first survey announces its opening into it.
+  addLiveRegionContainer();
+
+  // Prefetch surveys script so it's warm in the cache when a survey triggers
+  prefetchSurveysScript(configInput.appUrl);
 
   setIsSetup(true);
   logger.debug("Set up complete");
+
+  // The readiness signal (ENG-1846): a consent-gated setup means `window.formbricks` may not exist
+  // at page load, so a GTM tag firing `setEmbeddedData` on page load silently drops its value — the
+  // host triggers on this event instead. Emitted here, at the single point every *fresh* setup
+  // converges on, and nowhere else: the "already set up" and missing-config early returns above
+  // return `okVoid()` without reaching this line, so a repeated `setup()` call cannot double-fire
+  // the host's tags.
+  // `effectiveId`, not `config.get().workspaceId`: the input is what this setup just ran with, and
+  // it is already resolved through the legacy `environmentId` shim above.
+  emitFormbricksEvent(FORMBRICKS_EVENTS.setupSuccessful, { workspaceId: effectiveId });
 
   return okVoid();
 };
@@ -329,8 +418,8 @@ export const tearDown = (): void => {
   const logger = Logger.getInstance();
   const appConfig = Config.getInstance();
 
-  const { environment } = appConfig.get();
-  const filteredSurveys = filterSurveys(environment, DEFAULT_USER_STATE_NO_USER_ID);
+  const { workspace } = appConfig.get();
+  const filteredSurveys = filterSurveys(workspace, DEFAULT_USER_STATE_NO_USER_ID);
 
   logger.debug("Setting user state to default");
 

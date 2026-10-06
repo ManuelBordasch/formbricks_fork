@@ -1,7 +1,9 @@
 import { ZodRawShape, z } from "zod";
 import { logger } from "@formbricks/logger";
 import { TAuthenticationApiKey } from "@formbricks/types/auth";
+import { RequestBodyTooLargeError, parseJsonBodyWithLimit } from "@/app/lib/api/request-body";
 import { TApiAuditLog } from "@/app/lib/api/with-api-logging";
+import { withAuthorizationSurface } from "@/lib/authorization/context";
 import { formatZodError, handleApiError } from "@/modules/api/v2/lib/utils";
 import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
 import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
@@ -47,6 +49,8 @@ export const apiWrapper = async <S extends ExtendedSchemas>({
   rateLimit = true,
   handler,
   auditLog,
+  bodyTransform,
+  allowOrganizationOnlyApiKey = false,
 }: {
   request: Request;
   schemas?: S;
@@ -54,8 +58,19 @@ export const apiWrapper = async <S extends ExtendedSchemas>({
   rateLimit?: boolean;
   handler: HandlerFn<ParsedSchemas<S>>;
   auditLog?: TApiAuditLog;
+  bodyTransform?: (
+    body: Record<string, unknown>,
+    auth: TAuthenticationApiKey
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  /**
+   * When true, API keys that only carry organization-level access (i.e. no workspace
+   * permissions) are allowed to authenticate. Organization-scoped endpoints opt in so a
+   * pure organization key can reach them; workspace-scoped routes keep this false so such
+   * keys are rejected at the auth layer. See {@link authenticateApiKeyFromHeaders}.
+   */
+  allowOrganizationOnlyApiKey?: boolean;
 }): Promise<Response> => {
-  const authentication = await authenticateRequest(request);
+  const authentication = await authenticateRequest(request, { allowOrganizationOnlyApiKey });
   if (!authentication.ok) {
     return handleApiError(request, authentication.error);
   }
@@ -68,10 +83,22 @@ export const apiWrapper = async <S extends ExtendedSchemas>({
   let parsedInput: ParsedSchemas<S> = {} as ParsedSchemas<S>;
 
   if (schemas?.body) {
-    let bodyData;
+    let bodyData: Record<string, unknown>;
     try {
-      bodyData = await request.json();
+      bodyData = await parseJsonBodyWithLimit<Record<string, unknown>>(request);
     } catch (error) {
+      if (error instanceof RequestBodyTooLargeError) {
+        return handleApiError(request, {
+          type: "payload_too_large",
+          details: [
+            {
+              field: "body",
+              issue: error.message,
+            },
+          ],
+        });
+      }
+
       logger.error({ error, url: request.url }, "Error parsing JSON input");
       return handleApiError(request, {
         type: "bad_request",
@@ -82,6 +109,10 @@ export const apiWrapper = async <S extends ExtendedSchemas>({
           },
         ],
       });
+    }
+
+    if (bodyTransform) {
+      bodyData = await bodyTransform(bodyData, authentication.data);
     }
 
     const bodyResult = schemas.body.safeParse(bodyData);
@@ -133,10 +164,12 @@ export const apiWrapper = async <S extends ExtendedSchemas>({
     }
   }
 
-  return handler({
-    authentication: authentication.data,
-    parsedInput,
-    request,
-    auditLog,
-  });
+  return withAuthorizationSurface("api_v2", () =>
+    handler({
+      authentication: authentication.data,
+      parsedInput,
+      request,
+      auditLog,
+    })
+  );
 };

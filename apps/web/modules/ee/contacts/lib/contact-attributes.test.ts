@@ -1,6 +1,6 @@
-import { Prisma } from "@prisma/client";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { TContactAttribute } from "@formbricks/types/contact-attribute";
 import { DatabaseError } from "@formbricks/types/errors";
 import {
@@ -22,7 +22,7 @@ vi.mock("@formbricks/database", () => ({
 vi.mock("@/lib/utils/validate", () => ({ validateInputs: vi.fn() }));
 
 const contactId = "contact-1";
-const environmentId = "env-1";
+const workspaceId = "env-1";
 const email = "john@example.com";
 const userId = "user-123";
 
@@ -116,10 +116,10 @@ describe("getContactAttributesWithKeyInfo", () => {
       >
     );
 
-    const result = await getContactAttributesWithKeyInfo(contactId);
+    const result = await getContactAttributesWithKeyInfo(contactId, workspaceId);
 
     expect(prisma.contactAttribute.findMany).toHaveBeenCalledWith({
-      where: { contactId },
+      where: { contactId, contact: { workspaceId } },
       select: {
         value: true,
         valueNumber: true,
@@ -158,7 +158,7 @@ describe("getContactAttributesWithKeyInfo", () => {
   test("returns empty array if no attributes", async () => {
     vi.mocked(prisma.contactAttribute.findMany).mockResolvedValue([]);
 
-    const result = await getContactAttributesWithKeyInfo(contactId);
+    const result = await getContactAttributesWithKeyInfo(contactId, workspaceId);
 
     expect(result).toEqual([]);
   });
@@ -189,7 +189,7 @@ describe("getContactAttributesWithKeyInfo", () => {
       mixedTypeAttributes as unknown as Prisma.Result<typeof prisma.contactAttribute, unknown, "findMany">
     );
 
-    const result = await getContactAttributesWithKeyInfo(contactId);
+    const result = await getContactAttributesWithKeyInfo(contactId, workspaceId);
 
     expect(result).toHaveLength(3);
     expect(result[0].dataType).toBe("string");
@@ -202,6 +202,20 @@ describe("getContactAttributesWithKeyInfo", () => {
     expect(result[2].value).toBe("2024-01-01T00:00:00.000Z"); // resolved from valueDate
   });
 
+  // ENG-2290: a contact id alone is not a tenant boundary. The query must join through the contact's
+  // workspace so a caller holding an authorized workspace id cannot read a foreign contact's PII.
+  test("scopes the query to the workspace of the contact", async () => {
+    vi.mocked(prisma.contactAttribute.findMany).mockResolvedValue([]);
+
+    await getContactAttributesWithKeyInfo(contactId, workspaceId);
+
+    expect(prisma.contactAttribute.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ contact: { workspaceId } }),
+      })
+    );
+  });
+
   test("throws DatabaseError on Prisma error", async () => {
     const prismaError = new Prisma.PrismaClientKnownRequestError("Test error", {
       code: "P2002",
@@ -209,14 +223,14 @@ describe("getContactAttributesWithKeyInfo", () => {
     });
     vi.mocked(prisma.contactAttribute.findMany).mockRejectedValue(prismaError);
 
-    await expect(getContactAttributesWithKeyInfo(contactId)).rejects.toThrow(DatabaseError);
+    await expect(getContactAttributesWithKeyInfo(contactId, workspaceId)).rejects.toThrow(DatabaseError);
   });
 
   test("rethrows non-Prisma errors", async () => {
     const genericError = new Error("Generic error");
     vi.mocked(prisma.contactAttribute.findMany).mockRejectedValue(genericError);
 
-    await expect(getContactAttributesWithKeyInfo(contactId)).rejects.toThrow("Generic error");
+    await expect(getContactAttributesWithKeyInfo(contactId, workspaceId)).rejects.toThrow("Generic error");
   });
 });
 
@@ -229,10 +243,10 @@ describe("hasEmailAttribute", () => {
     vi.mocked(prisma.contactAttribute.findFirst).mockResolvedValue({
       id: "attr-1",
     } as unknown as TContactAttribute);
-    const result = await hasEmailAttribute(email, environmentId, contactId);
+    const result = await hasEmailAttribute(email, workspaceId, contactId);
     expect(prisma.contactAttribute.findFirst).toHaveBeenCalledWith({
       where: {
-        AND: [{ attributeKey: { key: "email", environmentId }, value: email }, { NOT: { contactId } }],
+        AND: [{ attributeKey: { key: "email", workspaceId }, value: email }, { NOT: { contactId } }],
       },
       select: { id: true },
     });
@@ -241,7 +255,7 @@ describe("hasEmailAttribute", () => {
 
   test("returns false if email attribute does not exist", async () => {
     vi.mocked(prisma.contactAttribute.findFirst).mockResolvedValue(null);
-    const result = await hasEmailAttribute(email, environmentId, contactId);
+    const result = await hasEmailAttribute(email, workspaceId, contactId);
     expect(result).toBe(false);
   });
 });
@@ -255,10 +269,10 @@ describe("hasUserIdAttribute", () => {
     vi.mocked(prisma.contactAttribute.findFirst).mockResolvedValue({
       id: "attr-1",
     } as unknown as TContactAttribute);
-    const result = await hasUserIdAttribute(userId, environmentId, contactId);
+    const result = await hasUserIdAttribute(userId, workspaceId, contactId);
     expect(prisma.contactAttribute.findFirst).toHaveBeenCalledWith({
       where: {
-        AND: [{ attributeKey: { key: "userId", environmentId }, value: userId }, { NOT: { contactId } }],
+        AND: [{ attributeKey: { key: "userId", workspaceId }, value: userId }, { NOT: { contactId } }],
       },
       select: { id: true },
     });
@@ -267,7 +281,7 @@ describe("hasUserIdAttribute", () => {
 
   test("returns false if userId attribute does not exist on another contact", async () => {
     vi.mocked(prisma.contactAttribute.findFirst).mockResolvedValue(null);
-    const result = await hasUserIdAttribute(userId, environmentId, contactId);
+    const result = await hasUserIdAttribute(userId, workspaceId, contactId);
     expect(result).toBe(false);
   });
 });
@@ -281,7 +295,7 @@ describe("error handling edge cases", () => {
     vi.mocked(prisma.contactAttribute.findFirst).mockResolvedValue(null);
 
     // Test with various email formats
-    await hasEmailAttribute("user+tag@example.com", environmentId, contactId);
+    await hasEmailAttribute("user+tag@example.com", workspaceId, contactId);
     expect(prisma.contactAttribute.findFirst).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
@@ -294,7 +308,7 @@ describe("error handling edge cases", () => {
   test("hasUserIdAttribute handles special characters in userId", async () => {
     vi.mocked(prisma.contactAttribute.findFirst).mockResolvedValue(null);
 
-    await hasUserIdAttribute("user-123_abc", environmentId, contactId);
+    await hasUserIdAttribute("user-123_abc", workspaceId, contactId);
     expect(prisma.contactAttribute.findFirst).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({

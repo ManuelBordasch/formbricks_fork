@@ -1,6 +1,6 @@
-import { Prisma, Response } from "@prisma/client";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma, Response } from "@formbricks/database/prisma";
 import { logger } from "@formbricks/logger";
 import { TSurveyQuota } from "@formbricks/types/quota";
 import { TResponseData, TResponseVariables } from "@formbricks/types/responses";
@@ -99,7 +99,10 @@ describe("Quota Evaluation Service", () => {
     delay: 0,
     displayPercentage: null,
     isBackButtonHidden: false,
-    projectOverwrites: null,
+    isAutoProgressingEnabled: false,
+    publishOn: null,
+    closeOn: null,
+    workspaceOverwrites: null,
     styling: null,
     showLanguageSwitch: null,
     languages: [],
@@ -111,15 +114,15 @@ describe("Quota Evaluation Service", () => {
     createdBy: null,
     followUps: [],
     isVerifyEmailEnabled: false,
-    isSingleResponsePerEmailEnabled: false,
     surveyClosedMessage: null,
     singleUse: null,
     pin: null,
-    environmentId: "env123",
+    workspaceId: "workspace123",
     metadata: {},
     updatedAt: new Date("2024-01-01"),
     blocks: [],
     isCaptureIpEnabled: false,
+    isAnonymizeResponsesEnabled: false,
     slug: null,
   };
 
@@ -161,6 +164,7 @@ describe("Quota Evaluation Service", () => {
     data: mockResponseData,
     ttc: null,
     contactAttributes: {},
+    ingestFlags: null,
     variables: mockVariablesData,
     meta: {},
     contactId: null,
@@ -266,7 +270,8 @@ describe("Quota Evaluation Service", () => {
         mockResponseData,
         mockVariablesData,
         [continueSurveyQuota],
-        "en"
+        "en",
+        {}
       );
       expect(handleQuotas).toHaveBeenCalledWith(mockSurveyId, mockResponseId, evaluateResult, true, mockTx);
     });
@@ -308,7 +313,8 @@ describe("Quota Evaluation Service", () => {
         mockResponseData,
         mockVariablesData,
         [mockQuota],
-        "en"
+        "en",
+        {}
       );
       expect(handleQuotas).toHaveBeenCalledWith(mockSurveyId, mockResponseId, evaluateResult, true, mockTx);
       expect(mockTx.response.findUnique).toHaveBeenCalledWith({
@@ -357,7 +363,8 @@ describe("Quota Evaluation Service", () => {
         mockResponseData,
         mockVariablesData,
         [mockPartialSubmissionQuota],
-        "default"
+        "default",
+        {}
       );
       expect(handleQuotas).toHaveBeenCalledWith(mockSurveyId, mockResponseId, evaluateResult, false, mockTx);
       expect(mockTx.response.findUnique).toHaveBeenCalledWith({ where: { id: mockResponseId } });
@@ -440,6 +447,54 @@ describe("Quota Evaluation Service", () => {
       );
     });
 
+    test("resolves reserved-field values from the response so a reserved quota condition can match", async () => {
+      // The real `buildServerEmbeddedValues` runs here (only ./utils and the data loaders are mocked),
+      // so this asserts the actual catalog projection reaches `evaluateQuotas` — the wiring that was
+      // missing when the helper had no production caller.
+      const input: QuotaEvaluationInput = {
+        surveyId: mockSurveyId,
+        responseId: mockResponseId,
+        data: mockResponseData,
+        variables: mockVariablesData,
+        language: "en",
+        responseFinished: true,
+        response: {
+          id: mockResponseId,
+          surveyId: mockSurveyId,
+          createdAt: new Date("2026-08-01T09:00:00.000Z"),
+          updatedAt: new Date("2026-08-01T09:02:00.000Z"),
+          finished: true,
+          language: "en",
+          data: mockResponseData,
+          variables: mockVariablesData,
+          ttc: { _total: 120_000 },
+          meta: { country: "DE", userAgent: { browser: "Chrome" } },
+        },
+        tx: asTx(mockTx),
+      };
+
+      vi.mocked(getQuotas).mockResolvedValue([mockQuota]);
+      vi.mocked(getSurvey).mockResolvedValue(mockSurvey);
+      vi.mocked(evaluateQuotas).mockReturnValue({ passedQuotas: [mockQuota], failedQuotas: [] });
+      vi.mocked(handleQuotas).mockResolvedValue(null);
+
+      await evaluateResponseQuotas(input);
+
+      expect(evaluateQuotas).toHaveBeenCalledWith(
+        mockSurvey,
+        mockResponseData,
+        mockVariablesData,
+        [mockQuota],
+        "en",
+        expect.objectContaining({
+          country: "DE",
+          browser: "Chrome",
+          finished: "true",
+          durationSeconds: 120,
+        })
+      );
+    });
+
     test("should use 'default' language when provided language matches default language", async () => {
       const surveyWithLanguages = {
         ...mockSurvey,
@@ -476,7 +531,8 @@ describe("Quota Evaluation Service", () => {
         mockResponseData,
         mockVariablesData,
         [mockQuota],
-        "default"
+        "default",
+        {}
       );
     });
   });

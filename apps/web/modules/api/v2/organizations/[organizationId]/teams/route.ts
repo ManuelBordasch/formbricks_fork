@@ -11,17 +11,28 @@ import {
   ZTeamInput,
 } from "@/modules/api/v2/organizations/[organizationId]/teams/types/teams";
 import { ZOrganizationIdSchema } from "@/modules/api/v2/organizations/[organizationId]/types/organizations";
+import {
+  canManageOrganizationUsers,
+  getApiKeyCreatorRole,
+} from "@/modules/api/v2/organizations/[organizationId]/users/lib/utils";
 
 export const GET = async (request: NextRequest, props: { params: Promise<{ organizationId: string }> }) =>
   authenticatedApiClient({
     request,
+    allowOrganizationOnlyApiKey: true,
     schemas: {
       query: ZGetTeamsFilter,
       params: z.object({ organizationId: ZOrganizationIdSchema }),
     },
     externalParams: props.params,
     handler: async ({ authentication, parsedInput: { query, params } }) => {
-      if (!hasOrganizationIdAndAccess(params!.organizationId, authentication, OrganizationAccessType.Read)) {
+      if (
+        !(await hasOrganizationIdAndAccess(
+          params!.organizationId,
+          authentication,
+          OrganizationAccessType.Read
+        ))
+      ) {
         return handleApiError(request, {
           type: "unauthorized",
           details: [{ field: "organizationId", issue: "unauthorized" }],
@@ -41,18 +52,40 @@ export const GET = async (request: NextRequest, props: { params: Promise<{ organ
 export const POST = async (request: Request, props: { params: Promise<{ organizationId: string }> }) =>
   authenticatedApiClient({
     request,
+    allowOrganizationOnlyApiKey: true,
     schemas: {
       body: ZTeamInput,
       params: z.object({ organizationId: ZOrganizationIdSchema }),
     },
     externalParams: props.params,
     handler: async ({ authentication, parsedInput: { body, params }, auditLog }) => {
-      if (!hasOrganizationIdAndAccess(params!.organizationId, authentication, OrganizationAccessType.Write)) {
+      if (
+        !(await hasOrganizationIdAndAccess(
+          params!.organizationId,
+          authentication,
+          OrganizationAccessType.Write
+        ))
+      ) {
         return handleApiError(
           request,
           {
             type: "unauthorized",
             details: [{ field: "organizationId", issue: "unauthorized" }],
+          },
+          auditLog
+        );
+      }
+
+      // Org API keys carry no role of their own, so anchor authorization to the API key creator's
+      // role, mirroring the same clamp enforced on user creation. Without this, a key whose creator
+      // was demoted or removed could still create/rename teams even though it can no longer manage users.
+      const assignerRole = await getApiKeyCreatorRole(authentication.apiKeyId, authentication.organizationId);
+      if (!canManageOrganizationUsers(assignerRole)) {
+        return handleApiError(
+          request,
+          {
+            type: "forbidden",
+            details: [{ field: "team", issue: "You are not allowed to manage teams in this organization" }],
           },
           auditLog
         );

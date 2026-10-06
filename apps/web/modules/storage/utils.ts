@@ -1,15 +1,22 @@
 import "server-only";
-import { StorageError, StorageErrorCode } from "@formbricks/storage";
+import { type StorageError, StorageErrorCode } from "@formbricks/storage";
 import { TResponseData } from "@formbricks/types/responses";
-import { TAllowedFileExtension, ZAllowedFileExtension } from "@formbricks/types/storage";
-import { TSurveyQuestion, TSurveyQuestionTypeEnum } from "@formbricks/types/surveys/types";
+import {
+  IMAGE_FILE_EXTENSIONS,
+  type TAccessType,
+  type TAllowedFileExtension,
+  ZAllowedFileExtension,
+} from "@formbricks/types/storage";
+import { TSurveyBlock } from "@formbricks/types/surveys/blocks";
 import { responses } from "@/app/lib/api/response";
 import { WEBAPP_URL } from "@/lib/constants";
 import { getPublicDomain } from "@/lib/getPublicUrl";
+import { type TFileUploadCandidate, getSurveyFileUploadConfigs } from "./survey-file-upload-elements";
 import { getOriginalFileNameFromUrl } from "./url-helpers";
 
-// Re-export for backward compatibility with server-side code
+// Re-exports for backward compatibility with server-side code
 export { getOriginalFileNameFromUrl } from "./url-helpers";
+export { getSurveyFileUploadConfigs } from "./survey-file-upload-elements";
 
 /**
  * Sanitize a provided file name to a safe subset.
@@ -58,14 +65,26 @@ export const sanitizeFileName = (rawFileName: string): string => {
 };
 
 /**
+ * Extracts the lowercase file extension from a file name
+ * @param fileName The name of the file
+ * @returns {string | null} The lowercase extension, or null when no extension exists
+ */
+const extractFileExtension = (fileName: string): string | null => {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+
+  if (!extension || extension === fileName.toLowerCase()) return null;
+
+  return extension;
+};
+
+/**
  * Validates if the file extension is allowed
  * @param fileName The name of the file to validate
  * @returns {boolean} True if the file extension is allowed, false otherwise
  */
 export const isAllowedFileExtension = (fileName: string): boolean => {
-  // Extract the file extension
-  const extension = fileName.split(".").pop()?.toLowerCase();
-  if (!extension || extension === fileName.toLowerCase()) return false;
+  const extension = extractFileExtension(fileName);
+  if (!extension) return false;
 
   // Check if the extension is in the allowed list
   return Object.values(ZAllowedFileExtension.enum).includes(extension as TAllowedFileExtension);
@@ -77,23 +96,311 @@ export const validateSingleFile = (
 ): boolean => {
   const fileName = getOriginalFileNameFromUrl(fileUrl);
   if (!fileName) return false;
-  const extension = fileName.split(".").pop()?.toLowerCase();
+  const extension = extractFileExtension(fileName);
   if (!extension) return false;
   return !allowedFileExtensions || allowedFileExtensions.includes(extension as TAllowedFileExtension);
 };
 
-export const validateFileUploads = (data?: TResponseData, questions?: TSurveyQuestion[]): boolean => {
+export type TSurveyFileUploadPermissionResult =
+  | {
+      ok: true;
+    }
+  | {
+      ok: false;
+      reason: "no_file_upload_element" | "file_upload_element_not_found" | "file_extension_not_allowed";
+    };
+
+const getAllowedFileExtensionFromFileName = (fileName: string): TAllowedFileExtension | null => {
+  const extension = extractFileExtension(fileName);
+  if (!extension) return null;
+
+  const extensionValidation = ZAllowedFileExtension.safeParse(extension);
+
+  return extensionValidation.success ? extensionValidation.data : null;
+};
+
+/**
+ * The ids of the elements whose answers hold storage URLs.
+ *
+ * Every response-file delete path needs the id set rather than the configs, and it must come from the
+ * union of `blocks` and `questions` — the same source write-time validation reads — because keying off
+ * a single shape silently skips deletes for the other.
+ *
+ * Split from `collectResponseFileUrls` so a caller scanning many responses builds the set once, and so
+ * it can skip its scan entirely when the set is empty.
+ */
+export const getSurveyFileUploadElementIds = (survey: {
+  blocks?: TSurveyBlock[] | null;
+  questions?: readonly TFileUploadCandidate[] | null;
+}): Set<string> =>
+  new Set(
+    getSurveyFileUploadConfigs({ blocks: survey.blocks, questions: survey.questions }).map(
+      (config) => config.id
+    )
+  );
+
+/**
+ * Pulls the storage URLs out of one response's answers, ready to hand to `deleteResponseFileUrls`.
+ *
+ * Only file-upload answers hold storage URLs, and they are always stored as an array of strings.
+ * Anything else under a matching key is skipped rather than cast, so malformed data cannot produce a
+ * bogus delete target.
+ *
+ * `data` is deliberately `unknown`: callers hand this a raw `Prisma.JsonValue` column or an already
+ * typed `TResponseData`, and the shape is checked here either way rather than cast at each call site.
+ */
+export const collectResponseFileUrls = (data: unknown, fileUploadElementIds: Set<string>): string[] => {
+  if (fileUploadElementIds.size === 0 || !data || typeof data !== "object" || Array.isArray(data)) {
+    return [];
+  }
+
+  const fileUrls: string[] = [];
+  // Typed rather than left as `Object.entries`' implicit `any` values, so the guards below are the only
+  // thing that narrows an answer to a string.
+  const answers: [string, unknown][] = Object.entries(data);
+
+  for (const [elementId, answer] of answers) {
+    if (fileUploadElementIds.has(elementId) && Array.isArray(answer)) {
+      fileUrls.push(...answer.filter((url): url is string => typeof url === "string"));
+    }
+  }
+
+  return fileUrls;
+};
+
+export const validateSurveyAllowsFileUpload = ({
+  fileName,
+  elementId,
+  blocks,
+  questions,
+}: {
+  fileName: string;
+  elementId: string;
+  blocks?: TSurveyBlock[] | null;
+  questions?: readonly TFileUploadCandidate[] | null;
+}): TSurveyFileUploadPermissionResult => {
+  const fileUploadConfigs = getSurveyFileUploadConfigs({ blocks, questions });
+
+  if (fileUploadConfigs.length === 0) {
+    return {
+      ok: false,
+      reason: "no_file_upload_element",
+    };
+  }
+
+  const fileUploadConfig = fileUploadConfigs.find((config) => config.id === elementId);
+
+  if (!fileUploadConfig) {
+    return {
+      ok: false,
+      reason: "file_upload_element_not_found",
+    };
+  }
+
+  const fileExtension = getAllowedFileExtensionFromFileName(fileName);
+
+  if (!fileExtension) {
+    return {
+      ok: false,
+      reason: "file_extension_not_allowed",
+    };
+  }
+
+  const { allowedFileExtensions } = fileUploadConfig;
+  const isFileExtensionAllowed =
+    allowedFileExtensions === undefined || allowedFileExtensions.includes(fileExtension);
+
+  return isFileExtensionAllowed
+    ? { ok: true }
+    : {
+        ok: false,
+        reason: "file_extension_not_allowed",
+      };
+};
+
+// Origins that may legitimately prefix an absolute storage URL. A response GET resolves stored
+// relative `/storage/...` URLs to absolute ones against these app bases (see resolveStorageUrl), so
+// a client that reads a response and re-submits the same file-upload answer sends back an absolute
+// URL. Those must still validate — but only for the app's own origins, so a foreign absolute URL
+// can never be smuggled past the scope check.
+const getAppStorageOrigins = (): string[] => {
+  const origins: string[] = [];
+  for (const base of [WEBAPP_URL, getPublicDomain()]) {
+    if (!base) continue;
+    try {
+      origins.push(new URL(base).origin);
+    } catch {
+      // Ignore a misconfigured base URL rather than throwing during validation.
+    }
+  }
+  return origins;
+};
+
+const getStorageUrlPathSegments = (fileUrl: string): string[] | null => {
+  let pathname: string;
+
+  if (fileUrl.startsWith("/storage/")) {
+    pathname = fileUrl;
+  } else {
+    let parsed: URL;
+    try {
+      parsed = new URL(fileUrl);
+    } catch {
+      return null;
+    }
+    // Absolute URLs are only accepted when they point at one of the app's own origins.
+    if (!getAppStorageOrigins().includes(parsed.origin)) return null;
+    pathname = parsed.pathname;
+  }
+
+  const pathWithoutSearch = pathname.split(/[?#]/)[0];
+  if (!pathWithoutSearch.startsWith("/storage/")) return null;
+  return pathWithoutSearch.split("/").filter(Boolean);
+};
+
+type TParsedStorageFileUrl = {
+  storageId: string;
+  accessType: TAccessType;
+  fileName: string;
+};
+
+export const parseStorageFileUrl = (fileUrl: string): TParsedStorageFileUrl | null => {
+  let pathname: string;
+
+  try {
+    pathname = fileUrl.startsWith("/storage/") ? fileUrl : new URL(fileUrl).pathname;
+  } catch {
+    return null;
+  }
+
+  const pathWithoutSearch = pathname.split(/[?#]/)[0];
+  if (!pathWithoutSearch.startsWith("/storage/")) return null;
+
+  const [storageSegment, storageId, accessType, ...fileNameSegments] = pathWithoutSearch
+    .split("/")
+    .filter(Boolean);
+  const fileName = fileNameSegments.join("/");
+
+  if (
+    storageSegment !== "storage" ||
+    !storageId ||
+    !fileName ||
+    (accessType !== "private" && accessType !== "public")
+  ) {
+    return null;
+  }
+
+  return { storageId, accessType, fileName };
+};
+
+const isScopedPrivateUploadUrl = ({
+  fileUrl,
+  workspaceId,
+  surveyId,
+  elementId,
+  legacyOwnedStoragePrefixes = [],
+}: {
+  fileUrl: string;
+  workspaceId: string;
+  surveyId: string;
+  elementId: string;
+  // Storage prefixes this workspace owns for pre-#8044 file URLs (its own id and, when set, its
+  // Workspace.legacyEnvironmentId). Empty for the client widget, which only ever emits the scoped
+  // shape below; passed by the management routes so replayed old responses still validate.
+  legacyOwnedStoragePrefixes?: string[];
+}): boolean => {
+  const segments = getStorageUrlPathSegments(fileUrl);
+
+  if (!segments) return false;
+
+  // Current (post-#8044) fully-scoped shape:
+  // /storage/{workspaceId}/private/surveys/{surveyId}/elements/{elementId}/{file}  -> 8 parts
+  if (segments.length === 8) {
+    const [
+      storageSegment,
+      storageWorkspaceId,
+      accessType,
+      surveysSegment,
+      storageSurveyId,
+      elementsSegment,
+      storageElementId,
+      fileName,
+    ] = segments;
+
+    return (
+      storageSegment === "storage" &&
+      storageWorkspaceId === workspaceId &&
+      accessType === "private" &&
+      surveysSegment === "surveys" &&
+      storageSurveyId === surveyId &&
+      elementsSegment === "elements" &&
+      storageElementId === elementId &&
+      Boolean(fileName)
+    );
+  }
+
+  // Legacy shapes uploaded before #8044 (pre-Formbricks-5 environment-id prefix, or the Formbricks-5
+  // workspace-id prefix) never recorded a survey or element, so they are only 4 parts:
+  // /storage/{prefix}/private/{file}. A read-then-write of such a response (backfills, re-imports,
+  // two-way integrations) must still validate — but only when {prefix} is a storage namespace THIS
+  // workspace owns, so cross-tenant deletion stays closed (the prefix is the only part that decides
+  // whose file a later cleanup deletes). Survey/element binding is unavailable here because the old
+  // URL never carried it.
+  if (segments.length === 4 && legacyOwnedStoragePrefixes.length > 0) {
+    const [storageSegment, storagePrefix, accessType, fileName] = segments;
+
+    return (
+      storageSegment === "storage" &&
+      accessType === "private" &&
+      legacyOwnedStoragePrefixes.includes(storagePrefix) &&
+      Boolean(fileName)
+    );
+  }
+
+  return false;
+};
+
+export const validateClientFileUploads = ({
+  data,
+  workspaceId,
+  surveyId,
+  blocks,
+  questions,
+  legacyOwnedStoragePrefixes,
+}: {
+  data?: TResponseData;
+  workspaceId: string;
+  surveyId: string;
+  blocks?: TSurveyBlock[] | null;
+  questions?: readonly TFileUploadCandidate[] | null;
+  // Passed by the management routes (see getWorkspaceLegacyEnvironmentId) so a replayed old response
+  // whose file URL predates the scoped shape still validates against a prefix the workspace owns.
+  // Omitted by the client widget path, which stays strict on the scoped shape.
+  legacyOwnedStoragePrefixes?: string[];
+}): boolean => {
   if (!data) return true;
-  for (const key of Object.keys(data)) {
-    const question = questions?.find((q) => q.id === key);
-    if (!question || question.type !== TSurveyQuestionTypeEnum.FileUpload) continue;
 
-    const fileUrls = data[key];
+  const fileUploadConfigs = getSurveyFileUploadConfigs({ blocks, questions });
 
+  for (const fileUploadConfig of fileUploadConfigs) {
+    const fileUrls = data[fileUploadConfig.id];
+
+    if (fileUrls === undefined) continue;
     if (!Array.isArray(fileUrls) || !fileUrls.every((url) => typeof url === "string")) return false;
 
     for (const fileUrl of fileUrls) {
-      if (!validateSingleFile(fileUrl, question.allowedFileExtensions)) return false;
+      if (!validateSingleFile(fileUrl, fileUploadConfig.allowedFileExtensions)) return false;
+      if (
+        !isScopedPrivateUploadUrl({
+          fileUrl,
+          workspaceId,
+          surveyId,
+          elementId: fileUploadConfig.id,
+          legacyOwnedStoragePrefixes,
+        })
+      ) {
+        return false;
+      }
     }
   }
 
@@ -107,8 +414,7 @@ export const isValidImageFile = (fileUrl: string): boolean => {
   const extension = fileName.split(".").pop()?.toLowerCase();
   if (!extension) return false;
 
-  const imageExtensions = ["png", "jpeg", "jpg", "webp", "heic"];
-  return imageExtensions.includes(extension);
+  return (IMAGE_FILE_EXTENSIONS as readonly string[]).includes(extension);
 };
 
 export const getErrorResponseFromStorageError = (
@@ -121,9 +427,13 @@ export const getErrorResponseFromStorageError = (
     case StorageErrorCode.InvalidInput:
       return responses.badRequestResponse("Invalid input", details, true);
     case StorageErrorCode.S3ClientError:
-      return responses.internalServerErrorResponse("Internal server error", true);
     case StorageErrorCode.S3CredentialsError:
-      return responses.internalServerErrorResponse("Internal server error", true);
+      return responses.internalServerErrorResponse(
+        "File storage is not configured correctly. Please check your file upload settings.",
+        true,
+        { storage_error_code: error.code },
+        "private, no-store"
+      );
     case StorageErrorCode.Unknown:
       return responses.internalServerErrorResponse("Internal server error", true);
     default: {

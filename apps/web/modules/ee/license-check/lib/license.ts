@@ -1,13 +1,12 @@
 import "server-only";
-import { HttpsProxyAgent } from "https-proxy-agent";
-import fetch from "node-fetch";
 import { cache as reactCache } from "react";
+import { ProxyAgent } from "undici";
 import { z } from "zod";
 import { createCacheKey } from "@formbricks/cache";
 import { prisma } from "@formbricks/database";
 import { logger } from "@formbricks/logger";
 import { cache } from "@/lib/cache";
-import { E2E_TESTING } from "@/lib/constants";
+import { COMMUNITY_WORKSPACE_LIMIT, E2E_TESTING } from "@/lib/constants";
 import { env } from "@/lib/env";
 import { hashString } from "@/lib/hash-string";
 import { getInstanceId } from "@/lib/instance";
@@ -16,6 +15,12 @@ import {
   TEnterpriseLicenseFeatures,
   TLicenseStatus,
 } from "@/modules/ee/license-check/types/enterprise-license";
+
+// Module-level ProxyAgent singleton — reused across all license fetches to avoid leaking
+// socket pools on every call (ProxyAgent owns connection pools and should not be created
+// per-request in long-lived processes).
+const _proxyUrl = env.HTTPS_PROXY ?? env.HTTP_PROXY;
+const _proxyDispatcher = _proxyUrl ? new ProxyAgent(_proxyUrl) : undefined;
 
 // Configuration
 const CONFIG = {
@@ -37,6 +42,22 @@ const CONFIG = {
 } as const;
 
 export const GRACE_PERIOD_MS = CONFIG.CACHE.GRACE_PERIOD_MS;
+
+/**
+ * Grace-period view of a license's last successful check, for the pending-downgrade banner.
+ *
+ * The clock is read here rather than in the banner: the banner is a client component rendered on
+ * both the server pass and hydration, so a `Date.now()` comparison there is impure and can disagree
+ * with itself across the two passes (ENG-2366). Keeping it here also means the 3-day window has a
+ * single definition — the banner used to carry its own copy of the constant, which would silently
+ * drift from the real grace period.
+ */
+export const getPendingDowngradeSchedule = (
+  lastChecked: Date
+): { isWithinGracePeriod: boolean; scheduledDowngradeDate: Date } => ({
+  isWithinGracePeriod: Date.now() - lastChecked.getTime() < GRACE_PERIOD_MS,
+  scheduledDowngradeDate: new Date(lastChecked.getTime() + GRACE_PERIOD_MS),
+});
 
 /** TTL in ms for successful license fetch results (24h). Re-export for use in actions. */
 export const FETCH_LICENSE_TTL_MS = CONFIG.CACHE.FETCH_LICENSE_TTL_MS;
@@ -71,19 +92,21 @@ type TCachedFetchResult = { value: TEnterpriseLicenseDetails | null };
 // Validation schemas
 const LicenseFeaturesSchema = z.object({
   isMultiOrgEnabled: z.boolean(),
-  projects: z.number().nullable(),
+  workspaces: z.number().nullable(),
   twoFactorAuth: z.boolean(),
   sso: z.boolean(),
   whitelabel: z.boolean(),
   removeBranding: z.boolean(),
   contacts: z.boolean(),
   aiSmartTools: z.boolean(),
-  aiDataAnalysis: z.boolean(),
   saml: z.boolean(),
   spamProtection: z.boolean(),
   auditLogs: z.boolean(),
   accessControl: z.boolean(),
   quotas: z.boolean(),
+  feedbackDirectories: z.boolean().default(false),
+  dashboards: z.boolean().default(false),
+  workflows: z.boolean().default(false),
 });
 
 const LicenseDetailsSchema = z.object({
@@ -139,19 +162,21 @@ export const getCacheKeys = () => {
 // Default features
 const DEFAULT_FEATURES: TEnterpriseLicenseFeatures = {
   isMultiOrgEnabled: false,
-  projects: 3,
+  workspaces: COMMUNITY_WORKSPACE_LIMIT,
   twoFactorAuth: false,
   sso: false,
   whitelabel: false,
   removeBranding: false,
   contacts: false,
   aiSmartTools: false,
-  aiDataAnalysis: false,
   saml: false,
   spamProtection: false,
   auditLogs: false,
   accessControl: false,
   quotas: false,
+  feedbackDirectories: false,
+  dashboards: false,
+  workflows: false,
 };
 
 // Helper functions
@@ -273,6 +298,11 @@ const MEMORY_CACHE_TTL_MS = 60 * 1000; // 1 minute memory cache to avoid stamped
 
 let getEnterpriseLicensePromise: Promise<TEnterpriseLicenseResult> | null = null;
 
+// Grace deliberately covers every non-active answer, not just an unreachable server: a check that
+// completes and reports "expired" takes this path too, so a lapsed key keeps its allowance for the
+// rest of the window. That is the conservative side to err on — were the license server ever to
+// answer "expired" wrongly, the window is what stops every self-hosted instance from downgrading at
+// once. Narrowing it to failed checks only would be a deliberate policy change, not a cleanup.
 const getFallbackLevel = (
   liveLicense: TEnterpriseLicenseDetails | null,
   previousResult: TPreviousResult,
@@ -323,7 +353,6 @@ const fetchLicenseFromServerInternal = async (retryCount = 0): Promise<TEnterpri
   if (!env.ENTERPRISE_LICENSE_KEY) return null;
 
   // Skip license checks during build time
-  // eslint-disable-next-line turbo/no-undeclared-env-vars -- NEXT_PHASE is a next.js env variable
   if (process.env.NEXT_PHASE === "phase-production-build") {
     return null;
   }
@@ -358,12 +387,6 @@ const fetchLicenseFromServerInternal = async (retryCount = 0): Promise<TEnterpri
     // (skip this check during E2E tests as we intentionally use null)
     if (!E2E_TESTING && !instanceId) return null;
 
-    const proxyUrl = env.HTTPS_PROXY ?? env.HTTP_PROXY;
-    const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), CONFIG.API.TIMEOUT_MS);
-
     const payload: Record<string, unknown> = {
       licenseKey: env.ENTERPRISE_LICENSE_KEY,
       usage: { responseCount },
@@ -375,13 +398,11 @@ const fetchLicenseFromServerInternal = async (retryCount = 0): Promise<TEnterpri
 
     const res = await fetch(CONFIG.API.ENDPOINT, {
       body: JSON.stringify(payload),
+      dispatcher: _proxyDispatcher,
       headers: { "Content-Type": "application/json" },
       method: "POST",
-      agent,
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
+      signal: AbortSignal.timeout(CONFIG.API.TIMEOUT_MS),
+    } as RequestInit & { dispatcher?: ProxyAgent });
 
     if (res.ok) {
       const responseJson = (await res.json()) as { data: unknown };
@@ -435,7 +456,6 @@ export const fetchLicense = async (): Promise<TEnterpriseLicenseDetails | null> 
   if (!env.ENTERPRISE_LICENSE_KEY) return null;
 
   // Skip license checks during build time - check before cache access
-  // eslint-disable-next-line turbo/no-undeclared-env-vars -- NEXT_PHASE is a next.js env variable
   if (process.env.NEXT_PHASE === "phase-production-build") {
     return null;
   }
@@ -619,11 +639,7 @@ const computeLicenseState = async (
 };
 
 export const getEnterpriseLicense = reactCache(async (): Promise<TEnterpriseLicenseResult> => {
-  if (
-    process.env.NODE_ENV !== "test" &&
-    memoryCache &&
-    Date.now() - memoryCache.timestamp < MEMORY_CACHE_TTL_MS
-  ) {
+  if (env.NODE_ENV !== "test" && memoryCache && Date.now() - memoryCache.timestamp < MEMORY_CACHE_TTL_MS) {
     return memoryCache.data;
   }
 

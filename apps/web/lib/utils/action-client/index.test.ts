@@ -1,5 +1,4 @@
 import * as Sentry from "@sentry/nextjs";
-import { getServerSession } from "next-auth";
 import { DEFAULT_SERVER_ERROR_MESSAGE } from "next-safe-action";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
@@ -10,12 +9,16 @@ import {
   InvalidInputError,
   InvalidPasswordResetTokenError,
   OperationNotAllowedError,
+  QueryExecutionError,
   ResourceNotFoundError,
   TooManyRequestsError,
+  UniqueConstraintError,
   UnknownError,
   ValidationError,
   isExpectedError,
 } from "@formbricks/types/errors";
+import { RequestBodyTooLargeError } from "@/app/lib/api/request-body";
+import { getSession } from "@/modules/auth/lib/session";
 
 // Mock Sentry
 vi.mock("@sentry/nextjs", () => ({
@@ -30,14 +33,9 @@ vi.mock("@formbricks/logger", () => ({
   },
 }));
 
-// Mock next-auth
-vi.mock("next-auth", () => ({
-  getServerSession: vi.fn(),
-}));
-
-// Mock authOptions
-vi.mock("@/modules/auth/lib/authOptions", () => ({
-  authOptions: {},
+// Mock session DAL
+vi.mock("@/modules/auth/lib/session", () => ({
+  getSession: vi.fn(),
 }));
 
 // Mock user service
@@ -72,8 +70,11 @@ describe("isExpectedError (shared helper)", () => {
       "ValidationError",
       "AuthenticationError",
       "OperationNotAllowedError",
+      "QueryExecutionError",
       "TooManyRequestsError",
       "InvalidPasswordResetTokenError",
+      "UniqueConstraintError",
+      "RequestBodyTooLargeError",
     ];
 
     expect(EXPECTED_ERROR_NAMES.size).toBe(expected.length);
@@ -90,7 +91,10 @@ describe("isExpectedError (shared helper)", () => {
     { ErrorClass: InvalidInputError, args: ["Invalid input"] },
     { ErrorClass: ValidationError, args: ["Invalid data"] },
     { ErrorClass: OperationNotAllowedError, args: ["Not allowed"] },
+    { ErrorClass: QueryExecutionError, args: ["Cube query failed. Details: connect ECONNREFUSED"] },
     { ErrorClass: InvalidPasswordResetTokenError, args: [INVALID_PASSWORD_RESET_TOKEN_ERROR_CODE] },
+    { ErrorClass: UniqueConstraintError, args: ["Already exists"] },
+    { ErrorClass: RequestBodyTooLargeError, args: [2 * 1024 * 1024] },
   ])("returns true for $ErrorClass.name", ({ ErrorClass, args }) => {
     const error = new (ErrorClass as any)(...args);
     expect(isExpectedError(error)).toBe(true);
@@ -179,11 +183,27 @@ describe("actionClient handleServerError", () => {
       expect(Sentry.captureException).not.toHaveBeenCalled();
     });
 
+    test("QueryExecutionError returns its message and is not sent to Sentry", async () => {
+      const result = await executeThrowingAction(
+        new QueryExecutionError("Cube query failed. Details: connect ECONNREFUSED")
+      );
+      expect(result?.serverError).toBe("Cube query failed. Details: connect ECONNREFUSED");
+      expect(Sentry.captureException).not.toHaveBeenCalled();
+    });
+
     test("InvalidPasswordResetTokenError returns its message and is not sent to Sentry", async () => {
       const result = await executeThrowingAction(
         new InvalidPasswordResetTokenError(INVALID_PASSWORD_RESET_TOKEN_ERROR_CODE)
       );
       expect(result?.serverError).toBe(INVALID_PASSWORD_RESET_TOKEN_ERROR_CODE);
+      expect(Sentry.captureException).not.toHaveBeenCalled();
+    });
+
+    test("UniqueConstraintError returns its message and is not sent to Sentry", async () => {
+      const result = await executeThrowingAction(
+        new UniqueConstraintError("Action with name foo already exists")
+      );
+      expect(result?.serverError).toBe("Action with name foo already exists");
       expect(Sentry.captureException).not.toHaveBeenCalled();
     });
   });
@@ -238,7 +258,7 @@ describe("authenticatedActionClient", () => {
   });
 
   test("throws AuthenticationError when there is no session", async () => {
-    vi.mocked(getServerSession).mockResolvedValue(null);
+    vi.mocked(getSession).mockResolvedValue(null);
 
     const action = authenticatedActionClient.action(async () => "ok");
     const result = await action();
@@ -249,7 +269,7 @@ describe("authenticatedActionClient", () => {
   });
 
   test("throws AuthorizationError when user is not found", async () => {
-    vi.mocked(getServerSession).mockResolvedValue({ user: { id: "user-1" } });
+    vi.mocked(getSession).mockResolvedValue({ user: { id: "user-1" }, expires: "2999-01-01T00:00:00.000Z" });
     vi.mocked(getUser).mockResolvedValue(null as any);
 
     const action = authenticatedActionClient.action(async () => "ok");
@@ -260,7 +280,7 @@ describe("authenticatedActionClient", () => {
   });
 
   test("executes action successfully when session and user exist", async () => {
-    vi.mocked(getServerSession).mockResolvedValue({ user: { id: "user-1" } });
+    vi.mocked(getSession).mockResolvedValue({ user: { id: "user-1" }, expires: "2999-01-01T00:00:00.000Z" });
     vi.mocked(getUser).mockResolvedValue({ id: "user-1", name: "Test" } as any);
 
     const action = authenticatedActionClient.action(async () => "success");

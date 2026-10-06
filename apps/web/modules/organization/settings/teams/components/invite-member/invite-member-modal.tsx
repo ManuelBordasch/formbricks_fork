@@ -20,16 +20,17 @@ import { IndividualInviteTab } from "./individual-invite-tab";
 interface InviteMemberModalProps {
   open: boolean;
   setOpen: (v: boolean) => void;
-  onSubmit: (data: TInvitee[]) => void;
+  onSubmit: (data: TInvitee[]) => Promise<boolean>;
   teams: TOrganizationTeam[];
+  organizationId: string;
   isAccessControlAllowed: boolean;
   isFormbricksCloud: boolean;
-  environmentId: string;
   membershipRole?: TOrganizationRole;
-  isStorageConfigured: boolean;
   isOwnerOrManager: boolean;
   isTeamAdmin: boolean;
   userAdminTeamIds?: string[];
+  enterpriseLicenseRequestFormUrl: string;
+  isBulkInviteAllowed: boolean;
 }
 
 export const InviteMemberModal = ({
@@ -37,15 +38,16 @@ export const InviteMemberModal = ({
   setOpen,
   onSubmit,
   teams,
+  organizationId,
   isAccessControlAllowed,
   isFormbricksCloud,
-  environmentId,
   membershipRole,
-  isStorageConfigured,
   isOwnerOrManager,
   isTeamAdmin,
   userAdminTeamIds,
-}: InviteMemberModalProps) => {
+  enterpriseLicenseRequestFormUrl,
+  isBulkInviteAllowed,
+}: Readonly<InviteMemberModalProps>) => {
   const [type, setType] = useState<"individual" | "bulk">("individual");
 
   const { t } = useTranslation();
@@ -61,22 +63,26 @@ export const InviteMemberModal = ({
     individual: (
       <IndividualInviteTab
         setOpen={setOpen}
-        environmentId={environmentId}
         onSubmit={onSubmit}
+        teams={filteredTeams}
+        organizationId={organizationId}
         isAccessControlAllowed={isAccessControlAllowed}
         isFormbricksCloud={isFormbricksCloud}
-        teams={filteredTeams}
         membershipRole={membershipRole}
         showTeamAdminRestrictions={showTeamAdminRestrictions}
+        enterpriseLicenseRequestFormUrl={enterpriseLicenseRequestFormUrl}
       />
     ),
     bulk: (
       <BulkInviteTab
         setOpen={setOpen}
         onSubmit={onSubmit}
+        teams={filteredTeams}
+        organizationId={organizationId}
         isAccessControlAllowed={isAccessControlAllowed}
         isFormbricksCloud={isFormbricksCloud}
-        isStorageConfigured={isStorageConfigured}
+        isBulkInviteAllowed={isBulkInviteAllowed}
+        enterpriseLicenseRequestFormUrl={enterpriseLicenseRequestFormUrl}
       />
     ),
   };
@@ -85,8 +91,8 @@ export const InviteMemberModal = ({
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent disableCloseOnOutsideClick unconstrained>
         <DialogHeader>
-          <DialogTitle>{t("environments.settings.teams.invite_member")}</DialogTitle>
-          <DialogDescription>{t("environments.settings.teams.invite_member_description")}</DialogDescription>
+          <DialogTitle>{t("workspace.settings.teams.invite_member")}</DialogTitle>
+          <DialogDescription>{t("workspace.settings.teams.invite_member_description")}</DialogDescription>
         </DialogHeader>
 
         <DialogBody className="flex min-h-0 flex-col gap-6 overflow-y-auto">
@@ -94,8 +100,8 @@ export const InviteMemberModal = ({
             <TabToggle
               id="type"
               options={[
-                { value: "individual", label: t("environments.settings.teams.individual") },
-                { value: "bulk", label: t("environments.settings.teams.bulk_invite") },
+                { value: "individual", label: t("workspace.settings.teams.individual") },
+                { value: "bulk", label: t("workspace.settings.teams.bulk_invite") },
               ]}
               onChange={(inviteType) => setType(inviteType)}
               defaultSelected={type}

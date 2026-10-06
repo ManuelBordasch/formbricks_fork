@@ -1,19 +1,24 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
-import { startHobbyAction, startProTrialAction } from "./actions";
+import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
+import { createTrialPaymentCheckoutAction, startHobbyAction, startProTrialAction } from "./actions";
 
 const mocks = vi.hoisted(() => ({
-  checkAuthorizationUpdated: vi.fn(),
+  assertCan: vi.fn(),
   getOrganization: vi.fn(),
+  getOrganizationIdFromWorkspaceId: vi.fn(),
+  getWorkspace: vi.fn(),
   createProTrialSubscription: vi.fn(),
   ensureCloudStripeSetupForOrganization: vi.fn(),
   ensureStripeCustomerForOrganization: vi.fn(),
   reconcileCloudStripeSubscriptionsForOrganization: vi.fn(),
   syncOrganizationBillingFromStripe: vi.fn(),
-  getOrganizationIdFromEnvironmentId: vi.fn(),
+  addOptimisticBillingFeature: vi.fn(),
   createCustomerPortalSession: vi.fn(),
   createSetupCheckoutSession: vi.fn(),
   isSubscriptionCancelled: vi.fn(),
   stripeCustomerSessionsCreate: vi.fn(),
+  getProTrialDays: vi.fn(),
+  applyRateLimit: vi.fn(),
 }));
 
 vi.mock("@/lib/utils/action-client", () => ({
@@ -26,10 +31,16 @@ vi.mock("@/lib/utils/action-client", () => ({
 
 vi.mock("@/lib/constants", () => ({
   WEBAPP_URL: "https://app.formbricks.com",
+  POSTHOG_KEY: undefined,
 }));
 
-vi.mock("@/lib/utils/action-client/action-client-middleware", () => ({
-  checkAuthorizationUpdated: mocks.checkAuthorizationUpdated,
+vi.mock("@/lib/posthog", () => ({
+  capturePostHogEvent: vi.fn(),
+  groupIdentifyPostHog: vi.fn(),
+}));
+
+vi.mock("@/lib/authorization", () => ({
+  assertCan: mocks.assertCan,
 }));
 
 vi.mock("@/lib/organization/service", () => ({
@@ -37,11 +48,19 @@ vi.mock("@/lib/organization/service", () => ({
 }));
 
 vi.mock("@/lib/utils/helper", () => ({
-  getOrganizationIdFromEnvironmentId: mocks.getOrganizationIdFromEnvironmentId,
+  getOrganizationIdFromWorkspaceId: mocks.getOrganizationIdFromWorkspaceId,
+}));
+
+vi.mock("@/lib/workspace/service", () => ({
+  getWorkspace: mocks.getWorkspace,
 }));
 
 vi.mock("@/modules/ee/audit-logs/lib/handler", () => ({
   withAuditLogging: vi.fn((_eventName, _objectType, fn) => fn),
+}));
+
+vi.mock("@/modules/core/rate-limit/helpers", () => ({
+  applyRateLimit: mocks.applyRateLimit,
 }));
 
 vi.mock("@/modules/ee/billing/api/lib/create-customer-portal-session", () => ({
@@ -62,6 +81,8 @@ vi.mock("@/modules/ee/billing/lib/organization-billing", () => ({
   ensureStripeCustomerForOrganization: mocks.ensureStripeCustomerForOrganization,
   reconcileCloudStripeSubscriptionsForOrganization: mocks.reconcileCloudStripeSubscriptionsForOrganization,
   syncOrganizationBillingFromStripe: mocks.syncOrganizationBillingFromStripe,
+  addOptimisticBillingFeature: mocks.addOptimisticBillingFeature,
+  getProTrialDays: mocks.getProTrialDays,
 }));
 
 vi.mock("@/modules/ee/billing/lib/stripe-client", () => ({
@@ -75,7 +96,7 @@ vi.mock("@/modules/ee/billing/lib/stripe-client", () => ({
 describe("billing actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.checkAuthorizationUpdated.mockResolvedValue(undefined);
+    mocks.assertCan.mockResolvedValue(undefined);
     mocks.getOrganization.mockResolvedValue({
       id: "org_1",
       billing: {
@@ -85,7 +106,10 @@ describe("billing actions", () => {
     mocks.ensureStripeCustomerForOrganization.mockResolvedValue({ customerId: "cus_1" });
     mocks.createProTrialSubscription.mockResolvedValue(undefined);
     mocks.reconcileCloudStripeSubscriptionsForOrganization.mockResolvedValue(undefined);
-    mocks.syncOrganizationBillingFromStripe.mockResolvedValue(undefined);
+    mocks.syncOrganizationBillingFromStripe.mockResolvedValue({ stripe: { features: ["ai-smart-tools"] } });
+    mocks.addOptimisticBillingFeature.mockResolvedValue(undefined);
+    mocks.getProTrialDays.mockResolvedValue(14);
+    mocks.applyRateLimit.mockResolvedValue(undefined);
   });
 
   test("startHobbyAction ensures a customer, reconciles hobby, and syncs billing", async () => {
@@ -94,15 +118,9 @@ describe("billing actions", () => {
       parsedInput: { organizationId: "org_1" },
     } as any);
 
-    expect(mocks.checkAuthorizationUpdated).toHaveBeenCalledWith({
-      userId: "user_1",
-      organizationId: "org_1",
-      access: [
-        {
-          type: "organization",
-          roles: ["owner", "manager"],
-        },
-      ],
+    expect(mocks.assertCan).toHaveBeenCalledWith({ type: "user", id: "user_1" }, "organization.manage", {
+      type: "organization",
+      id: "org_1",
     });
     expect(mocks.getOrganization).toHaveBeenCalledWith("org_1");
     expect(mocks.ensureStripeCustomerForOrganization).toHaveBeenCalledWith("org_1");
@@ -131,16 +149,34 @@ describe("billing actions", () => {
   });
 
   test("startProTrialAction uses ensured customer when org snapshot has no stripe customer id", async () => {
+    const auditLoggingCtx: { organizationId?: string; newObject?: Record<string, unknown> } = {};
     const result = await startProTrialAction({
-      ctx: { user: { id: "user_1" } },
+      ctx: { user: { id: "user_1" }, auditLoggingCtx },
       parsedInput: { organizationId: "org_1" },
     } as any);
 
+    expect(mocks.applyRateLimit).toHaveBeenCalledWith(rateLimitConfigs.actions.stateMutation, "org_1");
     expect(mocks.getOrganization).toHaveBeenCalledWith("org_1");
     expect(mocks.ensureStripeCustomerForOrganization).toHaveBeenCalledWith("org_1");
-    expect(mocks.createProTrialSubscription).toHaveBeenCalledWith("org_1", "cus_1");
+    expect(mocks.getProTrialDays).toHaveBeenCalledWith("org_1");
+    expect(mocks.createProTrialSubscription).toHaveBeenCalledWith("org_1", "cus_1", 14);
     expect(mocks.reconcileCloudStripeSubscriptionsForOrganization).toHaveBeenCalledWith("org_1");
     expect(mocks.syncOrganizationBillingFromStripe).toHaveBeenCalledWith("org_1");
+    expect(mocks.addOptimisticBillingFeature).toHaveBeenCalledWith("org_1", "ai-smart-tools");
+    expect(auditLoggingCtx.organizationId).toBe("org_1");
+    expect(auditLoggingCtx.newObject).toEqual({ plan: "pro", trialDurationDays: 14 });
+    expect(result).toEqual({ success: true });
+  });
+
+  test("startProTrialAction passes the shortened trial length when the A/B test variant is active", async () => {
+    mocks.getProTrialDays.mockResolvedValue(7);
+
+    const result = await startProTrialAction({
+      ctx: { user: { id: "user_1" }, auditLoggingCtx: {} },
+      parsedInput: { organizationId: "org_1" },
+    } as any);
+
+    expect(mocks.createProTrialSubscription).toHaveBeenCalledWith("org_1", "cus_1", 7);
     expect(result).toEqual({ success: true });
   });
 
@@ -153,14 +189,81 @@ describe("billing actions", () => {
     });
 
     const result = await startProTrialAction({
-      ctx: { user: { id: "user_1" } },
+      ctx: { user: { id: "user_1" }, auditLoggingCtx: {} },
       parsedInput: { organizationId: "org_1" },
     } as any);
 
     expect(mocks.ensureStripeCustomerForOrganization).not.toHaveBeenCalled();
-    expect(mocks.createProTrialSubscription).toHaveBeenCalledWith("org_1", "cus_existing");
+    expect(mocks.createProTrialSubscription).toHaveBeenCalledWith("org_1", "cus_existing", 14);
     expect(mocks.reconcileCloudStripeSubscriptionsForOrganization).toHaveBeenCalledWith("org_1");
     expect(mocks.syncOrganizationBillingFromStripe).toHaveBeenCalledWith("org_1");
+    expect(mocks.addOptimisticBillingFeature).toHaveBeenCalledWith("org_1", "ai-smart-tools");
     expect(result).toEqual({ success: true });
+  });
+
+  test("createTrialPaymentCheckoutAction forwards upgrade intent to setup checkout", async () => {
+    mocks.getOrganizationIdFromWorkspaceId.mockResolvedValue("org_1");
+    mocks.getOrganization.mockResolvedValue({
+      id: "org_1",
+      billing: {
+        stripeCustomerId: "cus_1",
+        stripe: {
+          subscriptionId: "sub_1",
+        },
+      },
+    });
+    mocks.getWorkspace.mockResolvedValue({ id: "ws_1" });
+    mocks.createSetupCheckoutSession.mockResolvedValue("https://checkout.stripe.test/setup");
+
+    const result = await createTrialPaymentCheckoutAction({
+      ctx: { user: { id: "user_1" }, auditLoggingCtx: {} },
+      parsedInput: {
+        organizationId: "org_1",
+        targetPlan: "pro",
+        targetInterval: "yearly",
+      },
+    } as any);
+
+    expect(mocks.createSetupCheckoutSession).toHaveBeenCalledWith(
+      "cus_1",
+      "sub_1",
+      "https://app.formbricks.com/organizations/org_1/settings/billing",
+      "org_1",
+      {
+        targetPlan: "pro",
+        targetInterval: "yearly",
+      }
+    );
+    expect(result).toBe("https://checkout.stripe.test/setup");
+  });
+
+  test("createTrialPaymentCheckoutAction creates payment-only setup checkout without upgrade intent", async () => {
+    mocks.getOrganizationIdFromWorkspaceId.mockResolvedValue("org_1");
+    mocks.getOrganization.mockResolvedValue({
+      id: "org_1",
+      billing: {
+        stripeCustomerId: "cus_1",
+        stripe: {
+          subscriptionId: "sub_1",
+        },
+      },
+    });
+    mocks.getWorkspace.mockResolvedValue({ id: "ws_1" });
+    mocks.createSetupCheckoutSession.mockResolvedValue("https://checkout.stripe.test/setup");
+
+    await createTrialPaymentCheckoutAction({
+      ctx: { user: { id: "user_1" }, auditLoggingCtx: {} },
+      parsedInput: {
+        organizationId: "org_1",
+      },
+    } as any);
+
+    expect(mocks.createSetupCheckoutSession).toHaveBeenCalledWith(
+      "cus_1",
+      "sub_1",
+      "https://app.formbricks.com/organizations/org_1/settings/billing",
+      "org_1",
+      undefined
+    );
   });
 });

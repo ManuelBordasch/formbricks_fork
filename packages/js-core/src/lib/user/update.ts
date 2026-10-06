@@ -1,4 +1,3 @@
-/* eslint-disable no-console -- required for logging errors */
 import { ApiClient } from "@/lib/common/api";
 import { Config } from "@/lib/common/config";
 import { Logger } from "@/lib/common/logger";
@@ -8,11 +7,11 @@ import { type ApiErrorResponse, type Result, type ResultError, err, ok } from "@
 
 export const sendUpdatesToBackend = async ({
   appUrl,
-  environmentId,
+  workspaceId,
   updates,
 }: {
   appUrl: string;
-  environmentId: string;
+  workspaceId: string;
   updates: TUpdates;
 }): Promise<
   Result<
@@ -24,12 +23,12 @@ export const sendUpdatesToBackend = async ({
     ApiErrorResponse
   >
 > => {
-  const url = `${appUrl}/api/v1/client/${environmentId}/user`;
+  const url = `${appUrl}/api/v1/client/${workspaceId}/user`;
 
   try {
     const api = new ApiClient({
       appUrl,
-      environmentId,
+      workspaceId,
       isDebug: getIsDebug(),
     });
 
@@ -72,19 +71,19 @@ export const sendUpdates = async ({
   const config = Config.getInstance();
   const logger = Logger.getInstance();
 
-  const { appUrl, environmentId } = config.get();
+  const { appUrl, workspaceId } = config.get();
   // update endpoint call
-  const url = `${appUrl}/api/v1/client/${environmentId}/user`;
+  const url = `${appUrl}/api/v1/client/${workspaceId}/user`;
 
   try {
-    const updatesResponse = await sendUpdatesToBackend({ appUrl, environmentId, updates });
+    const updatesResponse = await sendUpdatesToBackend({ appUrl, workspaceId, updates });
 
     if (!updatesResponse.ok) {
       return err(updatesResponse.error);
     }
 
     const userState = updatesResponse.data.state;
-    const filteredSurveys = filterSurveys(config.get().environment, userState);
+    const filteredSurveys = filterSurveys(config.get().workspace, userState);
 
     // messages => informational debug messages (e.g., "email already exists")
     // errors => error messages that should always be visible (e.g., invalid attribute keys)

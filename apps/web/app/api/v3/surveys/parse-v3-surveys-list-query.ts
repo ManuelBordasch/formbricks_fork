@@ -28,6 +28,7 @@ const SUPPORTED_QUERY_PARAMS = [
   "workspaceId",
   "limit",
   "cursor",
+  "includeTotalCount",
   FILTER_NAME_CONTAINS_QUERY_PARAM,
   FILTER_STATUS_IN_QUERY_PARAM,
   FILTER_TYPE_IN_QUERY_PARAM,
@@ -53,12 +54,19 @@ const ZV3SurveysListQuery = z.object({
   workspaceId: ZId,
   limit: z.coerce.number().int().min(1).max(V3_SURVEYS_MAX_LIMIT).default(V3_SURVEYS_DEFAULT_LIMIT),
   cursor: z.string().min(1).optional(),
+  includeTotalCount: z
+    .enum(["true", "false"])
+    .optional()
+    .transform((value) => value !== "false")
+    .default(true),
   [FILTER_NAME_CONTAINS_QUERY_PARAM]: z
     .string()
     .max(512)
     .optional()
     .transform((s) => (s === undefined || s.trim() === "" ? undefined : s.trim())),
-  [FILTER_STATUS_IN_QUERY_PARAM]: z.array(ZSurveyStatus).optional(),
+  // "archived" is a pseudo-status accepted only by the list filter; it is translated
+  // into an archivedAt filter (see buildFilterCriteria) rather than a real status match.
+  [FILTER_STATUS_IN_QUERY_PARAM]: z.array(z.union([ZSurveyStatus, z.literal("archived")])).optional(),
   [FILTER_TYPE_IN_QUERY_PARAM]: z.array(ZSurveyType).optional(),
   sortBy: ZSurveyFilters.shape.sortBy.optional(),
 });
@@ -71,6 +79,7 @@ export type TV3SurveysListQueryParseResult =
       workspaceId: string;
       limit: number;
       cursor: TSurveyListPageCursor | null;
+      includeTotalCount: boolean;
       sortBy: TSurveyListSort;
       filterCriteria: TSurveyFilterCriteria | undefined;
     }
@@ -90,7 +99,13 @@ function getUnsupportedQueryParams(searchParams: URLSearchParams): InvalidParam[
 function buildFilterCriteria(q: TV3SurveysListQuery): TSurveyFilterCriteria | undefined {
   const f: TSurveyFilterCriteria = {};
   if (q[FILTER_NAME_CONTAINS_QUERY_PARAM]) f.name = q[FILTER_NAME_CONTAINS_QUERY_PARAM];
-  if (q[FILTER_STATUS_IN_QUERY_PARAM]?.length) f.status = q[FILTER_STATUS_IN_QUERY_PARAM];
+  const statusValues = q[FILTER_STATUS_IN_QUERY_PARAM] ?? [];
+  // Split the "archived" pseudo-status out from real statuses.
+  const realStatuses = statusValues.filter(
+    (status): status is z.infer<typeof ZSurveyStatus> => status !== "archived"
+  );
+  if (realStatuses.length) f.status = realStatuses;
+  if (statusValues.includes("archived")) f.includeArchived = true;
   if (q[FILTER_TYPE_IN_QUERY_PARAM]?.length) f.type = q[FILTER_TYPE_IN_QUERY_PARAM];
   return Object.keys(f).length > 0 ? f : undefined;
 }
@@ -111,6 +126,7 @@ export function parseV3SurveysListQuery(searchParams: URLSearchParams): TV3Surve
     workspaceId: searchParams.get("workspaceId"),
     limit: searchParams.get("limit") ?? undefined,
     cursor: searchParams.get("cursor")?.trim() || undefined,
+    includeTotalCount: searchParams.get("includeTotalCount")?.trim() || undefined,
     [FILTER_NAME_CONTAINS_QUERY_PARAM]: searchParams.get(FILTER_NAME_CONTAINS_QUERY_PARAM) ?? undefined,
     [FILTER_STATUS_IN_QUERY_PARAM]: statusVals.length > 0 ? statusVals : undefined,
     [FILTER_TYPE_IN_QUERY_PARAM]: typeVals.length > 0 ? typeVals : undefined,
@@ -153,6 +169,7 @@ export function parseV3SurveysListQuery(searchParams: URLSearchParams): TV3Surve
     workspaceId: q.workspaceId,
     limit: q.limit,
     cursor,
+    includeTotalCount: q.includeTotalCount,
     sortBy,
     filterCriteria: buildFilterCriteria(q),
   };

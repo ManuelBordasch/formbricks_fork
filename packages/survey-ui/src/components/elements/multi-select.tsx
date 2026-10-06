@@ -1,7 +1,6 @@
-import { ChevronDown } from "lucide-react";
+import { Check, ChevronDown } from "lucide-react";
 import * as React from "react";
 import { Button } from "@/components/general/button";
-import { Checkbox } from "@/components/general/checkbox";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -13,7 +12,7 @@ import {
   SEARCH_THRESHOLD,
   useDropdownSearch,
 } from "@/components/general/dropdown-search";
-import { ElementError } from "@/components/general/element-error";
+import { ElementError, getElementErrorAria } from "@/components/general/element-error";
 import { ElementHeader } from "@/components/general/element-header";
 import { Input } from "@/components/general/input";
 import { cn } from "@/lib/utils";
@@ -93,10 +92,83 @@ const getOptionContainerClassName = (isSelected: boolean, isDisabled: boolean): 
     "relative flex flex-col border transition-colors outline-none",
     "rounded-option px-option-x py-option-y",
     isSelected ? "bg-option-selected-bg border-brand" : "bg-option-bg border-option-border",
-    "focus-within:border-brand focus-within:bg-option-selected-bg",
+    // No focus-within fill: it repainted the option in the *selected* colors, so the card's
+    // mount autofocus made option 1 look answered (ENG-2288). Focus has its own uniform ring
+    // on the option label, from survey-ui's globals.css.
     "hover:bg-option-hover-bg",
     isDisabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"
   );
+
+/**
+ * Custom checkbox indicator driven by the sibling native input's :checked state via the Tailwind
+ * `peer` utility. The native <input type="checkbox"> is visually hidden (sr-only) but stays in the
+ * DOM as the real, focusable control; this span only paints the box and tick.
+ */
+function CheckboxIndicator(): React.JSX.Element {
+  return (
+    <span
+      aria-hidden="true"
+      className={cn(
+        "border-input-border text-brand-foreground relative flex size-4 shrink-0 items-center justify-center rounded-[4px] border bg-white shadow-xs transition-colors",
+        "peer-checked:bg-brand peer-checked:border-brand",
+        // The tick lives inside this sibling span, so reveal it via a peer-checked descendant rule.
+        "[&>svg]:opacity-0 [&>svg]:transition-opacity peer-checked:[&>svg]:opacity-100"
+      )}>
+      <Check className="size-3.5" />
+    </span>
+  );
+}
+
+interface MultiSelectOptionItemProps {
+  inputId: string;
+  option: MultiSelectOption;
+  isChecked: boolean;
+  isDisabled: boolean;
+  errorMessage?: string;
+  onAdd: (optionId: string) => void;
+  onRemove: (optionId: string) => void;
+}
+
+function MultiSelectOptionItem({
+  inputId,
+  option,
+  isChecked,
+  isDisabled,
+  errorMessage,
+  onAdd,
+  onRemove,
+}: Readonly<MultiSelectOptionItemProps>): React.JSX.Element {
+  const optionId = `${inputId}-${option.id}`;
+
+  return (
+    <label
+      key={option.id}
+      htmlFor={optionId}
+      className={cn(getOptionContainerClassName(isChecked, isDisabled), isChecked && "z-10")}>
+      <span className="flex items-center">
+        <input
+          type="checkbox"
+          id={optionId}
+          name={inputId}
+          value={option.id}
+          checked={isChecked}
+          disabled={isDisabled}
+          aria-invalid={Boolean(errorMessage)}
+          className="peer sr-only"
+          onChange={(e) => {
+            if (e.target.checked) {
+              onAdd(option.id);
+            } else {
+              onRemove(option.id);
+            }
+          }}
+        />
+        <CheckboxIndicator />
+        <span className={cn("mx-3", optionLabelClassName)}>{option.label}</span>
+      </span>
+    </label>
+  );
+}
 
 interface DropdownVariantProps {
   inputId: string;
@@ -105,7 +177,6 @@ interface DropdownVariantProps {
   handleOptionAdd: (optionId: string) => void;
   handleOptionRemove: (optionId: string) => void;
   disabled: boolean;
-  headline: string;
   errorMessage?: string;
   displayText: string;
   hasOtherOption: boolean;
@@ -129,7 +200,6 @@ function DropdownVariant({
   handleOptionAdd,
   handleOptionRemove,
   disabled,
-  headline,
   errorMessage,
   displayText,
   hasOtherOption,
@@ -141,10 +211,11 @@ function DropdownVariant({
   otherOptionPlaceholder,
   dir,
   otherInputRef,
-  required,
   searchPlaceholder,
   searchNoResultsText,
 }: Readonly<DropdownVariantProps>): React.JSX.Element {
+  const errorAria = getElementErrorAria(inputId, errorMessage);
+
   const handleOptionToggle = (optionId: string): void => {
     if (selectedValues.includes(optionId)) {
       handleOptionRemove(optionId);
@@ -170,24 +241,34 @@ function DropdownVariant({
     hasNoResults,
     handleDropdownOpen,
     handleDropdownClose,
+    focusMenuItem,
+    handleContentKeyDown,
   } = useDropdownSearch({ options, hasOtherOption, otherOptionLabel, isSearchEnabled: showSearch });
 
   return (
     <div>
-      <ElementError errorMessage={errorMessage} dir={dir} />
+      <ElementError errorMessage={errorMessage} dir={dir} id={errorAria.errorId} />
       <DropdownMenu
         onOpenChange={(open) => {
           if (open) handleDropdownOpen();
           else handleDropdownClose();
         }}>
         <DropdownMenuTrigger asChild>
+          {/* Named via aria-labelledby (headline + visible value) instead of aria-label:
+              a rich-text headline would leak raw HTML into the accessible name, and the
+              name must contain the visible text (WCAG 2.5.3 Label in Name). */}
           <Button
             variant="outline"
             disabled={disabled}
             className="rounded-input min-h-input bg-input-bg border-input-border text-input-text py-input-y px-input-x w-full justify-between"
-            aria-invalid={Boolean(errorMessage)}
-            aria-label={headline}>
-            <span className="font-input font-input-weight text-input-text truncate">{displayText}</span>
+            aria-invalid={errorAria.ariaInvalid}
+            aria-describedby={errorAria.ariaDescribedBy}
+            aria-labelledby={`${inputId}-headline ${inputId}-trigger-value`}>
+            <span
+              id={`${inputId}-trigger-value`}
+              className="font-input font-input-weight text-input-text truncate">
+              {displayText}
+            </span>
             <ChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
           </Button>
         </DropdownMenuTrigger>
@@ -196,7 +277,8 @@ function DropdownVariant({
           side={lockedSide}
           avoidCollisions={lockedSide === undefined}
           className="bg-option-bg border-input-border w-(--radix-dropdown-menu-trigger-width) overflow-hidden"
-          align="start">
+          align="start"
+          onKeyDown={handleContentKeyDown}>
           {showSearch ? (
             <DropdownSearchInput
               searchQuery={searchQuery}
@@ -204,6 +286,7 @@ function DropdownVariant({
               searchInputRef={searchInputRef}
               placeholder={searchPlaceholder}
               dir={dir}
+              onNavigateToOptions={focusMenuItem}
             />
           ) : null}
           <div className="max-h-[260px] overflow-y-auto">
@@ -271,6 +354,10 @@ function DropdownVariant({
           </div>
         </DropdownMenuContent>
       </DropdownMenu>
+      {/* The dropdown branch renders no fieldset/group, and this free text is a SIBLING of the
+          trigger rather than a descendant, so nothing above it would supply a description. It also
+          needs one most: validateMultiSelectOtherValue errors precisely when this box is empty, and
+          it is the only native input[aria-invalid] here, so focusFirstControl lands right on it. */}
       {isOtherSelected ? (
         <Input
           ref={otherInputRef}
@@ -279,7 +366,9 @@ function DropdownVariant({
           onChange={handleOtherInputChange}
           placeholder={otherOptionPlaceholder}
           disabled={disabled}
-          aria-required={required}
+          aria-required
+          aria-invalid={errorAria.ariaInvalid}
+          aria-describedby={errorAria.ariaDescribedBy}
           dir={dir}
           className="mt-2 w-full"
         />
@@ -296,7 +385,6 @@ interface ListVariantProps {
   handleOptionAdd: (optionId: string) => void;
   handleOptionRemove: (optionId: string) => void;
   disabled: boolean;
-  headline: string;
   errorMessage?: string;
   hasOtherOption: boolean;
   otherOptionId?: string;
@@ -307,7 +395,6 @@ interface ListVariantProps {
   otherOptionPlaceholder: string;
   dir: TextDirection;
   otherInputRef: React.RefObject<HTMLInputElement | null>;
-  required: boolean;
 }
 
 function ListVariant({
@@ -318,7 +405,6 @@ function ListVariant({
   handleOptionAdd,
   handleOptionRemove,
   disabled,
-  headline,
   errorMessage,
   hasOtherOption,
   otherOptionId,
@@ -329,119 +415,88 @@ function ListVariant({
   otherOptionPlaceholder,
   dir,
   otherInputRef,
-  required,
 }: Readonly<ListVariantProps>): React.JSX.Element {
   const isNoneSelected = value.includes("none");
+  const otherTextId = otherOptionId ? `${inputId}-${otherOptionId}-input` : undefined;
+  const errorAria = getElementErrorAria(inputId, errorMessage);
+
+  const renderOption = (option: MultiSelectOption): React.JSX.Element => {
+    const isChecked = selectedValues.includes(option.id);
+    const isDisabled = disabled || (isNoneSelected && option.id !== "none");
+    return (
+      <MultiSelectOptionItem
+        key={option.id}
+        inputId={inputId}
+        option={option}
+        isChecked={isChecked}
+        isDisabled={isDisabled}
+        errorMessage={errorMessage}
+        onAdd={handleOptionAdd}
+        onRemove={handleOptionRemove}
+      />
+    );
+  };
 
   return (
     <>
-      <ElementError errorMessage={errorMessage} dir={dir} />
-      <fieldset className="space-y-2" aria-label={headline}>
-        {options
-          .filter((option) => option.id !== "none")
-          .map((option) => {
-            const isChecked = selectedValues.includes(option.id);
-            const optionId = `${inputId}-${option.id}`;
-            const isDisabled = disabled || (isNoneSelected && option.id !== "none");
-            return (
-              <label
-                key={option.id}
-                htmlFor={optionId}
-                className={cn(getOptionContainerClassName(isChecked, isDisabled), isChecked && "z-10")}>
-                <span className="flex items-center">
-                  <Checkbox
-                    id={optionId}
-                    name={inputId}
-                    checked={isChecked}
-                    onCheckedChange={(checked) => {
-                      if (checked === true) {
-                        handleOptionAdd(option.id);
-                      } else {
-                        handleOptionRemove(option.id);
-                      }
-                    }}
-                    disabled={isDisabled}
-                    aria-invalid={Boolean(errorMessage)}
-                  />
-                  <span className={cn("mx-3", optionLabelClassName)}>{option.label}</span>
-                </span>
-              </label>
-            );
-          })}
+      <ElementError errorMessage={errorMessage} dir={dir} id={errorAria.errorId} />
+      <div className="space-y-2">
+        {options.filter((option) => option.id !== "none").map(renderOption)}
         {hasOtherOption && otherOptionId ? (
-          <div className="space-y-2">
-            <label
-              htmlFor={`${inputId}-${otherOptionId}`}
-              className={cn(
-                getOptionContainerClassName(isOtherSelected, disabled || isNoneSelected),
-                isOtherSelected && "z-10"
-              )}>
-              <span className="flex items-center">
-                <Checkbox
-                  id={`${inputId}-${otherOptionId}`}
-                  name={inputId}
-                  checked={isOtherSelected}
-                  onCheckedChange={(checked) => {
-                    if (checked === true) {
-                      handleOptionAdd(otherOptionId);
-                    } else {
-                      handleOptionRemove(otherOptionId);
-                    }
-                  }}
-                  disabled={disabled || isNoneSelected}
-                  aria-invalid={Boolean(errorMessage)}
-                />
-                <span className={cn("mx-3 grow", optionLabelClassName)}>{otherOptionLabel}</span>
-              </span>
-              {isOtherSelected ? (
-                <Input
-                  type="text"
-                  value={otherValue}
-                  onChange={handleOtherInputChange}
-                  placeholder={otherOptionPlaceholder}
-                  disabled={disabled}
-                  aria-required={required}
-                  dir={dir}
-                  className="mt-2 w-full"
-                  ref={otherInputRef}
-                />
-              ) : null}
+          // The free-text input must NOT live inside the option <label>: a label may own only one
+          // labelable control, and label-area clicks would forward to the checkbox and toggle "Other"
+          // off. The bordered box is a plain container; only the option row is the checkbox's label.
+          <div
+            className={cn(
+              getOptionContainerClassName(isOtherSelected, disabled || isNoneSelected),
+              isOtherSelected && "z-10"
+            )}>
+            <label htmlFor={`${inputId}-${otherOptionId}`} className="flex cursor-pointer items-center">
+              <input
+                type="checkbox"
+                id={`${inputId}-${otherOptionId}`}
+                name={inputId}
+                value={otherOptionId}
+                checked={isOtherSelected}
+                disabled={disabled || isNoneSelected}
+                aria-invalid={Boolean(errorMessage)}
+                className="peer sr-only"
+                onChange={(e) => {
+                  if (e.target.checked) {
+                    handleOptionAdd(otherOptionId);
+                  } else {
+                    handleOptionRemove(otherOptionId);
+                  }
+                }}
+              />
+              <CheckboxIndicator />
+              <span className={cn("mx-3 grow", optionLabelClassName)}>{otherOptionLabel}</span>
             </label>
+            {/* The enclosing <fieldset> carries aria-describedby, but an ancestor's description is
+                not part of a descendant's accessible description (accname): focusing this input
+                announces its own name/state/description only. Without this it would read as invalid
+                with no reason. It describes one text input, not each option, so nothing repeats. */}
+            {isOtherSelected ? (
+              <Input
+                type="text"
+                id={otherTextId}
+                value={otherValue}
+                onChange={handleOtherInputChange}
+                placeholder={otherOptionPlaceholder}
+                disabled={disabled}
+                aria-required
+                aria-label={otherOptionLabel}
+                aria-invalid={errorAria.ariaInvalid}
+                aria-describedby={errorAria.ariaDescribedBy}
+                dir={dir}
+                className="mt-2 w-full"
+                ref={otherInputRef}
+              />
+            ) : null}
           </div>
         ) : null}
-        {options
-          .filter((option) => option.id === "none")
-          .map((option) => {
-            const isChecked = selectedValues.includes(option.id);
-            const optionId = `${inputId}-${option.id}`;
-            const isDisabled = disabled || (isNoneSelected && option.id !== "none");
-            return (
-              <label
-                key={option.id}
-                htmlFor={optionId}
-                className={cn(getOptionContainerClassName(isChecked, isDisabled), isChecked && "z-10")}>
-                <span className="flex items-center">
-                  <Checkbox
-                    id={optionId}
-                    name={inputId}
-                    checked={isChecked}
-                    onCheckedChange={(checked) => {
-                      if (checked === true) {
-                        handleOptionAdd(option.id);
-                      } else {
-                        handleOptionRemove(option.id);
-                      }
-                    }}
-                    disabled={isDisabled}
-                    required={false}
-                    aria-invalid={Boolean(errorMessage)}
-                  />
-                  <span className={cn("mx-3", optionLabelClassName)}>{option.label}</span>
-                </span>
-              </label>
-            );
-          })}
-      </fieldset>
+        {options.filter((option) => option.id === "none").map(renderOption)}
+      </div>
     </>
   );
 }
@@ -477,11 +532,12 @@ function MultiSelect({
   const hasOtherOption = Boolean(otherOptionId);
   const isOtherSelected = Boolean(hasOtherOption && otherOptionId && selectedValues.includes(otherOptionId));
   const otherInputRef = React.useRef<HTMLInputElement>(null);
+  const errorAria = getElementErrorAria(inputId, errorMessage);
 
   React.useEffect(() => {
     if (!isOtherSelected || disabled) return;
 
-    // Delay focus to win against Radix focus restoration when dropdown closes / checkbox receives focus.
+    // Delay focus to win against focus restoration when dropdown closes / checkbox receives focus.
     const timeoutId = globalThis.setTimeout(() => {
       globalThis.requestAnimationFrame(() => {
         otherInputRef.current?.focus();
@@ -526,69 +582,93 @@ function MultiSelect({
     displayText = selectedLabels.join(", ");
   }
 
+  const isListVariant = variant === "list";
+
   return (
     <div className="w-full space-y-4" id={elementId} dir={dir}>
-      {/* Headline */}
-      <ElementHeader
-        headline={headline}
-        description={description}
-        required={required}
-        requiredLabel={requiredLabel}
-        htmlFor={inputId}
-        imageUrl={imageUrl}
-        videoUrl={videoUrl}
-      />
-
-      {/* Options */}
-      <div className="relative" data-element-input>
-        {variant === "dropdown" ? (
-          <DropdownVariant
-            inputId={inputId}
-            options={options}
-            selectedValues={selectedValues}
-            handleOptionAdd={handleOptionAdd}
-            handleOptionRemove={handleOptionRemove}
-            disabled={disabled}
+      {isListVariant ? (
+        // A checkbox group is role="group", which ARIA 1.2 gives neither aria-required nor
+        // aria-invalid (aria-invalid was global in ARIA 1.1 but is not in 1.2), and checkboxes have
+        // no radiogroup-equivalent role. Only the visible "Required" badge conveys requiredness;
+        // aria-invalid stays as a best-effort hook while the live region carries the announcement.
+        // The group is named by its headline via aria-labelledby instead of a <legend>, so the
+        // headline's media/required badge are not nested in invalid block content.
+        <fieldset
+          className="w-full space-y-4"
+          aria-labelledby={`${inputId}-headline`}
+          aria-invalid={errorAria.ariaInvalid}
+          aria-describedby={errorAria.ariaDescribedBy}>
+          <ElementHeader
+            headlineId={`${inputId}-headline`}
             headline={headline}
-            errorMessage={errorMessage}
-            displayText={displayText}
-            hasOtherOption={hasOtherOption}
-            otherOptionId={otherOptionId}
-            isOtherSelected={isOtherSelected}
-            otherOptionLabel={otherOptionLabel}
-            otherValue={otherValue}
-            handleOtherInputChange={handleOtherInputChange}
-            otherOptionPlaceholder={otherOptionPlaceholder}
-            dir={dir}
-            otherInputRef={otherInputRef}
+            description={description}
             required={required}
-            searchPlaceholder={searchPlaceholder}
-            searchNoResultsText={searchNoResultsText}
+            requiredLabel={requiredLabel}
+            imageUrl={imageUrl}
+            videoUrl={videoUrl}
           />
-        ) : (
-          <ListVariant
-            inputId={inputId}
-            options={options}
-            selectedValues={selectedValues}
-            value={value}
-            handleOptionAdd={handleOptionAdd}
-            handleOptionRemove={handleOptionRemove}
-            disabled={disabled}
+          <div className="relative" data-element-input>
+            <ListVariant
+              inputId={inputId}
+              options={options}
+              selectedValues={selectedValues}
+              value={value}
+              handleOptionAdd={handleOptionAdd}
+              handleOptionRemove={handleOptionRemove}
+              disabled={disabled}
+              errorMessage={errorMessage}
+              hasOtherOption={hasOtherOption}
+              otherOptionId={otherOptionId}
+              isOtherSelected={isOtherSelected}
+              otherOptionLabel={otherOptionLabel}
+              otherValue={otherValue}
+              handleOtherInputChange={handleOtherInputChange}
+              otherOptionPlaceholder={otherOptionPlaceholder}
+              dir={dir}
+              otherInputRef={otherInputRef}
+            />
+          </div>
+        </fieldset>
+      ) : (
+        <>
+          {/* Dropdown trigger is a Radix menu button named via aria-labelledby (headline id +
+              visible value id); the headline is a plain label here (no htmlFor) to avoid
+              pointing at a non-input. */}
+          <ElementHeader
+            headlineId={`${inputId}-headline`}
             headline={headline}
-            errorMessage={errorMessage}
-            hasOtherOption={hasOtherOption}
-            otherOptionId={otherOptionId}
-            isOtherSelected={isOtherSelected}
-            otherOptionLabel={otherOptionLabel}
-            otherValue={otherValue}
-            handleOtherInputChange={handleOtherInputChange}
-            otherOptionPlaceholder={otherOptionPlaceholder}
-            dir={dir}
-            otherInputRef={otherInputRef}
+            description={description}
             required={required}
+            requiredLabel={requiredLabel}
+            imageUrl={imageUrl}
+            videoUrl={videoUrl}
           />
-        )}
-      </div>
+          <div className="relative" data-element-input>
+            <DropdownVariant
+              inputId={inputId}
+              options={options}
+              selectedValues={selectedValues}
+              handleOptionAdd={handleOptionAdd}
+              handleOptionRemove={handleOptionRemove}
+              disabled={disabled}
+              errorMessage={errorMessage}
+              displayText={displayText}
+              hasOtherOption={hasOtherOption}
+              otherOptionId={otherOptionId}
+              isOtherSelected={isOtherSelected}
+              otherOptionLabel={otherOptionLabel}
+              otherValue={otherValue}
+              handleOtherInputChange={handleOtherInputChange}
+              otherOptionPlaceholder={otherOptionPlaceholder}
+              dir={dir}
+              otherInputRef={otherInputRef}
+              required={required}
+              searchPlaceholder={searchPlaceholder}
+              searchNoResultsText={searchNoResultsText}
+            />
+          </div>
+        </>
+      )}
     </div>
   );
 }

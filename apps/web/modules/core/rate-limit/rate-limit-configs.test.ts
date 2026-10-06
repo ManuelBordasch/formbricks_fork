@@ -59,26 +59,96 @@ describe("rateLimitConfigs", () => {
       expect(rateLimitConfigs).toHaveProperty("auth");
       expect(rateLimitConfigs).toHaveProperty("api");
       expect(rateLimitConfigs).toHaveProperty("actions");
+      expect(rateLimitConfigs).toHaveProperty("storage");
     });
 
     test("should have all auth configurations", () => {
       const authConfigs = Object.keys(rateLimitConfigs.auth);
-      expect(authConfigs).toEqual(["login", "signup", "forgotPassword", "verifyEmail"]);
+      expect(authConfigs).toEqual([
+        "login",
+        "signup",
+        "forgotPassword",
+        "resetPassword",
+        "verifyEmail",
+        "emailToken",
+      ]);
+      expect(rateLimitConfigs.auth.resetPassword).toEqual({
+        interval: 3600,
+        allowedPerInterval: 5,
+        namespace: "auth:reset-password",
+      });
+      // The values, not just the key: emailToken throttles an unauthenticated endpoint that also
+      // reveals whether an address is registered, so a loosened quota is a security regression.
+      expect(rateLimitConfigs.auth.emailToken).toEqual({
+        interval: 3600,
+        allowedPerInterval: 10,
+        namespace: "auth:email-token",
+      });
     });
 
     test("should have all API configurations", () => {
       const apiConfigs = Object.keys(rateLimitConfigs.api);
-      expect(apiConfigs).toEqual(["v1", "v2", "v3", "client"]);
+      expect(apiConfigs).toEqual([
+        "v1",
+        "v2",
+        "v3",
+        "mcpAuth",
+        "v3SurveyGenerate",
+        "internalDatasetPurge",
+        "client",
+        "clientEnvironment",
+      ]);
     });
 
     test("should have all action configurations", () => {
       const actionConfigs = Object.keys(rateLimitConfigs.actions);
       expect(actionConfigs).toEqual([
         "emailUpdate",
+        "accountDeletion",
         "surveyFollowUp",
         "sendLinkSurveyEmail",
+        "validateSurveyPin",
         "licenseRecheck",
+        "unsplash",
+        "inviteMember",
+        "generateExampleResponses",
+        "integrationMutation",
+        "feedbackSourceMutation",
+        "historicalResponseImport",
+        "chartCreation",
+        "feedbackDirectoryMutation",
+        "feedbackRecordDeletion",
+        "stateMutation",
       ]);
+
+      // Exact values, not just presence: this quota is the only thing bounding one account from
+      // exhausting the instance-wide UNSPLASH_ACCESS_KEY, so a loosened interval, allowance or
+      // namespace is a security regression and should fail here rather than in production.
+      expect(rateLimitConfigs.actions.unsplash).toEqual({
+        interval: 60,
+        allowedPerInterval: 30,
+        namespace: "action:unsplash",
+      });
+      expect(rateLimitConfigs.actions.inviteMember).toEqual({
+        interval: 3600 * 24,
+        allowedPerInterval: 50,
+        namespace: "action:invite-member",
+      });
+      expect(rateLimitConfigs.actions.historicalResponseImport).toEqual({
+        interval: 3600,
+        allowedPerInterval: 10,
+        namespace: "action:historical-response-import",
+      });
+      expect(rateLimitConfigs.actions.stateMutation).toEqual({
+        interval: 60,
+        allowedPerInterval: 120,
+        namespace: "action:state-mutation",
+      });
+    });
+
+    test("should have all storage configurations", () => {
+      const storageConfigs = Object.keys(rateLimitConfigs.storage);
+      expect(storageConfigs).toEqual(["upload", "uploadPerWorkspace", "delete", "attachmentsExport"]);
     });
   });
 
@@ -88,6 +158,7 @@ describe("rateLimitConfigs", () => {
         ...Object.values(rateLimitConfigs.auth),
         ...Object.values(rateLimitConfigs.api),
         ...Object.values(rateLimitConfigs.actions),
+        ...Object.values(rateLimitConfigs.storage),
       ];
 
       for (const config of allConfigs) {
@@ -104,6 +175,7 @@ describe("rateLimitConfigs", () => {
       Object.values(rateLimitConfigs.auth).forEach((config) => allNamespaces.push(config.namespace));
       Object.values(rateLimitConfigs.api).forEach((config) => allNamespaces.push(config.namespace));
       Object.values(rateLimitConfigs.actions).forEach((config) => allNamespaces.push(config.namespace));
+      Object.values(rateLimitConfigs.storage).forEach((config) => allNamespaces.push(config.namespace));
 
       const uniqueNamespaces = new Set(allNamespaces);
       expect(uniqueNamespaces.size).toBe(allNamespaces.length);
@@ -137,9 +209,14 @@ describe("rateLimitConfigs", () => {
         { config: rateLimitConfigs.api.v1, identifier: "api-v1-key" },
         { config: rateLimitConfigs.api.v2, identifier: "api-v2-key" },
         { config: rateLimitConfigs.api.v3, identifier: "api-v3-key" },
+        { config: rateLimitConfigs.api.v3SurveyGenerate, identifier: "api-v3-survey-generate-key" },
         { config: rateLimitConfigs.api.client, identifier: "client-api-key" },
+        { config: rateLimitConfigs.api.clientEnvironment, identifier: "environment-id" },
         { config: rateLimitConfigs.actions.emailUpdate, identifier: "user-profile" },
+        { config: rateLimitConfigs.actions.accountDeletion, identifier: "user-account-delete" },
+        { config: rateLimitConfigs.actions.unsplash, identifier: "user-unsplash" },
         { config: rateLimitConfigs.storage.upload, identifier: "storage-upload" },
+        { config: rateLimitConfigs.storage.uploadPerWorkspace, identifier: "storage-upload-workspace" },
         { config: rateLimitConfigs.storage.delete, identifier: "storage-delete" },
       ];
 
@@ -169,6 +246,15 @@ describe("rateLimitConfigs", () => {
       expect(config.namespace).toBe("storage:upload");
     });
 
+    test("should properly configure storage upload per workspace rate limit", async () => {
+      const config = rateLimitConfigs.storage.uploadPerWorkspace;
+
+      // Verify configuration values
+      expect(config.interval).toBe(60); // 1 minute
+      expect(config.allowedPerInterval).toBe(100); // 100 requests per minute
+      expect(config.namespace).toBe("storage:upload:workspace");
+    });
+
     test("should properly configure storage delete rate limit", async () => {
       const config = rateLimitConfigs.storage.delete;
 
@@ -176,6 +262,22 @@ describe("rateLimitConfigs", () => {
       expect(config.interval).toBe(60); // 1 minute
       expect(config.allowedPerInterval).toBe(5); // 5 requests per minute
       expect(config.namespace).toBe("storage:delete");
+    });
+
+    test("should properly configure client environment rate limit", async () => {
+      const config = rateLimitConfigs.api.clientEnvironment;
+
+      expect(config.interval).toBe(60);
+      expect(config.allowedPerInterval).toBe(1000);
+      expect(config.namespace).toBe("api:client:environment");
+    });
+
+    test("should properly configure v3 survey generation rate limit", async () => {
+      const config = rateLimitConfigs.api.v3SurveyGenerate;
+
+      expect(config.interval).toBe(60);
+      expect(config.allowedPerInterval).toBe(10);
+      expect(config.namespace).toBe("api:v3:surveys:generate");
     });
   });
 });

@@ -3,70 +3,94 @@
 import { z } from "zod";
 import { ZId } from "@formbricks/types/common";
 import { OperationNotAllowedError, ResourceNotFoundError } from "@formbricks/types/errors";
+import { assertCan } from "@/lib/authorization";
 import { getOrganization } from "@/lib/organization/service";
+import { capturePostHogEvent } from "@/lib/posthog";
 import { authenticatedActionClient } from "@/lib/utils/action-client";
-import { checkAuthorizationUpdated } from "@/lib/utils/action-client/action-client-middleware";
-import { getOrganizationIdFromProjectId } from "@/lib/utils/helper";
+import { getOrganizationIdFromWorkspaceId } from "@/lib/utils/helper";
+import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
+import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
 import { withAuditLogging } from "@/modules/ee/audit-logs/lib/handler";
 import { getRemoveBrandingPermission } from "@/modules/ee/license-check/lib/utils";
-import { updateProjectBranding } from "@/modules/ee/whitelabel/remove-branding/lib/project";
-import { ZProjectUpdateBrandingInput } from "@/modules/ee/whitelabel/remove-branding/types/project";
-import { getProject } from "@/modules/survey/editor/lib/project";
+import { updateWorkspaceBranding } from "@/modules/ee/whitelabel/remove-branding/lib/workspace";
+import { ZWorkspaceUpdateBrandingInput } from "@/modules/ee/whitelabel/remove-branding/types/workspace";
+import { getWorkspace } from "@/modules/survey/editor/lib/workspace";
 
-const ZUpdateProjectAction = z.object({
-  projectId: ZId,
-  data: ZProjectUpdateBrandingInput,
+const ZUpdateWorkspaceAction = z.object({
+  workspaceId: ZId,
+  data: ZWorkspaceUpdateBrandingInput,
 });
 
-export const updateProjectBrandingAction = authenticatedActionClient.inputSchema(ZUpdateProjectAction).action(
-  withAuditLogging("updated", "project", async ({ ctx, parsedInput }) => {
-    const organizationId = await getOrganizationIdFromProjectId(parsedInput.projectId);
+export const updateWorkspaceBrandingAction = authenticatedActionClient
+  .inputSchema(ZUpdateWorkspaceAction)
+  .action(
+    withAuditLogging("updated", "workspace", async ({ ctx, parsedInput }) => {
+      const organizationId = await getOrganizationIdFromWorkspaceId(parsedInput.workspaceId);
 
-    await checkAuthorizationUpdated({
-      userId: ctx.user.id,
-      organizationId,
-      access: [
-        {
-          type: "organization",
-          roles: ["owner", "manager"],
-        },
-        {
-          type: "projectTeam",
-          projectId: parsedInput.projectId,
-          minPermission: "manage",
-        },
-      ],
-    });
+      await assertCan({ type: "user", id: ctx.user.id }, "workspace.manage", {
+        type: "workspace",
+        id: parsedInput.workspaceId,
+      });
+      await applyRateLimit(rateLimitConfigs.actions.stateMutation, parsedInput.workspaceId);
 
-    if (
-      parsedInput.data.inAppSurveyBranding !== undefined ||
-      parsedInput.data.linkSurveyBranding !== undefined
-    ) {
-      const organization = await getOrganization(organizationId);
+      if (
+        parsedInput.data.inAppSurveyBranding !== undefined ||
+        parsedInput.data.linkSurveyBranding !== undefined
+      ) {
+        const organization = await getOrganization(organizationId);
 
-      if (!organization) {
-        throw new ResourceNotFoundError("Organization", organizationId);
-      }
-      const canRemoveBranding = await getRemoveBrandingPermission(organizationId);
+        if (!organization) {
+          throw new ResourceNotFoundError("Organization", organizationId);
+        }
+        const canRemoveBranding = await getRemoveBrandingPermission(organizationId);
 
-      if (parsedInput.data.inAppSurveyBranding !== undefined) {
-        if (!canRemoveBranding) {
-          throw new OperationNotAllowedError("You are not allowed to remove in-app branding");
+        if (parsedInput.data.inAppSurveyBranding !== undefined) {
+          if (!canRemoveBranding) {
+            throw new OperationNotAllowedError("You are not allowed to remove in-app branding");
+          }
+        }
+
+        if (parsedInput.data.linkSurveyBranding !== undefined) {
+          if (!canRemoveBranding) {
+            throw new OperationNotAllowedError("You are not allowed to remove link survey branding");
+          }
         }
       }
+      ctx.auditLoggingCtx.organizationId = organizationId;
+      ctx.auditLoggingCtx.workspaceId = parsedInput.workspaceId;
+      const oldWorkspace = await getWorkspace(parsedInput.workspaceId);
+      ctx.auditLoggingCtx.oldObject = oldWorkspace;
+      const result = await updateWorkspaceBranding(parsedInput.workspaceId, parsedInput.data);
+      ctx.auditLoggingCtx.newObject = await getWorkspace(parsedInput.workspaceId);
 
-      if (parsedInput.data.linkSurveyBranding !== undefined) {
-        if (!canRemoveBranding) {
-          throw new OperationNotAllowedError("You are not allowed to remove link survey branding");
-        }
+      const groupContext = { organizationId, workspaceId: parsedInput.workspaceId };
+
+      if (oldWorkspace?.linkSurveyBranding === true && parsedInput.data.linkSurveyBranding === false) {
+        capturePostHogEvent(
+          ctx.user.id,
+          "remove_branding_enabled",
+          {
+            organization_id: organizationId,
+            workspace_id: parsedInput.workspaceId,
+            branding_type: "link",
+          },
+          groupContext
+        );
       }
-    }
 
-    ctx.auditLoggingCtx.organizationId = organizationId;
-    ctx.auditLoggingCtx.projectId = parsedInput.projectId;
-    ctx.auditLoggingCtx.oldObject = await getProject(parsedInput.projectId);
-    const result = await updateProjectBranding(parsedInput.projectId, parsedInput.data);
-    ctx.auditLoggingCtx.newObject = await getProject(parsedInput.projectId);
-    return result;
-  })
-);
+      if (oldWorkspace?.inAppSurveyBranding === true && parsedInput.data.inAppSurveyBranding === false) {
+        capturePostHogEvent(
+          ctx.user.id,
+          "remove_branding_enabled",
+          {
+            organization_id: organizationId,
+            workspace_id: parsedInput.workspaceId,
+            branding_type: "in_app",
+          },
+          groupContext
+        );
+      }
+
+      return result;
+    })
+  );

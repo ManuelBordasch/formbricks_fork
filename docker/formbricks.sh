@@ -2,6 +2,433 @@
 
 set -e
 ubuntu_version=$(lsb_release -a 2>/dev/null | grep -v "No LSB modules are available." | grep "Description:" | awk -F "Description:\t" '{print $2}')
+legacy_valkey_image="valkey/valkey@sha256:12ba4f45a7c3e1d0f076acd616cb230834e75a77e8516dde382720af32832d6d"
+multi_arch_valkey_image="valkey/valkey@sha256:e0eb7c480958d32bdc4357a74bdd70653ae15f2f9b4c93c4a5a9fad1dc471c84"
+
+write_rustfs_init_script() {
+  local target_path="${1:-rustfs-init.sh}"
+  local script_dir
+  local template_path
+
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  template_path="${script_dir}/rustfs-init.sh"
+
+  if [ -f "$template_path" ]; then
+    cp "$template_path" "$target_path"
+    chmod 755 "$target_path"
+    return
+  fi
+
+  cat >"$target_path" << 'RUSTFS_SCRIPT_EOF'
+#!/bin/sh
+# Shared RustFS bootstrap script.
+# Used directly by docker-compose.dev.yml for local development and used as the
+# source template for the generated rustfs-init.sh in docker/formbricks.sh for
+# one-click/self-hosted installs. packages/storage/src/rustfs-init-bootstrap.test.ts
+# also validates that the generated script stays in sync with this file.
+set -e
+
+rustfs_endpoint_url="${RUSTFS_ENDPOINT_URL:-http://rustfs:9000}"
+
+echo '⏳ Waiting for RustFS to be ready...'
+attempts=0
+max_attempts=30
+until rc alias set rustfs "$rustfs_endpoint_url" "$RUSTFS_ADMIN_USER" "$RUSTFS_ADMIN_PASSWORD" >/dev/null 2>&1 \
+  && rc bucket list rustfs >/dev/null 2>&1; do
+  attempts=$((attempts + 1))
+  if [ $attempts -ge $max_attempts ]; then
+    printf '❌ Failed to connect to RustFS after %s attempts\n' $max_attempts
+    exit 1
+  fi
+  printf '...still waiting attempt %s/%s\n' $attempts $max_attempts
+  sleep 2
+done
+echo '🔗 RustFS reachable; alias configured.'
+
+echo '🪣 Creating bucket (idempotent)...'
+rc bucket create "rustfs/$RUSTFS_BUCKET_NAME" --ignore-existing
+
+if [ -n "${RUSTFS_CORS_ALLOWED_ORIGINS:-}" ]; then
+  echo '🌐 Applying bucket CORS configuration...'
+  cors_file="/tmp/formbricks-cors.xml"
+
+  cat > "$cors_file" << EOF
+<CORSConfiguration>
+  <CORSRule>
+EOF
+
+  old_ifs=$IFS
+  IFS=','
+  for origin in $RUSTFS_CORS_ALLOWED_ORIGINS; do
+    trimmed_origin=$(printf '%s' "$origin" | tr -d '[:space:]')
+    if [ -n "$trimmed_origin" ]; then
+      printf '    <AllowedOrigin>%s</AllowedOrigin>\n' "$trimmed_origin" >> "$cors_file"
+    fi
+  done
+  IFS=$old_ifs
+
+  cat >> "$cors_file" << EOF
+    <AllowedMethod>GET</AllowedMethod>
+    <AllowedMethod>HEAD</AllowedMethod>
+    <AllowedMethod>POST</AllowedMethod>
+    <AllowedMethod>PUT</AllowedMethod>
+    <AllowedMethod>DELETE</AllowedMethod>
+    <AllowedHeader>*</AllowedHeader>
+    <ExposeHeader>ETag</ExposeHeader>
+    <MaxAgeSeconds>3000</MaxAgeSeconds>
+  </CORSRule>
+</CORSConfiguration>
+EOF
+
+  rc bucket cors set "rustfs/$RUSTFS_BUCKET_NAME" "$cors_file"
+  echo 'CORS configuration applied successfully.'
+fi
+
+echo '📄 Creating JSON policy file...'
+cat > /tmp/formbricks-policy.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"],
+      "Resource": ["arn:aws:s3:::$RUSTFS_BUCKET_NAME/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::$RUSTFS_BUCKET_NAME"]
+    }
+  ]
+}
+EOF
+
+echo '🔒 Creating policy (idempotent)...'
+if ! rc admin policy info rustfs "$RUSTFS_POLICY_NAME" >/dev/null 2>&1; then
+  rc admin policy create rustfs "$RUSTFS_POLICY_NAME" /tmp/formbricks-policy.json
+  echo 'Policy created successfully.'
+else
+  echo 'Policy already exists, skipping creation.'
+fi
+
+echo '👤 Creating service user (idempotent)...'
+if ! rc admin user info rustfs "$RUSTFS_SERVICE_USER" >/dev/null 2>&1; then
+  rc admin user add rustfs "$RUSTFS_SERVICE_USER" "$RUSTFS_SERVICE_PASSWORD"
+  echo 'User created successfully.'
+else
+  echo 'User already exists, skipping creation.'
+fi
+
+echo '🔗 Attaching policy to user (idempotent)...'
+rc admin policy attach rustfs "$RUSTFS_POLICY_NAME" --user "$RUSTFS_SERVICE_USER"
+
+echo '✅ RustFS setup complete!'
+RUSTFS_SCRIPT_EOF
+
+  chmod 755 "$target_path"
+}
+
+upsert_dotenv_var() {
+  local key="$1"
+  local value="$2"
+  local env_file="${3:-.env}"
+  local tmp_file
+
+  touch "$env_file"
+  chmod 600 "$env_file"
+  tmp_file=$(mktemp)
+
+  awk -v insert_key="$key" -v insert_val="$value" '
+    BEGIN { updated=0 }
+    $0 ~ "^" insert_key "=" {
+      print insert_key "=" insert_val
+      updated=1
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        print insert_key "=" insert_val
+      }
+    }
+  ' "$env_file" >"$tmp_file" && mv "$tmp_file" "$env_file"
+}
+
+write_rustfs_env_file() {
+  local env_file="${1:-.env}"
+
+  upsert_dotenv_var "FORMBRICKS_RUSTFS_ADMIN_USER" "$rustfs_admin_user" "$env_file"
+  upsert_dotenv_var "FORMBRICKS_RUSTFS_ADMIN_PASSWORD" "$rustfs_admin_password" "$env_file"
+  upsert_dotenv_var "FORMBRICKS_RUSTFS_SERVICE_USER" "$rustfs_service_user" "$env_file"
+  upsert_dotenv_var "FORMBRICKS_RUSTFS_SERVICE_PASSWORD" "$rustfs_service_password" "$env_file"
+  upsert_dotenv_var "FORMBRICKS_RUSTFS_BUCKET_NAME" "$rustfs_bucket_name" "$env_file"
+  upsert_dotenv_var "FORMBRICKS_RUSTFS_POLICY_NAME" "$rustfs_policy_name" "$env_file"
+  upsert_dotenv_var "FORMBRICKS_RUSTFS_REGION" "us-east-1" "$env_file"
+}
+
+formbricks_docker_command=(docker)
+
+configure_formbricks_docker_command() {
+  if docker info >/dev/null 2>&1; then
+    formbricks_docker_command=(docker)
+    return
+  fi
+
+  if command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
+    formbricks_docker_command=(sudo docker)
+    return
+  fi
+
+  return 1
+}
+
+run_formbricks_docker_compose() {
+  "${formbricks_docker_command[@]}" compose "$@"
+}
+
+read_rendered_compose_password() {
+  local compose_file="$1"
+  local env_file="${2:-}"
+  local encoded_password
+  local rendered_config
+  local rendered_password
+  local without_escaped_dollars
+  local compose_args=(-f "$compose_file")
+
+  if [ -n "$env_file" ]; then
+    compose_args=(--env-file "$env_file" "${compose_args[@]}")
+  fi
+
+  if ! command -v docker >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    return 1
+  fi
+
+  rendered_config=$(
+    unset POSTGRES_PASSWORD POSTGRES_PASSWORD_URL_ENCODED
+    run_formbricks_docker_compose "${compose_args[@]}" config --format json 2>/dev/null
+  ) || return 1
+  encoded_password=$(printf '%s' "$rendered_config" | jq -er '
+      .services.postgres.environment.POSTGRES_PASSWORD
+      | select(type == "string" and length > 0)
+      | select((contains("\n") or contains("\r")) | not)
+      | @base64
+    ') || return 1
+
+  rendered_password=$(printf '%s' "$encoded_password" | base64 --decode) || return 1
+  # Compose doubles literal dollar signs in its rendered model so that the model can be parsed again.
+  without_escaped_dollars=${rendered_password//\$\$/}
+  if [[ "$without_escaped_dollars" == *\$* ]]; then
+    return 1
+  fi
+
+  printf '%s' "${rendered_password//\$\$/\$}"
+}
+
+read_existing_postgres_password() {
+  local env_file="${1:-.env}"
+  local compose_file="${2:-docker-compose.yml}"
+  local existing_password
+
+  if [ -f "$env_file" ]; then
+    if [ ! -f "$compose_file" ]; then
+      echo "❌ Could not safely resolve the existing PostgreSQL password. Refusing to rewrite $env_file." >&2
+      return 1
+    fi
+
+    if existing_password=$(read_rendered_compose_password "$compose_file" "$env_file"); then
+      printf '%s' "$existing_password"
+      return
+    fi
+
+    echo "❌ Could not safely resolve the existing PostgreSQL password. Refusing to rewrite $env_file." >&2
+    return 1
+  fi
+
+  if [ -f "$compose_file" ]; then
+    if existing_password=$(read_rendered_compose_password "$compose_file"); then
+      printf '%s' "$existing_password"
+      return
+    fi
+
+    echo "❌ Could not safely resolve the existing PostgreSQL password. Refusing to rewrite .env." >&2
+    return 1
+  fi
+
+  return 0
+}
+
+url_encode() {
+  local LC_ALL=C
+  local value="$1"
+  local encoded=""
+  local char
+  local byte
+  local i
+
+  for ((i = 0; i < ${#value}; i++)); do
+    char=${value:i:1}
+    case "$char" in
+      [a-zA-Z0-9.~_-]) encoded+="$char" ;;
+      *)
+        printf -v byte '%d' "'$char"
+        printf -v encoded '%s%%%02X' "$encoded" "$((byte & 255))"
+        ;;
+    esac
+  done
+
+  printf '%s' "$encoded"
+}
+
+serialize_dotenv_value() {
+  local value="$1"
+
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//\$/\$\$}
+
+  printf '"%s"' "$value"
+}
+
+write_generated_env_file() (
+  local env_file="${1:-.env}"
+  local postgres_password="${2:-}"
+  local hub_api_key="${3:-}"
+  local cubejs_api_secret="${4:-}"
+  local authzed_token="${5:-}"
+  local authzed_database_password="${6:-}"
+  local serialized_postgres_password
+  local postgres_password_url_encoded
+  local tmp_file
+
+  append_if_missing() {
+    local key="$1"
+    local value="$2"
+
+    if ! grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$tmp_file"; then
+      printf '%s=%s\n' "$key" "$value" >>"$tmp_file"
+    fi
+  }
+
+  umask 077
+  if [ -z "$postgres_password" ]; then
+    postgres_password=$(openssl rand -hex 32)
+  fi
+  if [ -z "$hub_api_key" ]; then
+    hub_api_key=$(openssl rand -hex 32)
+  fi
+  if [ -z "$cubejs_api_secret" ]; then
+    cubejs_api_secret=$(openssl rand -hex 32)
+  fi
+  if [ -z "$authzed_token" ]; then
+    authzed_token=$(openssl rand -hex 32)
+  fi
+  if [ -z "$authzed_database_password" ]; then
+    authzed_database_password=$(openssl rand -hex 32)
+  fi
+  serialized_postgres_password=$(serialize_dotenv_value "$postgres_password")
+  postgres_password_url_encoded=$(url_encode "$postgres_password")
+
+  tmp_file=$(mktemp "${env_file}.tmp.XXXXXX")
+  trap 'rm -f "$tmp_file"' EXIT
+
+  if [ -f "$env_file" ]; then
+    awk '
+      !/^[[:space:]]*(export[[:space:]]+)?(POSTGRES_PASSWORD|POSTGRES_PASSWORD_URL_ENCODED|HUB_API_KEY|CUBEJS_API_SECRET|CUBEJS_JWT_ISSUER|CUBEJS_JWT_AUDIENCE)[[:space:]]*=/
+    ' "$env_file" >"$tmp_file"
+  fi
+
+  cat <<EOF >>"$tmp_file"
+POSTGRES_PASSWORD=$serialized_postgres_password
+POSTGRES_PASSWORD_URL_ENCODED=$postgres_password_url_encoded
+HUB_API_KEY=$hub_api_key
+CUBEJS_API_SECRET=$cubejs_api_secret
+CUBEJS_JWT_ISSUER=formbricks-web
+CUBEJS_JWT_AUDIENCE=formbricks-cube
+EOF
+
+  append_if_missing "AUTHZED_TOKEN" "$authzed_token"
+  append_if_missing "AUTHZED_DATABASE_PASSWORD" "$authzed_database_password"
+  append_if_missing "AUTHZED_ENABLED" "true"
+  append_if_missing "AUTHZED_CONSISTENCY" "fully_consistent"
+  append_if_missing "FORMBRICKS_AUTHZED_V6_MIGRATION_ACKNOWLEDGED" "true"
+
+  chmod 600 "$tmp_file"
+  mv "$tmp_file" "$env_file"
+  trap - EXIT
+)
+
+write_base_env_file() {
+  local env_file="${1:-.env}"
+  local hub_key="$2"
+  local cube_secret="$3"
+  local authzed_token="$4"
+  local authzed_database_password="$5"
+
+  umask 077
+  : >"$env_file"
+  write_generated_env_file "$env_file" "" "$hub_key" "$cube_secret" "$authzed_token" "$authzed_database_password"
+}
+
+add_formbricks_traefik_labels() {
+  local compose_file="${1:-docker-compose.yml}"
+  local formbricks_domain_name="$2"
+  local formbricks_hsts_enabled="$3"
+  local formbricks_https_setup="$4"
+  local tmp_file="${compose_file}.tmp"
+
+  if ! awk -v domain_name="$formbricks_domain_name" -v hsts_enabled="$formbricks_hsts_enabled" -v https_setup="$formbricks_https_setup" '
+BEGIN { in_formbricks = 0; inserted = 0 }
+/^  formbricks:$/ { in_formbricks = 1 }
+in_formbricks && /^  [A-Za-z0-9_-]+:/ && !/^  formbricks:$/ { in_formbricks = 0 }
+{
+    if (in_formbricks && !inserted && $0 ~ /^    environment:$/) {
+        print "    labels:"
+        print "      - \"traefik.enable=true\""
+        print "      - \"traefik.http.routers.formbricks.rule=Host(`" domain_name "`)\""
+        print "      - \"traefik.http.routers.formbricks.entrypoints=websecure\""
+        print "      - \"traefik.http.routers.formbricks.tls=true\""
+        if (https_setup == "y") {
+            print "      - \"traefik.http.routers.formbricks.tls.certresolver=default\""
+        }
+        print "      - \"traefik.http.services.formbricks.loadbalancer.server.port=3000\""
+        print "      - \"traefik.http.routers.feedback-records-token.rule=Host(`" domain_name "`) && Path(`/api/v3/feedbackRecords/token`)\""
+        print "      - \"traefik.http.routers.feedback-records-token.entrypoints=websecure\""
+        print "      - \"traefik.http.routers.feedback-records-token.tls=true\""
+        if (https_setup == "y") {
+            print "      - \"traefik.http.routers.feedback-records-token.tls.certresolver=default\""
+        }
+        print "      - \"traefik.http.routers.feedback-records-token.service=formbricks\""
+        print "      - \"traefik.http.routers.feedback-records-token.priority=200\""
+        if (hsts_enabled == "y") {
+            print "      - \"traefik.http.middlewares.hstsHeader.headers.stsSeconds=31536000\""
+            print "      - \"traefik.http.middlewares.hstsHeader.headers.forceSTSHeader=true\""
+            print "      - \"traefik.http.middlewares.hstsHeader.headers.stsPreload=true\""
+            print "      - \"traefik.http.middlewares.hstsHeader.headers.stsIncludeSubdomains=true\""
+        } else {
+            print "      - \"traefik.http.routers.formbricks_http.entrypoints=web\""
+            print "      - \"traefik.http.routers.formbricks_http.rule=Host(`" domain_name "`)\""
+            print "      - \"traefik.http.routers.feedback-records-token-http.rule=Host(`" domain_name "`) && Path(`/api/v3/feedbackRecords/token`)\""
+            print "      - \"traefik.http.routers.feedback-records-token-http.entrypoints=web\""
+            print "      - \"traefik.http.routers.feedback-records-token-http.service=formbricks\""
+            print "      - \"traefik.http.routers.feedback-records-token-http.priority=200\""
+        }
+        inserted = 1
+    }
+    print
+}
+END {
+    if (!inserted) {
+        exit 1
+    }
+}
+' "$compose_file" >"$tmp_file"; then
+    rm -f "$tmp_file"
+    echo "❌ Failed to add Traefik labels to the formbricks service."
+    return 1
+  fi
+
+  mv "$tmp_file" "$compose_file"
+}
 
 install_formbricks() {
   # Friendly welcome
@@ -9,10 +436,6 @@ install_formbricks() {
   echo ""
   echo "🛸 Fasten your seatbelts! We're setting up your Formbricks environment on your $ubuntu_version server."
   echo ""
-
-  # Remove any old Docker installations, without stopping the script if they're not found
-  echo "🧹 Time to sweep away any old Docker installations."
-  sudo apt-get remove docker docker-engine docker.io containerd runc >/dev/null 2>&1 || true
 
   # Update package list
   echo "🔄 Updating your package list."
@@ -23,33 +446,69 @@ install_formbricks() {
   sudo apt-get install -y \
     ca-certificates \
     curl \
-    gnupg \
+    jq \
     lsb-release >/dev/null 2>&1
 
-  # Set up Docker's official GPG key & stable repository
-  echo "🔑 Adding Docker's official GPG key and setting up the stable repository."
-  sudo mkdir -m 0755 -p /etc/apt/keyrings >/dev/null 2>&1
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg >/dev/null 2>&1
-  echo \
-    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-  $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null 2>&1
-
-  # Update package list again
-  echo "🔄 Updating your package list again."
-  sudo apt-get update >/dev/null 2>&1
-
-  # Install Docker
-  echo "🐳 Installing Docker."
-  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1
-
-  # Test Docker installation
-  echo "🚀 Testing your Docker installation."
-  if docker --version >/dev/null 2>&1; then
-    echo "🎉 Docker is installed!"
+  # Reuse an existing Docker installation instead of replacing it implicitly.
+  if command -v docker >/dev/null 2>&1; then
+    echo "✅ Docker is already installed."
   else
-    echo "❌ Docker is not installed. Please install Docker before proceeding."
+    # Remove old Docker packages only when Docker is not installed at all.
+    echo "⚠️ Legacy Docker-related packages may conflict with Docker CE."
+    echo "These packages can also be used outside Docker, so they will only be removed with your consent."
+    read -p "Remove legacy packages (docker/docker-engine/docker.io/containerd/runc)? [y/N] " remove_legacy_docker_pkgs
+    remove_legacy_docker_pkgs=$(echo "$remove_legacy_docker_pkgs" | tr '[:upper:]' '[:lower:]')
+    if [[ "$remove_legacy_docker_pkgs" == "y" || "$remove_legacy_docker_pkgs" == "yes" ]]; then
+      echo "🧹 Removing old Docker installations."
+      sudo apt-get remove docker docker-engine docker.io containerd runc >/dev/null 2>&1 || true
+    else
+      echo "⏭️ Skipping legacy package removal."
+      echo "If Docker installation fails due to conflicting packages, rerun the script and allow the removal step."
+    fi
+
+    echo "📦 Installing Docker-specific dependencies."
+    sudo apt-get install -y gnupg >/dev/null 2>&1
+
+    # Set up Docker's official GPG key & stable repository.
+    echo "🔑 Adding Docker's official GPG key and setting up the stable repository."
+    sudo mkdir -m 0755 -p /etc/apt/keyrings >/dev/null 2>&1
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg >/dev/null 2>&1
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+    $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null 2>&1
+
+    # Update package list again after adding the Docker repository.
+    echo "🔄 Updating your package list again."
+    sudo apt-get update >/dev/null 2>&1
+
+    # Install Docker only when it is not already present on the system.
+    echo "🐳 Installing Docker."
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1
+
+    # Test Docker installation.
+    echo "🚀 Testing your Docker installation."
+    if docker --version >/dev/null 2>&1; then
+      echo "🎉 Docker is installed!"
+    else
+      echo "❌ Docker is not installed. Please install Docker before proceeding."
+      exit 1
+    fi
+  fi
+
+  if ! configure_formbricks_docker_command; then
+    echo "❌ Docker is installed, but the daemon is not reachable."
+    echo "Please start or fix Docker and rerun this script."
+    echo "To avoid modifying an existing Docker setup without your consent, this script will not remove or reinstall Docker automatically."
     exit 1
   fi
+  echo "✅ Docker daemon is reachable. Reusing the existing Docker installation."
+
+  if ! run_formbricks_docker_compose version >/dev/null 2>&1; then
+    echo "❌ Docker Compose is not available on this system."
+    echo "Please install Docker Compose or upgrade Docker so 'docker compose' works, then rerun this script."
+    exit 1
+  fi
+  echo "✅ Docker Compose is available."
 
   # Adding your user to the Docker group
   echo "🐳 Adding your user to the Docker group to avoid using sudo with docker commands."
@@ -60,6 +519,14 @@ install_formbricks() {
 
   mkdir -p formbricks && cd formbricks
   echo "📁 Created Formbricks Quickstart directory at ./formbricks."
+
+  existing_postgres_password=""
+  if [ -f ".env" ] || [ -f "docker-compose.yml" ]; then
+    if ! existing_postgres_password=$(read_existing_postgres_password ".env" "docker-compose.yml"); then
+      echo "Set POSTGRES_PASSWORD in .env manually, then rerun this script."
+      exit 1
+    fi
+  fi
 
   # Ask the user for their domain name (recommend surveys subdomain)
   echo "🔗 Please enter your app domain (e.g., surveys.example.com). 🚨 Do NOT enter the protocol (http/https):"
@@ -266,14 +733,14 @@ EOT
   echo "   If you skip this, the following features will be disabled:"
   echo "   - Adding images to surveys (e.g., in questions or as background)"
   echo "   - 'File Upload' and 'Picture Selection' question types"
-  echo "   - Project logos"
+  echo "   - Workspace logos"
   echo "   - Custom organization logo in emails"
   read -p "Configure file uploads now? [Y/n] " configure_uploads
   configure_uploads=$(echo "$configure_uploads" | tr '[:upper:]' '[:lower:]')
   if [[ -z $configure_uploads ]]; then configure_uploads="y"; fi
 
   if [[ $configure_uploads == "y" ]]; then
-    # Storage choice: External S3 vs bundled MinIO
+    # Storage choice: External S3 vs bundled RustFS
     read -p "🗄️  Do you want to use an external S3-compatible storage (AWS S3/DO Spaces/etc.)? [y/N] " use_external_s3
     use_external_s3=$(echo "$use_external_s3" | tr '[:upper:]' '[:lower:]')
     if [[ -z $use_external_s3 ]]; then use_external_s3="n"; fi
@@ -286,33 +753,44 @@ EOT
       read -p "   S3 Bucket Name: " ext_s3_bucket
       read -p "   S3 Endpoint URL (leave empty if you are using AWS S3, otherwise please enter the endpoint URL of the third party S3 compatible storage service): " ext_s3_endpoint
       
-      minio_storage="n"
+      rustfs_storage="n"
     else
-      minio_storage="y"
+      rustfs_storage="y"
       default_files_domain="files.$domain_name"
       read -p "🔗 Enter the files subdomain for object storage (e.g., $default_files_domain): " files_domain
       if [[ -z $files_domain ]]; then files_domain="$default_files_domain"; fi
 
-      echo "🔑 Generating MinIO credentials..."
-      minio_root_user="formbricks-$(openssl rand -hex 4)"
-      minio_root_password=$(openssl rand -base64 20)
-      minio_service_user="formbricks-service-$(openssl rand -hex 4)"
-      minio_service_password=$(openssl rand -base64 20)
-      minio_bucket_name="formbricks-uploads"
-      minio_policy_name="formbricks-policy"
+      echo "🔑 Generating RustFS credentials..."
+      rustfs_admin_user="formbricks-$(openssl rand -hex 4)"
+      rustfs_admin_password=$(openssl rand -base64 20)
+      rustfs_service_user="formbricks-service-$(openssl rand -hex 4)"
+      rustfs_service_password=$(openssl rand -base64 20)
+      rustfs_bucket_name="formbricks-uploads"
+      rustfs_policy_name="formbricks-policy"
       
-      echo "✅ MinIO will be configured with:"
-      echo "   S3 Access Key (least privilege): $minio_service_user"
-      echo "   Bucket: $minio_bucket_name"
+      echo "✅ RustFS will be configured with:"
+      echo "   S3 Access Key (least privilege): $rustfs_service_user"
+      echo "   Bucket: $rustfs_bucket_name"
     fi
   else
-    minio_storage="n"
+    rustfs_storage="n"
     use_external_s3="n"
-    echo "⚠️ File uploads are disabled. Proceeding without S3/MinIO configuration."
+    echo "⚠️ File uploads are disabled. Proceeding without S3-compatible storage configuration."
   fi
 
   echo "📥 Downloading docker-compose.yml from Formbricks GitHub repository..."
   curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/formbricks/formbricks/stable/docker/docker-compose.yml
+  echo "📥 Downloading AuthZed database bootstrap helper..."
+  authzed_bootstrap_commit="10d5ad908491a8a818aef3c6ada91fa4fdc30b03"
+  authzed_bootstrap_sha256="70975701cdf0dcffef5d3573a7514360e87428bb07cc4bfb4dbf47ae0c2e93a5"
+  curl -fsSL -o authzed-postgres-bootstrap.sh \
+    "https://raw.githubusercontent.com/formbricks/formbricks/${authzed_bootstrap_commit}/docker/authzed-postgres-bootstrap.sh"
+  printf '%s  %s\n' "$authzed_bootstrap_sha256" authzed-postgres-bootstrap.sh | sha256sum --check --status -
+  chmod 700 authzed-postgres-bootstrap.sh
+  mkdir -p cube/schema
+  echo "📥 Downloading Cube.js configuration for XM Suite v5 analytics..."
+  curl -fsSL -o cube/cube.js https://raw.githubusercontent.com/formbricks/formbricks/stable/docker/cube/cube.js
+  curl -fsSL -o cube/schema/FeedbackRecords.js https://raw.githubusercontent.com/formbricks/formbricks/stable/docker/cube/schema/FeedbackRecords.js
 
   echo "🚙 Updating docker-compose.yml with your custom inputs..."
   sed -i "/WEBAPP_URL:/s|WEBAPP_URL:.*|WEBAPP_URL: \"https://$domain_name\"|" docker-compose.yml
@@ -326,6 +804,23 @@ EOT
 
   cron_secret=$(openssl rand -hex 32) && sed -i "/CRON_SECRET:$/s/CRON_SECRET:.*/CRON_SECRET: $cron_secret/" docker-compose.yml	
   echo "🚗 CRON_SECRET updated successfully!"
+
+  hub_api_key=$(openssl rand -hex 32)
+  cubejs_api_secret=$(openssl rand -hex 32)
+  authzed_token=$(openssl rand -hex 32)
+  authzed_database_password=$(openssl rand -hex 32)
+  write_generated_env_file \
+    ".env" \
+    "$existing_postgres_password" \
+    "$hub_api_key" \
+    "$cubejs_api_secret" \
+    "$authzed_token" \
+    "$authzed_database_password"
+  if [ -n "$existing_postgres_password" ]; then
+    echo "🚗 Preserved the existing PostgreSQL password and AuthZed credentials while refreshing .env."
+  else
+    echo "🚗 Generated PostgreSQL, Hub, Cube, and AuthZed secrets in .env successfully!"
+  fi
   
   if [[ -n $mail_from ]]; then
     sed -i "s|# MAIL_FROM:|MAIL_FROM: \"$mail_from\"|" docker-compose.yml
@@ -353,55 +848,85 @@ EOT
       sed -E -i 's|^([[:space:]]*)#?[[:space:]]*S3_FORCE_PATH_STYLE:[[:space:]]*.*$|\1# S3_FORCE_PATH_STYLE:|' docker-compose.yml
     fi
     echo "🚗 External S3 configuration updated successfully!"
-  elif [[ $minio_storage == "y" ]]; then
-    echo "🚗 Configuring bundled MinIO..."
-    sed -i "s|# S3_ACCESS_KEY:|S3_ACCESS_KEY: \"$minio_service_user\"|" docker-compose.yml
-    sed -i "s|# S3_SECRET_KEY:|S3_SECRET_KEY: \"$minio_service_password\"|" docker-compose.yml
-    sed -i "s|# S3_REGION:|S3_REGION: \"us-east-1\"|" docker-compose.yml
-    sed -i "s|# S3_BUCKET_NAME:|S3_BUCKET_NAME: \"$minio_bucket_name\"|" docker-compose.yml
+  elif [[ $rustfs_storage == "y" ]]; then
+    echo "🚗 Configuring bundled RustFS..."
+    write_rustfs_env_file ".env"
+    sed -i 's|# S3_ACCESS_KEY:|S3_ACCESS_KEY: "${FORMBRICKS_RUSTFS_SERVICE_USER}"|' docker-compose.yml
+    sed -i 's|# S3_SECRET_KEY:|S3_SECRET_KEY: "${FORMBRICKS_RUSTFS_SERVICE_PASSWORD}"|' docker-compose.yml
+    sed -i 's|# S3_REGION:|S3_REGION: "${FORMBRICKS_RUSTFS_REGION}"|' docker-compose.yml
+    sed -i 's|# S3_BUCKET_NAME:|S3_BUCKET_NAME: "${FORMBRICKS_RUSTFS_BUCKET_NAME}"|' docker-compose.yml
     if [[ $https_setup == "y" ]]; then
       sed -i "s|# S3_ENDPOINT_URL:|S3_ENDPOINT_URL: \"https://$files_domain\"|" docker-compose.yml
     else
       sed -i "s|# S3_ENDPOINT_URL:|S3_ENDPOINT_URL: \"http://$files_domain\"|" docker-compose.yml
     fi
-    # Ensure S3_FORCE_PATH_STYLE is enabled for MinIO
+    # Ensure S3_FORCE_PATH_STYLE is enabled for RustFS
     sed -E -i 's|^([[:space:]]*)#?[[:space:]]*S3_FORCE_PATH_STYLE:[[:space:]]*.*$|\1S3_FORCE_PATH_STYLE: 1|' docker-compose.yml
-    echo "🚗 MinIO S3 configuration updated successfully!"
+    echo "🚗 RustFS S3 configuration updated successfully!"
   fi
 
-  # SUPER SIMPLE: Use multiple simple operations instead of complex AWK
-
   # Step 1: Add Traefik labels to formbricks service
-  awk -v domain_name="$domain_name" -v hsts_enabled="$hsts_enabled" '
-/formbricks:/,/^ *$/ {
-    if ($0 ~ /<<: \*environment$/) {
+  if ! add_formbricks_traefik_labels "docker-compose.yml" "$domain_name" "$hsts_enabled" "$https_setup"; then
+    exit 1
+  fi
+
+  # Step 1b: Add FeedbackRecords gateway labels to the Hub service.
+  awk -v domain_name="$domain_name" -v hsts_enabled="$hsts_enabled" -v https_setup="$https_setup" '
+BEGIN { in_hub = 0; inserted = 0 }
+/^  hub:/ { in_hub = 1 }
+in_hub && /^  [A-Za-z0-9_-]+:/ && !/^  hub:/ { in_hub = 0 }
+{
+    if (in_hub && !inserted && $0 ~ /^    environment:/) {
         print "    labels:"
         print "      - \"traefik.enable=true\""
-        print "      - \"traefik.http.routers.formbricks.rule=Host(`" domain_name "`)\""
-        print "      - \"traefik.http.routers.formbricks.entrypoints=websecure\""
-        print "      - \"traefik.http.routers.formbricks.tls=true\""
-        print "      - \"traefik.http.routers.formbricks.tls.certresolver=default\""
-        print "      - \"traefik.http.services.formbricks.loadbalancer.server.port=3000\""
-        if (hsts_enabled == "y") {
-            print "      - \"traefik.http.middlewares.hstsHeader.headers.stsSeconds=31536000\""
-            print "      - \"traefik.http.middlewares.hstsHeader.headers.forceSTSHeader=true\""
-            print "      - \"traefik.http.middlewares.hstsHeader.headers.stsPreload=true\""
-            print "      - \"traefik.http.middlewares.hstsHeader.headers.stsIncludeSubdomains=true\""
-        } else {
-            print "      - \"traefik.http.routers.formbricks_http.entrypoints=web\""
-            print "      - \"traefik.http.routers.formbricks_http.rule=Host(`" domain_name "`)\""
+        print "      - \"traefik.http.services.feedback-records-hub.loadbalancer.server.port=8080\""
+        print "      - \"traefik.http.routers.feedback-records-v3.rule=Host(`" domain_name "`) && PathPrefix(`/api/v3/feedbackRecords`)\""
+        print "      - \"traefik.http.routers.feedback-records-v3.entrypoints=websecure\""
+        print "      - \"traefik.http.routers.feedback-records-v3.tls=true\""
+        if (https_setup == "y") {
+            print "      - \"traefik.http.routers.feedback-records-v3.tls.certresolver=default\""
         }
-        print $0
-    } else {
-        print $0
+        print "      - \"traefik.http.routers.feedback-records-v3.service=feedback-records-hub\""
+        print "      - \"traefik.http.routers.feedback-records-v3.priority=100\""
+        print "      - \"traefik.http.routers.feedback-records-v3.middlewares=feedback-records-auth,feedback-records-v3-rewrite,feedback-records-hub-headers\""
+        print "      - \"traefik.http.routers.feedback-records-sdk.rule=Host(`" domain_name "`) && PathPrefix(`/v1/feedback-records`)\""
+        print "      - \"traefik.http.routers.feedback-records-sdk.entrypoints=websecure\""
+        print "      - \"traefik.http.routers.feedback-records-sdk.tls=true\""
+        if (https_setup == "y") {
+            print "      - \"traefik.http.routers.feedback-records-sdk.tls.certresolver=default\""
+        }
+        print "      - \"traefik.http.routers.feedback-records-sdk.service=feedback-records-hub\""
+        print "      - \"traefik.http.routers.feedback-records-sdk.priority=100\""
+        print "      - \"traefik.http.routers.feedback-records-sdk.middlewares=feedback-records-auth,feedback-records-hub-headers\""
+        if (hsts_enabled != "y") {
+            print "      - \"traefik.http.routers.feedback-records-v3-http.rule=Host(`" domain_name "`) && PathPrefix(`/api/v3/feedbackRecords`)\""
+            print "      - \"traefik.http.routers.feedback-records-v3-http.entrypoints=web\""
+            print "      - \"traefik.http.routers.feedback-records-v3-http.service=feedback-records-hub\""
+            print "      - \"traefik.http.routers.feedback-records-v3-http.priority=100\""
+            print "      - \"traefik.http.routers.feedback-records-v3-http.middlewares=feedback-records-auth,feedback-records-v3-rewrite,feedback-records-hub-headers\""
+            print "      - \"traefik.http.routers.feedback-records-sdk-http.rule=Host(`" domain_name "`) && PathPrefix(`/v1/feedback-records`)\""
+            print "      - \"traefik.http.routers.feedback-records-sdk-http.entrypoints=web\""
+            print "      - \"traefik.http.routers.feedback-records-sdk-http.service=feedback-records-hub\""
+            print "      - \"traefik.http.routers.feedback-records-sdk-http.priority=100\""
+            print "      - \"traefik.http.routers.feedback-records-sdk-http.middlewares=feedback-records-auth,feedback-records-hub-headers\""
+        }
+        print "      - \"traefik.http.middlewares.feedback-records-auth.forwardauth.address=http://formbricks:3000/api/traefik-auth/feedback-records\""
+        print "      - \"traefik.http.middlewares.feedback-records-auth.forwardauth.forwardbody=true\""
+        print "      - \"traefik.http.middlewares.feedback-records-auth.forwardauth.maxbodysize=1048576\""
+        print "      - \"traefik.http.middlewares.feedback-records-auth.forwardauth.preserverequestmethod=true\""
+        print "      - \"traefik.http.middlewares.feedback-records-v3-rewrite.replacepathregex.regex=^/api/v3/feedbackRecords(.*)\""
+        print "      - \"traefik.http.middlewares.feedback-records-v3-rewrite.replacepathregex.replacement=/v1/feedback-records$${1}\""
+        print "      - \"traefik.http.middlewares.feedback-records-hub-headers.headers.customrequestheaders.Authorization=Bearer ${HUB_API_KEY}\""
+        print "      - \"traefik.http.middlewares.feedback-records-hub-headers.headers.customrequestheaders.X-API-Key=\""
+        print "      - \"traefik.http.middlewares.feedback-records-hub-headers.headers.customrequestheaders.Cookie=\""
+        inserted = 1
     }
-    next
+    print
 }
-{ print }
 ' docker-compose.yml >tmp.yml && mv tmp.yml docker-compose.yml
 
-  # Step 2: Ensure formbricks waits for minio-init to complete successfully (mapping depends_on)
-  if [[ $minio_storage == "y" ]]; then
+  # Step 2: Ensure formbricks waits for rustfs-init to complete successfully (mapping depends_on)
+  if [[ $rustfs_storage == "y" ]]; then
     # Remove any existing simple depends_on list and replace with mapping
     awk '
       BEGIN{in_fb=0; removing=0}
@@ -422,7 +947,9 @@ EOT
           print "    depends_on:"
           print "      postgres:"
           print "        condition: service_started"
-          print "      minio-init:"
+          print "      redis:"
+          print "        condition: service_started"
+          print "      rustfs-init:"
           print "        condition: service_completed_successfully"
           inserted=1
         }
@@ -437,71 +964,95 @@ EOT
   insert_traefik="y"
   if grep -q "^  traefik:" docker-compose.yml; then insert_traefik="n"; fi
 
-  if [[ $minio_storage == "y" ]]; then
-    insert_minio="y"; insert_minio_init="y"
-    if grep -q "^  minio:" docker-compose.yml; then insert_minio="n"; fi
-    if grep -q "^  minio-init:" docker-compose.yml; then insert_minio_init="n"; fi
+  if [[ $rustfs_storage == "y" ]]; then
+    rustfs_cors_origin="https://$domain_name"
+    if [[ $https_setup != "y" ]]; then
+      rustfs_cors_origin="http://$domain_name"
+    fi
 
-    if [[ $insert_minio == "y" ]]; then
+    insert_rustfs_perms="y"; insert_rustfs="y"; insert_rustfs_init="y"
+    if grep -q "^  rustfs-perms:" docker-compose.yml; then insert_rustfs_perms="n"; fi
+    if grep -q "^  rustfs:" docker-compose.yml; then insert_rustfs="n"; fi
+    if grep -q "^  rustfs-init:" docker-compose.yml; then insert_rustfs_init="n"; fi
+
+    if [[ $insert_rustfs_perms == "y" ]]; then
       cat >> "$services_snippet_file" << EOF
 
-  minio:
-    restart: always
-    image: minio/minio@sha256:13582eff79c6605a2d315bdd0e70164142ea7e98fc8411e9e10d089502a6d883
-    command: server /data
-    environment:
-      MINIO_ROOT_USER: "$minio_root_user"
-      MINIO_ROOT_PASSWORD: "$minio_root_password"
+  rustfs-perms:
+    image: busybox:1.36.1
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p /data && chown -R 10001:10001 /data"]
     volumes:
-      - minio-data:/data
-    labels:
-      - "traefik.enable=true"
-      # S3 API on files subdomain
-      - "traefik.http.routers.minio-s3.rule=Host(\`$files_domain\`)"
-      - "traefik.http.routers.minio-s3.entrypoints=websecure"
-      - "traefik.http.routers.minio-s3.tls=true"
-      - "traefik.http.routers.minio-s3.tls.certresolver=default"
-      - "traefik.http.routers.minio-s3.service=minio-s3"
-      - "traefik.http.services.minio-s3.loadbalancer.server.port=9000"
-      # CORS and rate limit (adjust origins if needed)
-      - "traefik.http.routers.minio-s3.middlewares=minio-cors,minio-ratelimit"
-      - "traefik.http.middlewares.minio-cors.headers.accesscontrolallowmethods=GET,PUT,POST,DELETE,HEAD,OPTIONS"
-      - "traefik.http.middlewares.minio-cors.headers.accesscontrolallowheaders=*"
-      - "traefik.http.middlewares.minio-cors.headers.accesscontrolalloworiginlist=https://$domain_name"
-      - "traefik.http.middlewares.minio-cors.headers.accesscontrolmaxage=100"
-      - "traefik.http.middlewares.minio-cors.headers.addvaryheader=true"
-      - "traefik.http.middlewares.minio-ratelimit.ratelimit.average=100"
-      - "traefik.http.middlewares.minio-ratelimit.ratelimit.burst=200"
+      - rustfs-data:/data
 EOF
     fi
 
-    if [[ $insert_minio_init == "y" ]]; then
+    if [[ $insert_rustfs == "y" ]]; then
       cat >> "$services_snippet_file" << EOF
-  minio-init:
-    image: minio/mc@sha256:95b5f3f7969a5c5a9f3a700ba72d5c84172819e13385aaf916e237cf111ab868
+  rustfs:
+    restart: always
+    image: rustfs/rustfs:1.0.0-rc.2@sha256:7d6d361c49c08d427250fb59aae5d78df83d644c3405d9ccf4b21cda0b0692d0
     depends_on:
-      - minio
+      rustfs-perms:
+        condition: service_completed_successfully
+    command: /data
     environment:
-      MINIO_ROOT_USER: "$minio_root_user"
-      MINIO_ROOT_PASSWORD: "$minio_root_password"
-      MINIO_SERVICE_USER: "$minio_service_user"
-      MINIO_SERVICE_PASSWORD: "$minio_service_password"
-      MINIO_BUCKET_NAME: "$minio_bucket_name"
-    entrypoint: ["/bin/sh", "/tmp/minio-init.sh"]
+      RUSTFS_ACCESS_KEY: "\${FORMBRICKS_RUSTFS_ADMIN_USER}"
+      RUSTFS_SECRET_KEY: "\${FORMBRICKS_RUSTFS_ADMIN_PASSWORD}"
+      RUSTFS_ADDRESS: ":9000"
     volumes:
-      - ./minio-init.sh:/tmp/minio-init.sh:ro
+      - rustfs-data:/data
+    labels:
+      - "traefik.enable=true"
+      # S3 API on files subdomain
+      - "traefik.http.routers.rustfs-s3.rule=Host(\`$files_domain\`)"
+      - "traefik.http.routers.rustfs-s3.entrypoints=websecure"
+      - "traefik.http.routers.rustfs-s3.tls=true"
+      - "traefik.http.routers.rustfs-s3.tls.certresolver=default"
+      - "traefik.http.routers.rustfs-s3.service=rustfs-s3"
+      - "traefik.http.services.rustfs-s3.loadbalancer.server.port=9000"
+      # CORS and rate limit (adjust origins if needed)
+      - "traefik.http.routers.rustfs-s3.middlewares=rustfs-cors,rustfs-ratelimit"
+      - "traefik.http.middlewares.rustfs-cors.headers.accesscontrolallowmethods=GET,PUT,POST,DELETE,HEAD,OPTIONS"
+      - "traefik.http.middlewares.rustfs-cors.headers.accesscontrolallowheaders=*"
+      - "traefik.http.middlewares.rustfs-cors.headers.accesscontrolalloworiginlist=https://$domain_name"
+      - "traefik.http.middlewares.rustfs-cors.headers.accesscontrolmaxage=100"
+      - "traefik.http.middlewares.rustfs-cors.headers.addvaryheader=true"
+      - "traefik.http.middlewares.rustfs-ratelimit.ratelimit.average=100"
+      - "traefik.http.middlewares.rustfs-ratelimit.ratelimit.burst=200"
+EOF
+    fi
+
+    if [[ $insert_rustfs_init == "y" ]]; then
+      cat >> "$services_snippet_file" << EOF
+  rustfs-init:
+    image: rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
+    depends_on:
+      - rustfs
+    environment:
+      RUSTFS_ADMIN_USER: "\${FORMBRICKS_RUSTFS_ADMIN_USER}"
+      RUSTFS_ADMIN_PASSWORD: "\${FORMBRICKS_RUSTFS_ADMIN_PASSWORD}"
+      RUSTFS_SERVICE_USER: "\${FORMBRICKS_RUSTFS_SERVICE_USER}"
+      RUSTFS_SERVICE_PASSWORD: "\${FORMBRICKS_RUSTFS_SERVICE_PASSWORD}"
+      RUSTFS_BUCKET_NAME: "\${FORMBRICKS_RUSTFS_BUCKET_NAME}"
+      RUSTFS_POLICY_NAME: "\${FORMBRICKS_RUSTFS_POLICY_NAME}"
+      RUSTFS_CORS_ALLOWED_ORIGINS: "$rustfs_cors_origin"
+    entrypoint: ["/bin/sh", "/tmp/rustfs-init.sh"]
+    volumes:
+      - ./rustfs-init.sh:/tmp/rustfs-init.sh:ro
 EOF
     fi
 
     if [[ $insert_traefik == "y" ]]; then
       cat >> "$services_snippet_file" << EOF
   traefik:
-    image: "traefik:v2.11.31"
+    image: "traefik:v3.6.4"
     restart: always
     container_name: "traefik"
     depends_on:
       - formbricks
-      - minio
+      - hub
+      - rustfs
     ports:
       - "80:80"
       - "443:443"
@@ -513,11 +1064,11 @@ EOF
 EOF
     fi
 
-    # Downgrade MinIO router to plain HTTP when HTTPS is not configured
+    # Downgrade RustFS router to plain HTTP when HTTPS is not configured
     if [[ $https_setup != "y" ]]; then
-      sed -i 's/traefik.http.routers.minio-s3.entrypoints=websecure/traefik.http.routers.minio-s3.entrypoints=web/' "$services_snippet_file"
-      sed -i '/traefik.http.routers.minio-s3.tls=true/d' "$services_snippet_file"
-      sed -i '/traefik.http.routers.minio-s3.tls.certresolver=default/d' "$services_snippet_file"
+      sed -i 's/traefik.http.routers.rustfs-s3.entrypoints=websecure/traefik.http.routers.rustfs-s3.entrypoints=web/' "$services_snippet_file"
+      sed -i '/traefik.http.routers.rustfs-s3.tls=true/d' "$services_snippet_file"
+      sed -i '/traefik.http.routers.rustfs-s3.tls.certresolver=default/d' "$services_snippet_file"
       sed -i "s|accesscontrolalloworiginlist=https://$domain_name|accesscontrolalloworiginlist=http://$domain_name|" "$services_snippet_file"
     fi
   else
@@ -525,11 +1076,12 @@ EOF
       cat > "$services_snippet_file" << EOF
 
   traefik:
-    image: "traefik:v2.11.31"
+    image: "traefik:v3.6.4"
     restart: always
     container_name: "traefik"
     depends_on:
       - formbricks
+      - hub
     ports:
       - "80:80"
       - "443:443"
@@ -577,14 +1129,14 @@ EOF
         END { if (invol && !added) { print "  redis:"; print "    driver: local" } }
       ' docker-compose.yml > tmp.yml && mv tmp.yml docker-compose.yml
     fi
-    # Ensure minio-data if needed
-    if [[ $minio_storage == "y" ]]; then
-      if ! awk '/^volumes:/{invol=1; next} invol && (/^[^[:space:]]/ || NF==0){invol=0} invol{ if($1=="minio-data:") found=1 } END{ exit(found?0:1) }' docker-compose.yml; then
+    # Ensure rustfs-data if needed
+    if [[ $rustfs_storage == "y" ]]; then
+      if ! awk '/^volumes:/{invol=1; next} invol && (/^[^[:space:]]/ || NF==0){invol=0} invol{ if($1=="rustfs-data:") found=1 } END{ exit(found?0:1) }' docker-compose.yml; then
         awk '
           /^volumes:/ { print; invol=1; next }
-          invol && /^[^[:space:]]/ { if(!added){ print "  minio-data:"; print "    driver: local"; added=1 } ; invol=0 }
+          invol && /^[^[:space:]]/ { if(!added){ print "  rustfs-data:"; print "    driver: local"; added=1 } ; invol=0 }
           { print }
-          END { if (invol && !added) { print "  minio-data:"; print "    driver: local" } }
+          END { if (invol && !added) { print "  rustfs-data:"; print "    driver: local" } }
         ' docker-compose.yml > tmp.yml && mv tmp.yml docker-compose.yml
       fi
     fi
@@ -596,81 +1148,25 @@ EOF
       echo "    driver: local"
       echo "  redis:"
       echo "    driver: local"
-      if [[ $minio_storage == "y" ]]; then
-        echo "  minio-data:"
+      if [[ $rustfs_storage == "y" ]]; then
+        echo "  rustfs-data:"
         echo "    driver: local"
       fi
     } >> docker-compose.yml
   fi
 
-  # Create minio-init script outside heredoc to avoid variable expansion issues
-  if [[ $minio_storage == "y" ]]; then
-    cat > minio-init.sh << 'MINIO_SCRIPT_EOF'
-#!/bin/sh
-echo '⏳ Waiting for MinIO to be ready...'
-attempts=0
-max_attempts=30
-until mc alias set minio http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 \
-  && mc ls minio >/dev/null 2>&1; do
-  attempts=$((attempts + 1))
-  if [ $attempts -ge $max_attempts ]; then
-    printf '❌ Failed to connect to MinIO after %s attempts\n' $max_attempts
-    exit 1
-  fi
-  printf '...still waiting attempt %s/%s\n' $attempts $max_attempts
-  sleep 2
-done
-echo '🔗 MinIO reachable; alias configured.'
-
-echo '🪣 Creating bucket (idempotent)...';
-mc mb minio/$MINIO_BUCKET_NAME --ignore-existing;
-
-echo '📄 Creating JSON policy file...';
-cat > /tmp/formbricks-policy.json << EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:DeleteObject", "s3:GetObject", "s3:PutObject"],
-      "Resource": ["arn:aws:s3:::$MINIO_BUCKET_NAME/*"]
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
-      "Resource": ["arn:aws:s3:::$MINIO_BUCKET_NAME"]
-    }
-  ]
-}
-EOF
-
-echo '🔒 Creating policy (idempotent)...';
-if ! mc admin policy info minio formbricks-policy >/dev/null 2>&1; then
-  mc admin policy create minio formbricks-policy /tmp/formbricks-policy.json || mc admin policy add minio formbricks-policy /tmp/formbricks-policy.json;
-  echo 'Policy created successfully.';
-else
-  echo 'Policy already exists, skipping creation.';
-fi
-
-echo '👤 Creating service user (idempotent)...';
-if ! mc admin user info minio "$MINIO_SERVICE_USER" >/dev/null 2>&1; then
-  mc admin user add minio "$MINIO_SERVICE_USER" "$MINIO_SERVICE_PASSWORD";
-  echo 'User created successfully.';
-else
-  echo 'User already exists, skipping creation.';
-fi
-
-echo '🔗 Attaching policy to user (idempotent)...';
-mc admin policy attach minio formbricks-policy --user "$MINIO_SERVICE_USER" || echo 'Policy already attached or attachment failed (non-fatal).';
-
-echo '✅ MinIO setup complete!';
-exit 0;
-MINIO_SCRIPT_EOF
-    chmod +x minio-init.sh
+  # Create rustfs-init script outside heredoc to avoid variable expansion issues
+  if [[ $rustfs_storage == "y" ]]; then
+    write_rustfs_init_script "rustfs-init.sh"
   fi
 
   newgrp docker <<END
 
+set -e
+docker compose up -d postgres authzed-db-bootstrap spicedb-migrate spicedb formbricks-migrate
+docker compose wait formbricks-migrate
+docker compose --profile authzed-ops run --rm authzed-ops upgrade prepare
+docker compose --profile authzed-ops run --rm authzed-ops upgrade check
 docker compose up -d
 
 echo "🔗 To edit more variables and deeper config, go to the formbricks/docker-compose.yml, edit the file, and restart the container!"
@@ -678,10 +1174,10 @@ echo "🔗 To edit more variables and deeper config, go to the formbricks/docker
 echo "🚨 Make sure you have set up the DNS records as well as inbound rules for the domain name and IP address of this instance."
 echo ""
 
-if [[ $minio_storage == "y" ]]; then
-    echo "🗄️  MinIO Storage Setup Complete:"
-    echo "   • Access Key: $minio_service_user (least privilege)"
-    echo "   • Bucket: $minio_bucket_name (✅ created and secured)"
+if [[ $rustfs_storage == "y" ]]; then
+    echo "🗄️  RustFS Storage Setup Complete:"
+    echo "   • Bucket: $rustfs_bucket_name (✅ created and secured)"
+    echo "   • Generated credentials stored in ./formbricks/.env (permissions set to 600)"
     echo ""
 fi
 
@@ -713,11 +1209,112 @@ stop_formbricks() {
   echo "🎉 Formbricks instance stopped successfully!"
 }
 
+migrate_legacy_valkey_image() {
+  local compose_file="${1:-docker-compose.yml}"
+  local backup_file="${compose_file}.before-valkey-8.1.9"
+  local temp_file="${compose_file}.tmp"
+
+  if [[ ! -f "$compose_file" ]]; then
+    echo "❌ Cannot update Valkey because $compose_file does not exist."
+    return 1
+  fi
+
+  if ! awk -v legacy_image="$legacy_valkey_image" '
+    function indentation(line) {
+      match(line, /[^ ]/)
+      return RSTART - 1
+    }
+    /^services:[[:space:]]*$/ {
+      in_services=1
+      service_indent=-1
+      next
+    }
+    in_services && /^[^[:space:]#]/ {
+      in_services=0
+      in_redis=0
+    }
+    in_services && /^[ ]+[A-Za-z0-9_-]+:[[:space:]]*$/ {
+      line_indent=indentation($0)
+      if (service_indent < 0) service_indent=line_indent
+      if (line_indent == service_indent) in_redis=($0 ~ /^[ ]+redis:[[:space:]]*$/)
+    }
+    in_redis && /^[[:space:]]+image:[[:space:]]*/ && index($0, legacy_image) { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' "$compose_file"; then
+    return 0
+  fi
+
+  cp -p "$compose_file" "$backup_file"
+  cp -p "$compose_file" "$temp_file"
+
+  if ! awk -v legacy_image="$legacy_valkey_image" -v replacement_image="$multi_arch_valkey_image" '
+    function indentation(line) {
+      match(line, /[^ ]/)
+      return RSTART - 1
+    }
+    /^services:[[:space:]]*$/ {
+      in_services=1
+      service_indent=-1
+    }
+    in_services && /^[^[:space:]#]/ && !/^services:[[:space:]]*$/ {
+      in_services=0
+      in_redis=0
+    }
+    in_services && /^[ ]+[A-Za-z0-9_-]+:[[:space:]]*$/ {
+      line_indent=indentation($0)
+      if (service_indent < 0) service_indent=line_indent
+      if (line_indent == service_indent) in_redis=($0 ~ /^[ ]+redis:[[:space:]]*$/)
+    }
+    in_redis && /^[[:space:]]+image:[[:space:]]*/ && index($0, legacy_image) {
+      sub(legacy_image, replacement_image)
+      replacements++
+    }
+    { print }
+    END { exit(replacements == 1 ? 0 : 1) }
+  ' "$compose_file" >"$temp_file"; then
+    rm -f "$temp_file"
+    echo "❌ Could not update the bundled Valkey image. The original Compose file is unchanged."
+    return 1
+  fi
+
+  mv "$temp_file" "$compose_file"
+
+  if ! sudo docker compose -f "$compose_file" config >/dev/null; then
+    cp -p "$backup_file" "$compose_file"
+    echo "❌ The updated Compose file is invalid. Restored $compose_file from $backup_file."
+    return 1
+  fi
+
+  echo "✅ Updated bundled Valkey to the native amd64/arm64 image. Backup: $backup_file"
+}
+
 update_formbricks() {
   echo "🔄 Updating Formbricks..."
   cd formbricks
+
+  migrate_legacy_valkey_image docker-compose.yml
+
+  if ! grep -Eq '^  authzed-ops:$' docker-compose.yml || ! grep -Eq '^  spicedb:$' docker-compose.yml; then
+    echo "❌ This installation does not yet contain the AuthZed v6 Compose services."
+    echo "Your customized Compose file was not changed. Follow the v6 AuthZed migration guide before updating:"
+    echo "https://formbricks.com/docs/self-hosting/advanced/authzed-operations#upgrade-an-existing-installation-to-v6"
+    exit 1
+  fi
+
+  if ! grep -Eq '^FORMBRICKS_AUTHZED_V6_MIGRATION_ACKNOWLEDGED=true$' .env; then
+    echo "❌ The AuthZed v6 migration has not been acknowledged for this installation."
+    echo "Back up PostgreSQL, add the documented AuthZed services and secrets, then run the upgrade preparation."
+    echo "After its final check is clean, set FORMBRICKS_AUTHZED_V6_MIGRATION_ACKNOWLEDGED=true in .env and retry."
+    echo "https://formbricks.com/docs/self-hosting/advanced/authzed-operations#upgrade-an-existing-installation-to-v6"
+    exit 1
+  fi
   sudo docker compose pull
+  # Preparation is an explicit maintenance operation. Never run target-version
+  # database migrations or schema/relationship writes against the still-running app.
+  sudo docker compose --profile authzed-ops run --rm --no-deps authzed-ops upgrade check
   sudo docker compose down
+  sudo docker compose up -d --wait postgres
+  sudo docker compose run --rm --no-deps formbricks-migrate
   sudo docker compose up -d
   echo "🎉 Formbricks updated successfully!"
   echo "🎉 Check the status of Formbricks & Traefik with 'cd formbricks && sudo docker compose logs.'"
@@ -736,64 +1333,78 @@ get_logs() {
   sudo docker compose logs
 }
 
-cleanup_minio_init() {
-  echo "🧹 Cleaning up MinIO init service and references..."
+cleanup_rustfs_init() {
+  echo "🧹 Cleaning up RustFS init service and references..."
   cd formbricks
 
-  # Remove minio-init service block from docker-compose.yml
+  # Remove rustfs-init service block from docker-compose.yml
   awk '
     BEGIN{skip=0}
     /^services:[[:space:]]*$/ { print; next }
-    /^  minio-init:/          { skip=1; next }
+    /^  rustfs-init:/         { skip=1; next }
     /^  [A-Za-z0-9_-]+:/      { if (skip) skip=0 }
     { if (!skip) print }
   ' docker-compose.yml > tmp.yml && mv tmp.yml docker-compose.yml
 
-  # Remove list-style "- minio-init" lines under depends_on (if any)
+  # Remove list-style init dependencies under depends_on (if any)
   if sed --version >/dev/null 2>&1; then
+    sed -E -i '/^[[:space:]]*-[[:space:]]*rustfs-init[[:space:]]*$/d' docker-compose.yml
     sed -E -i '/^[[:space:]]*-[[:space:]]*minio-init[[:space:]]*$/d' docker-compose.yml
   else
+    sed -E -i '' '/^[[:space:]]*-[[:space:]]*rustfs-init[[:space:]]*$/d' docker-compose.yml
     sed -E -i '' '/^[[:space:]]*-[[:space:]]*minio-init[[:space:]]*$/d' docker-compose.yml
   fi
 
-  # Remove the minio-init mapping and its condition line (mapping style depends_on)
+  # Remove the mapping style depends_on entries for init jobs
   if sed --version >/dev/null 2>&1; then
+    sed -i '/^[[:space:]]*rustfs-init:[[:space:]]*$/,/^[[:space:]]*condition:[[:space:]]*service_completed_successfully[[:space:]]*$/d' docker-compose.yml
     sed -i '/^[[:space:]]*minio-init:[[:space:]]*$/,/^[[:space:]]*condition:[[:space:]]*service_completed_successfully[[:space:]]*$/d' docker-compose.yml
   else
+    sed -i '' '/^[[:space:]]*rustfs-init:[[:space:]]*$/,/^[[:space:]]*condition:[[:space:]]*service_completed_successfully[[:space:]]*$/d' docker-compose.yml
     sed -i '' '/^[[:space:]]*minio-init:[[:space:]]*$/,/^[[:space:]]*condition:[[:space:]]*service_completed_successfully[[:space:]]*$/d' docker-compose.yml
   fi
 
-  # Remove any stopped minio-init container and restart without orphans
+  # Remove any stopped init containers and restart without orphans
+  docker compose rm -f -s rustfs-init >/dev/null 2>&1 || true
   docker compose rm -f -s minio-init >/dev/null 2>&1 || true
   docker compose up -d --remove-orphans
 
-  echo "✅ MinIO init cleanup complete."
+  echo "✅ RustFS init cleanup complete."
 }
 
-case "$1" in
-install)
-  install_formbricks
-  ;;
-update)
-  update_formbricks
-  ;;
-stop)
-  stop_formbricks
-  ;;
-restart)
-  restart_formbricks
-  ;;
-logs)
-  get_logs
-  ;;
+cleanup_minio_init() {
+  cleanup_rustfs_init
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "$1" in
+  install)
+    install_formbricks
+    ;;
+  update)
+    update_formbricks
+    ;;
+  stop)
+    stop_formbricks
+    ;;
+  restart)
+    restart_formbricks
+    ;;
+  logs)
+    get_logs
+    ;;
+  cleanup-rustfs-init)
+    cleanup_rustfs_init
+    ;;
   cleanup-minio-init)
     cleanup_minio_init
     ;;
-uninstall)
-  uninstall_formbricks
-  ;;
-*)
-  echo "🚀 Executing default step of installing Formbricks"
-  install_formbricks
-  ;;
-esac
+  uninstall)
+    uninstall_formbricks
+    ;;
+  *)
+    echo "🚀 Executing default step of installing Formbricks"
+    install_formbricks
+    ;;
+  esac
+fi

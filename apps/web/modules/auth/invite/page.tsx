@@ -1,4 +1,9 @@
-import { getServerSession } from "next-auth";
+/* eslint-disable react-hooks/error-boundaries -- InvitePage is an async Server Component, where
+   try/catch genuinely is the boundary: the awaits that can throw run inside the try, on the server,
+   during this function. The rule's premise (a throw comes from a *child's* render, after this
+   function has returned its element tree, so only an error boundary can catch it) holds for client
+   components and does not apply here. Scoped to the file because ESLint cannot tell a server
+   component from a client one (ENG-2366). */
 import Link from "next/link";
 import { after } from "next/server";
 import { logger } from "@formbricks/logger";
@@ -9,7 +14,7 @@ import { getUser, updateUser } from "@/lib/user/service";
 import { getTranslate } from "@/lingodotdev/server";
 import { deleteInvite, getInvite } from "@/modules/auth/invite/lib/invite";
 import { createTeamMembership } from "@/modules/auth/invite/lib/team";
-import { authOptions } from "@/modules/auth/lib/authOptions";
+import { getSession } from "@/modules/auth/lib/session";
 import { sendInviteAcceptedEmail } from "@/modules/email";
 import { Button } from "@/modules/ui/components/button";
 import { ContentLayout } from "./components/content-layout";
@@ -21,7 +26,7 @@ interface InvitePageProps {
 export const InvitePage = async (props: InvitePageProps) => {
   const searchParams = await props.searchParams;
   const t = await getTranslate();
-  const session = await getServerSession(authOptions);
+  const session = await getSession();
   const user = session?.user.id ? await getUser(session.user.id) : null;
 
   try {

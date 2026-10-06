@@ -1,19 +1,22 @@
 import "server-only";
-import { ApiKey, ApiKeyPermission, Prisma } from "@prisma/client";
 import { randomBytes } from "node:crypto";
 import { cache as reactCache } from "react";
 import { prisma } from "@formbricks/database";
+import { ApiKey, ApiKeyPermission, Prisma } from "@formbricks/database/prisma";
 import { logger } from "@formbricks/logger";
 import { TOrganizationAccess } from "@formbricks/types/api-key";
 import { ZId } from "@formbricks/types/common";
-import { DatabaseError } from "@formbricks/types/errors";
+import { DatabaseError, OperationNotAllowedError } from "@formbricks/types/errors";
+import { reconcileApiKeyRelationships } from "@/lib/authzed/api-key";
+import { runPostCommitProjection } from "@/lib/authzed/projection-boundary";
 import { CONTROL_HASH } from "@/lib/constants";
 import { hashSecret, hashSha256, parseApiKeyV2, verifySecret } from "@/lib/crypto";
 import { validateInputs } from "@/lib/utils/validate";
+import { getWorkspacesByOrganizationId } from "@/modules/organization/settings/api-keys/lib/workspaces";
 import {
   TApiKeyCreateInput,
   TApiKeyUpdateInput,
-  TApiKeyWithEnvironmentAndProject,
+  TApiKeyWithEnvironmentAndWorkspace,
   TApiKeyWithEnvironmentPermission,
   ZApiKeyCreateInput,
 } from "@/modules/organization/settings/api-keys/types/api-keys";
@@ -32,10 +35,10 @@ export const getApiKeysWithEnvironmentPermissions = reactCache(
           label: true,
           createdAt: true,
           organizationAccess: true,
-          apiKeyEnvironments: {
+          apiKeyWorkspaces: {
             select: {
-              environmentId: true,
               permission: true,
+              workspaceId: true,
             },
           },
         },
@@ -52,19 +55,19 @@ export const getApiKeysWithEnvironmentPermissions = reactCache(
 
 // Get API key with its permissions from a raw API key
 export const getApiKeyWithPermissions = reactCache(
-  async (apiKey: string): Promise<TApiKeyWithEnvironmentAndProject | null> => {
+  async (apiKey: string): Promise<TApiKeyWithEnvironmentAndWorkspace | null> => {
     try {
       const includeQuery = {
-        apiKeyEnvironments: {
+        apiKeyWorkspaces: {
           include: {
-            environment: {
-              include: {
-                project: {
-                  select: {
-                    id: true,
-                    name: true,
-                  },
-                },
+            workspace: {
+              select: {
+                id: true,
+                name: true,
+                // ENG-1749: needed so the auth layer can drop any workspace permission whose
+                // workspace is outside the key's organization (defense-in-depth for the read path,
+                // which authorizes off the permission list rather than resolveBodyIdsV2).
+                organizationId: true,
               },
             },
           },
@@ -121,7 +124,7 @@ export const getApiKeyWithPermissions = reactCache(
           });
       }
 
-      return apiKeyData as TApiKeyWithEnvironmentAndProject;
+      return apiKeyData as TApiKeyWithEnvironmentAndWorkspace;
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError) {
         throw new DatabaseError(error.message);
@@ -142,6 +145,10 @@ export const deleteApiKey = async (id: string): Promise<ApiKey | null> => {
       },
     });
 
+    await runPostCommitProjection("api_key_delete_relationship_reconciliation", () =>
+      reconcileApiKeyRelationships({ apiKeyIds: [id] })
+    );
+
     return deletedApiKeyData;
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
@@ -156,12 +163,33 @@ export const createApiKey = async (
   organizationId: string,
   userId: string,
   apiKeyData: TApiKeyCreateInput & {
-    environmentPermissions?: Array<{ environmentId: string; permission: ApiKeyPermission }>;
+    workspacePermissions?: Array<{
+      workspaceId: string;
+      permission: ApiKeyPermission;
+    }>;
     organizationAccess: TOrganizationAccess;
   }
 ): Promise<TApiKeyWithEnvironmentPermission & { actualKey: string }> => {
   validateInputs([organizationId, ZId], [apiKeyData, ZApiKeyCreateInput]);
   try {
+    // ENG-1749: an API key is created at the organization level but carries per-workspace
+    // permissions. Reject any workspace that does not belong to the authorized organization,
+    // otherwise a caller could mint a key scoped to another tenant's workspace (cross-tenant
+    // BOLA). Validate before generating/hashing the secret so illegitimate input does no work.
+    const { workspacePermissions, organizationAccess, ...apiKeyDataWithoutPermissions } = apiKeyData;
+    if (workspacePermissions && workspacePermissions.length > 0) {
+      const orgWorkspaceIds = new Set(
+        (await getWorkspacesByOrganizationId(organizationId)).map((workspace) => workspace.id)
+      );
+      for (const { workspaceId } of workspacePermissions) {
+        if (!orgWorkspaceIds.has(workspaceId)) {
+          throw new OperationNotAllowedError(
+            `Workspace ${workspaceId} does not belong to organization ${organizationId}`
+          );
+        }
+      }
+    }
+
     // Generate a secure random secret (32 bytes base64url)
     const secret = randomBytes(32).toString("base64url");
 
@@ -172,9 +200,6 @@ export const createApiKey = async (
     // 2. bcrypt hash
     const hashedKey = await hashSecret(secret, 12);
 
-    // Extract environmentPermissions from apiKeyData
-    const { environmentPermissions, organizationAccess, ...apiKeyDataWithoutPermissions } = apiKeyData;
-
     // Create the API key
     const result = await prisma.apiKey.create({
       data: {
@@ -184,21 +209,25 @@ export const createApiKey = async (
         createdBy: userId,
         organization: { connect: { id: organizationId } },
         organizationAccess,
-        ...(environmentPermissions && environmentPermissions.length > 0
+        ...(workspacePermissions && workspacePermissions.length > 0
           ? {
-              apiKeyEnvironments: {
-                create: environmentPermissions.map((envPerm) => ({
-                  environmentId: envPerm.environmentId,
-                  permission: envPerm.permission,
+              apiKeyWorkspaces: {
+                create: workspacePermissions.map((wsPerm) => ({
+                  permission: wsPerm.permission,
+                  workspaceId: wsPerm.workspaceId,
                 })),
               },
             }
           : {}),
       },
       include: {
-        apiKeyEnvironments: true,
+        apiKeyWorkspaces: true,
       },
     });
+
+    await runPostCommitProjection("api_key_create_relationship_reconciliation", () =>
+      reconcileApiKeyRelationships({ apiKeyIds: [result.id] })
+    );
 
     // Return the new v2 format: fbk_{secret}
     return { ...result, actualKey: `fbk_${secret}` };

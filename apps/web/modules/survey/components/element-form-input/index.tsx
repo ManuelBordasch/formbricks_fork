@@ -1,11 +1,11 @@
 "use client";
 
 import { useAutoAnimate } from "@formkit/auto-animate/react";
-import { debounce } from "lodash";
 import { ImagePlusIcon, TrashIcon } from "lucide-react";
 import { type Dispatch, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type TI18nString } from "@formbricks/types/i18n";
+import { IMAGE_FILE_EXTENSIONS } from "@formbricks/types/storage";
 import {
   TSurveyElement,
   TSurveyElementChoice,
@@ -14,14 +14,15 @@ import {
 import {
   TSurvey,
   TSurveyEndScreenCard,
+  TSurveyRecallItem,
   TSurveyRedirectUrlCard,
   TSurveyWelcomeCard,
 } from "@formbricks/types/surveys/types";
 import { TUserLocale } from "@formbricks/types/user";
 import { createI18nString, extractLanguageCodes } from "@/lib/i18n/utils";
+import { debounce } from "@/lib/utils/debounce";
 import { useSyncScroll } from "@/lib/utils/hooks/useSyncScroll";
-import { recallToHeadline } from "@/lib/utils/recall";
-import { MultiLangWrapper } from "@/modules/survey/components/element-form-input/components/multi-lang-wrapper";
+import { headlineToRecall, recallToHeadline } from "@/lib/utils/recall";
 import { RecallWrapper } from "@/modules/survey/components/element-form-input/components/recall-wrapper";
 import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
 import { LocalizedEditor } from "@/modules/survey/multi-language-surveys/components/localized-editor";
@@ -54,8 +55,7 @@ interface ElementFormInputProps {
   updateChoice?: (choiceIdx: number, data: Partial<TSurveyElementChoice>) => void;
   updateMatrixLabel?: (index: number, type: "row" | "column", matrixLabel: TI18nString) => void;
   isInvalid: boolean;
-  selectedLanguageCode: string;
-  setSelectedLanguageCode: (languageCode: string) => void;
+  selectedLanguageCode?: string;
   label: string;
   maxLength?: number;
   placeholder?: string;
@@ -81,8 +81,7 @@ export const ElementFormInput = ({
   updateMatrixLabel,
   isInvalid,
   label,
-  selectedLanguageCode,
-  setSelectedLanguageCode,
+  selectedLanguageCode = "default",
   maxLength,
   placeholder,
   onBlur,
@@ -120,8 +119,7 @@ export const ElementFormInput = ({
       : isEndingCard
         ? localSurvey.endings[elementIdx - elements.length].id
         : currentElement.id;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isWelcomeCard, isEndingCard, currentElement?.id]);
+  }, [isWelcomeCard, isEndingCard, currentElement?.id, elementIdx, elements.length, localSurvey.endings]);
   const endingCard = localSurvey.endings.find((ending) => ending.id === elementId);
 
   const surveyLanguageCodes = useMemo(
@@ -387,6 +385,19 @@ export const ElementFormInput = ({
     return false;
   };
 
+  const handleMultiLangChange = useCallback(
+    (newValue: string, recallItems?: TSurveyRecallItem[], fallbacks?: { [key: string]: string }) => {
+      const updatedValue = {
+        ...text,
+        [usedLanguageCode]:
+          recallItems && fallbacks ? headlineToRecall(newValue, recallItems, fallbacks) : newValue,
+      };
+      setText(updatedValue);
+      debouncedHandleUpdate(updatedValue[usedLanguageCode]);
+    },
+    [text, usedLanguageCode, debouncedHandleUpdate]
+  );
+
   const useRichTextEditor = id === "headline" || id === "subheader" || id === "html";
 
   // For rich text editor fields, we need either updateElement or updateSurvey
@@ -398,12 +409,12 @@ export const ElementFormInput = ({
     return (
       <div className="w-full">
         {label && (
-          <div className="mb-2 mt-3 flex items-center justify-between">
+          <div className="mt-3 mb-2 flex items-center justify-between">
             <Label htmlFor={id}>{label}</Label>
             {id === "headline" && currentElement && updateElement && (
-              <div className="flex items-center space-x-2">
+              <div className="flex items-center gap-x-2">
                 <Label htmlFor="required-toggle" className="text-sm">
-                  {t("environments.surveys.edit.required")}
+                  {t("workspace.surveys.edit.required")}
                 </Label>
                 <Switch
                   id="required-toggle"
@@ -421,8 +432,8 @@ export const ElementFormInput = ({
           {showImageUploader && id === "headline" && (
             <FileInput
               id="element-image"
-              allowedFileExtensions={["png", "jpeg", "jpg", "webp", "heic"]}
-              environmentId={localSurvey.environmentId}
+              allowedFileExtensions={[...IMAGE_FILE_EXTENSIONS]}
+              workspaceId={localSurvey.workspaceId}
               onFileUpload={(url: string[] | undefined, fileType: "image" | "video") => {
                 if (url) {
                   const update =
@@ -455,7 +466,6 @@ export const ElementFormInput = ({
                 isInvalid={isInvalid}
                 updateElement={(isWelcomeCard || isEndingCard ? updateSurvey : updateElement)!}
                 selectedLanguageCode={selectedLanguageCode}
-                setSelectedLanguageCode={setSelectedLanguageCode}
                 firstRender={firstRender}
                 setFirstRender={setFirstRender}
                 locale={locale}
@@ -469,7 +479,7 @@ export const ElementFormInput = ({
 
             {id === "headline" && !isWelcomeCard && (
               <TooltipRenderer
-                tooltipContent={t("environments.surveys.edit.add_photo_or_video")}
+                tooltipContent={t("workspace.surveys.edit.add_photo_or_video")}
                 delayDuration={100}>
                 <Button
                   variant="secondary"
@@ -486,7 +496,7 @@ export const ElementFormInput = ({
             )}
 
             {id === "subheader" && renderRemoveDescriptionButton() && (
-              <TooltipRenderer tooltipContent={t("environments.surveys.edit.remove_description")}>
+              <TooltipRenderer tooltipContent={t("workspace.surveys.edit.remove_description")}>
                 <Button
                   variant="secondary"
                   size="icon"
@@ -528,102 +538,73 @@ export const ElementFormInput = ({
   return (
     <div className="w-full">
       {label && (
-        <div className="mb-2 mt-3 flex items-center justify-between">
+        <div className="mt-3 mb-2 flex items-center justify-between">
           <Label htmlFor={id}>{label}</Label>
         </div>
       )}
-      <MultiLangWrapper
-        isTranslationIncomplete={isTranslationIncomplete}
-        value={text}
+      <RecallWrapper
         localSurvey={localSurvey}
-        selectedLanguageCode={selectedLanguageCode}
-        setSelectedLanguageCode={setSelectedLanguageCode}
-        locale={locale}
-        key={selectedLanguageCode}
-        onChange={(updatedText) => {
-          setText(updatedText);
-          debouncedHandleUpdate(updatedText[usedLanguageCode]);
+        elementId={elementId}
+        value={text[usedLanguageCode]}
+        onChange={(value, recallItems, fallbacks) => {
+          handleMultiLangChange(value, recallItems, fallbacks);
         }}
-        render={({ value, onChange, children: languageIndicator }) => {
+        onAddFallback={() => {
+          inputRef.current?.focus();
+        }}
+        isRecallAllowed={false}
+        usedLanguageCode={usedLanguageCode}
+        render={({ value, onChange, highlightedJSX, children: recallComponents, isRecallSelectVisible }) => {
           return (
-            <RecallWrapper
-              localSurvey={localSurvey}
-              elementId={elementId}
-              value={value[usedLanguageCode]}
-              onChange={(value, recallItems, fallbacks) => {
-                // Pass all values to MultiLangWrapper's onChange
-                onChange(value, recallItems, fallbacks);
-              }}
-              onAddFallback={() => {
-                inputRef.current?.focus();
-              }}
-              isRecallAllowed={false}
-              usedLanguageCode={usedLanguageCode}
-              render={({
-                value,
-                onChange,
-                highlightedJSX,
-                children: recallComponents,
-                isRecallSelectVisible,
-              }) => {
-                return (
-                  <div className="flex flex-col gap-4 bg-white" ref={animationParent}>
-                    <div className="flex w-full items-center space-x-2">
-                      <div className="group relative w-full">
-                        {languageIndicator}
-                        {/* The highlight container is absolutely positioned behind the input */}
-                        <div className="h-10 w-full"></div>
-                        <div
-                          ref={highlightContainerRef}
-                          className={`no-scrollbar absolute top-0 z-0 mt-0.5 flex h-10 w-full overflow-scroll whitespace-nowrap px-3 py-2 text-center text-sm text-transparent ${
-                            localSurvey.languages?.length > 1 ? "pr-24" : ""
-                          }`}
-                          dir="auto"
-                          key={highlightedJSX.toString()}>
-                          {highlightedJSX}
-                        </div>
-
-                        <Input
-                          key={`${elementId}-${id}-${usedLanguageCode}`}
-                          value={
-                            recallToHeadline(
-                              {
-                                [usedLanguageCode]: value,
-                              },
-                              localSurvey,
-                              false,
-                              usedLanguageCode
-                            )[usedLanguageCode]
-                          }
-                          dir="auto"
-                          onChange={(e) => onChange(e.target.value)}
-                          id={id}
-                          name={id}
-                          placeholder={placeholder ?? getPlaceHolderById(id, t)}
-                          aria-label={label}
-                          maxLength={maxLength}
-                          ref={inputRef}
-                          onBlur={onBlur}
-                          className={`absolute top-0 text-black caret-black ${
-                            localSurvey.languages?.length > 1 ? "pr-24" : ""
-                          } ${className}`}
-                          isInvalid={
-                            isInvalid &&
-                            text[usedLanguageCode]?.trim() === "" &&
-                            localSurvey.languages?.length > 1 &&
-                            isTranslationIncomplete
-                          }
-                          autoComplete={isRecallSelectVisible ? "off" : "on"}
-                          autoFocus={false}
-                          onKeyDown={handleKeyDown}
-                        />
-                        {recallComponents}
-                      </div>
-                    </div>
+            <div className="flex flex-col gap-4 bg-white" ref={animationParent}>
+              <div className="flex w-full items-center gap-x-2">
+                <div className="group relative w-full">
+                  {/* The highlight container is absolutely positioned behind the input */}
+                  <div className="h-10 w-full"></div>
+                  <div
+                    ref={highlightContainerRef}
+                    className="absolute top-0 z-0 mt-0.5 flex h-10 w-full no-scrollbar overflow-scroll px-3 py-2 text-center text-sm whitespace-nowrap text-transparent"
+                    dir="auto"
+                    key={highlightedJSX.toString()}>
+                    {highlightedJSX}
                   </div>
-                );
-              }}
-            />
+
+                  <Input
+                    key={`${elementId}-${id}-${usedLanguageCode}`}
+                    value={
+                      recallToHeadline(
+                        {
+                          [usedLanguageCode]: value,
+                        },
+                        localSurvey,
+                        false,
+                        usedLanguageCode
+                      )[usedLanguageCode]
+                    }
+                    dir="auto"
+                    onChange={(e) => onChange(e.target.value)}
+                    id={id}
+                    name={id}
+                    placeholder={placeholder ?? getPlaceHolderById(id, t)}
+                    aria-label={label}
+                    maxLength={maxLength}
+                    ref={inputRef}
+                    onBlur={onBlur}
+                    className={`absolute top-0 text-black caret-black ${className}`}
+                    isInvalid={
+                      isInvalid &&
+                      text[usedLanguageCode]?.trim() === "" &&
+                      localSurvey.languages?.length > 1 &&
+                      isTranslationIncomplete
+                    }
+                    autoComplete={isRecallSelectVisible ? "off" : "on"}
+                    autoFocus={false}
+                    onKeyDown={handleKeyDown}
+                  />
+                  {recallComponents}
+                </div>
+              </div>
+            </div>
           );
         }}
       />

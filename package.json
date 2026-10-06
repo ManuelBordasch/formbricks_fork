@@ -2,17 +2,11 @@
   "name": "formbricks",
   "version": "0.0.0",
   "private": true,
-  "workspaces": [
-    "apps/*",
-    "packages/*"
-  ],
-  "prisma": {
-    "schema": "packages/database/schema.prisma"
-  },
   "scripts": {
     "agents:update": "npx @next/codemod@canary agents-md --output AGENTS.md",
     "clean:all": "turbo run clean && rimraf node_modules pnpm-lock.yaml .turbo coverage out",
     "clean": "turbo run clean && rimraf node_modules .turbo coverage out",
+    "clean:cache": "rimraf .turbo/cache apps/web/.next",
     "build": "turbo run build",
     "build:dev": "turbo run build:dev",
     "db:migrate:dev": "turbo run db:migrate:dev",
@@ -21,91 +15,65 @@
     "db:push": "turbo run db:push",
     "db:seed": "turbo run db:seed",
     "db:seed:clear": "turbo run db:seed -- -- --clear",
-    "db:up": "docker compose -f docker-compose.dev.yml up -d",
+    "db:up": "pnpm dev:setup && docker compose -f docker-compose.dev.yml up -d",
     "db:down": "docker compose -f docker-compose.dev.yml down",
-    "go": "pnpm db:up && turbo run go --concurrency 20",
+    "authzed:backfill": "dotenv -e .env -v NODE_OPTIONS=--conditions=react-server -v LOG_LEVEL=fatal -- tsx --tsconfig apps/web/tsconfig.json ./apps/web/scripts/authzed-backfill.ts",
+    "authzed:perf": "dotenv -e .env -v NODE_OPTIONS=--conditions=react-server -v LOG_LEVEL=fatal -- tsx --tsconfig apps/web/tsconfig.json ./apps/web/scripts/authzed-perf.ts",
+    "authzed:health": "dotenv -e .env -v NODE_OPTIONS=--conditions=react-server -v LOG_LEVEL=fatal -- tsx --tsconfig apps/web/tsconfig.json ./apps/web/scripts/authzed-health.ts",
+    "authzed:schema": "dotenv -e .env -v NODE_OPTIONS=--conditions=react-server -v LOG_LEVEL=fatal -- tsx --tsconfig apps/web/tsconfig.json ./apps/web/scripts/authzed-schema.ts",
+    "authzed:smoke": "bash docker/authzed-smoke.sh",
+    "authzed:validate": "bash authzed/validate.sh",
+    "authzed:upgrade": "dotenv -e .env -v NODE_OPTIONS=--conditions=react-server -v LOG_LEVEL=fatal -- tsx --tsconfig apps/web/tsconfig.json ./apps/web/scripts/authzed-upgrade.ts",
+    "go": "pnpm db:up && pnpm dev:authzed && turbo run go --concurrency 20",
     "dev": "turbo run dev --parallel",
     "pre-commit": "lint-staged",
     "start": "turbo run start --parallel",
-    "format": "prettier --write \"**/*.{ts,tsx,md}\"",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "generate": "turbo run generate",
-    "lint": "turbo run lint",
+    "catalog:check": "node scripts/check-catalog.mjs",
+    "lint": "turbo run lint && pnpm api:v3:lint && pnpm catalog:check",
+    "typecheck": "turbo run typecheck",
     "test": "turbo run test --no-cache",
     "test:coverage": "turbo run test:coverage --no-cache",
     "test:e2e": "playwright test",
     "test-e2e:azure": "pnpm test:e2e -c playwright.service.config.ts --workers=10",
     "prepare": "husky install",
     "storybook": "turbo run storybook",
-    "fb-migrate-dev": "pnpm --filter @formbricks/database create-migration && pnpm prisma generate",
+    "fb-migrate-dev": "pnpm --filter @formbricks/database create-migration && pnpm --filter @formbricks/database generate",
     "i18n:surveys:generate": "pnpm --filter @formbricks/surveys i18n:generate",
     "i18n:web:generate": "pnpm --filter @formbricks/web i18n:generate",
     "generate-translations": "pnpm i18n:web:generate && pnpm i18n:surveys:generate",
     "scan-translations": "pnpm --filter @formbricks/i18n-utils scan-translations",
     "i18n": "pnpm generate-translations && pnpm scan-translations",
     "i18n:validate": "pnpm scan-translations",
-    "dev:setup": "bash scripts/setup-dev-env.sh"
-  },
-  "dependencies": {
-    "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "api:v3:bundle": "node docs/api-v3-reference/scripts/bundle.mjs",
+    "api:v3:lint": "node docs/api-v3-reference/scripts/bundle.mjs --lint",
+    "api:v3:check": "node docs/api-v3-reference/scripts/bundle.mjs --check",
+    "dev:setup": "bash scripts/setup-dev-env.sh",
+    "dev:authzed": "bash scripts/dev-authzed-up.sh"
   },
   "devDependencies": {
-    "@azure/playwright": "1.1.2",
-    "@formbricks/eslint-config": "workspace:*",
-    "@playwright/test": "1.58.2",
-    "eslint": "8.57.1",
+    "@axe-core/playwright": "4.11.3",
+    "@azure/playwright": "1.1.5",
+    "@formbricks/config-eslint": "workspace:*",
+    "@playwright/test": "catalog:",
+    "@redocly/cli": "1.34.17",
+    "@trivago/prettier-plugin-sort-imports": "catalog:",
+    "dotenv": "catalog:",
+    "eslint": "9.39.5",
     "husky": "9.1.7",
-    "lint-staged": "16.3.3",
-    "rimraf": "6.1.3",
-    "tsx": "4.21.0",
-    "turbo": "2.8.16"
-  },
-  "lint-staged": {
-    "(apps|packages)/**/*.{js,ts,jsx,tsx}": [
-      "prettier --write"
-    ],
-    "*.json": [
-      "prettier --write"
-    ],
-    "packages/database/schema.prisma": [
-      "prisma format"
-    ]
+    "js-yaml": "catalog:",
+    "lint-staged": "16.4.0",
+    "prettier": "catalog:",
+    "prettier-plugin-sort-json": "catalog:",
+    "prettier-plugin-tailwindcss": "catalog:",
+    "rimraf": "catalog:",
+    "tsx": "catalog:",
+    "turbo": "2.9.14"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.19.0 <21 || >=22.12.0 <23 || >=24.0.0 <25"
   },
-  "packageManager": "pnpm@10.32.1",
-  "nextBundleAnalysis": {
-    "budget": 358400,
-    "budgetPercentIncreaseRed": 20,
-    "minimumChangeThreshold": 0,
-    "showDetails": true
-  },
-  "pnpm": {
-    "overrides": {
-      "@hono/node-server": "1.19.10",
-      "@tootallnate/once": "3.0.1",
-      "schema-utils@3.3.0>ajv": "6.14.0",
-      "axios": "1.13.5",
-      "effect": "3.20.0",
-      "flatted": "3.4.2",
-      "hono": "4.12.7",
-      "@microsoft/api-extractor>minimatch": "10.2.4",
-      "node-forge": ">=1.3.2",
-      "qs": "6.14.2",
-      "rollup": "4.59.0",
-      "socket.io-parser": "4.2.6",
-      "tar": ">=7.5.11",
-      "typeorm": ">=0.3.26",
-      "undici": "7.24.0",
-      "fast-xml-parser": "5.5.7",
-      "diff": ">=8.0.3"
-    },
-    "comments": {
-      "overrides": "Security fixes for transitive dependencies. Remove when upstream packages update: @hono/node-server/hono (Dependabot #313/#316/#317) - awaiting Prisma update | @tootallnate/once (Dependabot #305) - awaiting sqlite3/node-gyp chain update | schema-utils@3>ajv (Dependabot #287) - awaiting eslint/file-loader schema-utils update | axios (CVE-2025-58754, CVE-2026-25639) - awaiting @boxyhq/saml-jackson update | effect (Dependabot #339) - awaiting Prisma update | flatted (Dependabot #324/#338) - awaiting eslint/flat-cache update | minimatch (Dependabot #288/#294/#297) - awaiting react-email/glob update | node-forge (Dependabot #230) - awaiting @boxyhq/saml-jackson update | qs (Dependabot #277) - awaiting googleapis/googleapis-common update | rollup (Dependabot #291) - awaiting Vite patch adoption | socket.io-parser (Dependabot #334) - awaiting react-email/socket.io update | tar (CVE-2026-23745/23950/24842/26960) - awaiting @boxyhq/saml-jackson/sqlite3 dependency updates | typeorm (Dependabot #223) - awaiting @boxyhq/saml-jackson update | undici (Dependabot #319/#322/#323) - awaiting jsdom/vitest/isomorphic-dompurify updates | fast-xml-parser (CVE-2026-25896/26278/33036/33349) - awaiting exact upstream pin updates | diff (Dependabot #269) - awaiting upstream patch range adoption"
-    },
-    "patchedDependencies": {
-      "next-auth@4.24.13": "patches/next-auth@4.24.13.patch"
-    }
-  }
+  "packageManager": "pnpm@11.7.0"
 }

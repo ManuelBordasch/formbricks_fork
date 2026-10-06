@@ -1,16 +1,26 @@
 import { Result, err, ok } from "@formbricks/types/error-handlers";
-import { ApiErrorResponse } from "@formbricks/types/errors";
+import { ApiErrorResponse, RESPONSE_ALREADY_FINISHED_ERROR_CODE } from "@formbricks/types/errors";
 import { TQuotaFullResponse } from "@formbricks/types/quota";
 import { TResponseUpdate } from "@formbricks/types/responses";
 import { RECAPTCHA_VERIFICATION_ERROR_CODE } from "@/lib/constants";
 import { TResponseErrorCodesEnum } from "@/types/response-error-codes";
 import { ApiClient } from "./api-client";
+import {
+  type SerializedSurveyState,
+  addPendingResponse,
+  countPendingResponsesStrict,
+  getPendingResponsesStrict,
+  removePendingResponseStrict,
+} from "./offline-storage";
 import { SurveyState } from "./survey-state";
 
 interface QueueConfig {
   appUrl: string;
-  environmentId: string;
+  workspaceId: string;
   retryAttempts: number;
+  persistOffline?: boolean;
+  surveyId?: string;
+  onResponseCreated?: (responseId: string) => void;
   onResponseSendingFailed?: (responseUpdate: TResponseUpdate, errorCode?: TResponseErrorCodesEnum) => void;
   onResponseSendingFinished?: () => void;
   onQuotaFull?: (quotaInfo: TQuotaFullResponse) => void;
@@ -23,25 +33,227 @@ export const delay = (ms: number): Promise<void> => {
   });
 };
 
+// Module-level locks keyed by surveyId.
+// Survive ResponseQueue instance recreation (e.g. React useMemo recomputation)
+// so that only one sync/send runs at a time per survey, even across instances.
+const syncingBySurvey = new Map<string, boolean>();
+const requestInProgressBySurvey = new Map<string, boolean>();
+const processedDbIdsPendingRemovalBySurvey = new Map<string, Set<number>>();
+
+/** @internal Exposed for tests only. */
+export const _syncLocks = {
+  clear: () => {
+    syncingBySurvey.clear();
+    requestInProgressBySurvey.clear();
+    processedDbIdsPendingRemovalBySurvey.clear();
+  },
+  set: (surveyId: string, value: boolean) => syncingBySurvey.set(surveyId, value),
+  get: (surveyId: string) => syncingBySurvey.get(surveyId) ?? false,
+  setRequestInProgress: (surveyId: string, value: boolean) => requestInProgressBySurvey.set(surveyId, value),
+  getRequestInProgress: (surveyId: string) => requestInProgressBySurvey.get(surveyId) ?? false,
+};
+
 export class ResponseQueue {
   readonly queue: TResponseUpdate[] = [];
   readonly config: QueueConfig;
   private surveyState: SurveyState;
-  private isRequestInProgress = false;
   readonly api: ApiClient;
   private responseRecaptchaToken?: string;
+  // Maps queued response objects to their IndexedDB ids for cleanup after successful sends.
+  private readonly pendingDbIds: Map<TResponseUpdate, number> = new Map();
 
   constructor(config: QueueConfig, surveyState: SurveyState) {
     this.config = config;
     this.surveyState = surveyState;
     this.api = new ApiClient({
       appUrl: config.appUrl,
-      environmentId: config.environmentId,
+      workspaceId: config.workspaceId,
     });
+  }
+
+  private get isSyncing(): boolean {
+    return this.config.surveyId ? (syncingBySurvey.get(this.config.surveyId) ?? false) : false;
+  }
+
+  private set isSyncing(value: boolean) {
+    if (this.config.surveyId) {
+      syncingBySurvey.set(this.config.surveyId, value);
+    }
+  }
+
+  private get isRequestInProgress(): boolean {
+    return this.config.surveyId ? (requestInProgressBySurvey.get(this.config.surveyId) ?? false) : false;
+  }
+
+  private set isRequestInProgress(value: boolean) {
+    if (this.config.surveyId) {
+      requestInProgressBySurvey.set(this.config.surveyId, value);
+    }
   }
 
   setResponseRecaptchaToken(token?: string) {
     this.responseRecaptchaToken = token;
+  }
+
+  private serializeSurveyState(): SerializedSurveyState {
+    return {
+      responseId: this.surveyState.responseId,
+      displayId: this.surveyState.displayId,
+      surveyId: this.surveyState.surveyId,
+      singleUseId: this.surveyState.singleUseId,
+      userId: this.surveyState.userId,
+      contactId: this.surveyState.contactId,
+      responseAcc: { ...this.surveyState.responseAcc },
+    };
+  }
+
+  private logOfflinePersistenceError(message: string, error: unknown) {
+    console.error(`Formbricks: ${message}`, {
+      error,
+      surveyId: this.config.surveyId,
+    });
+  }
+
+  private processQueueInBackground(context: string) {
+    void this.processQueue().catch((error) => {
+      this.logOfflinePersistenceError(context, error);
+    });
+  }
+
+  private syncPersistedResponsesInBackground(context: string) {
+    void this.syncPersistedResponses().catch((error) => {
+      this.logOfflinePersistenceError(context, error);
+    });
+  }
+
+  private async countPersistedResponses(): Promise<number> {
+    if (!this.config.surveyId) return 0;
+
+    try {
+      const pendingCount = await countPendingResponsesStrict(this.config.surveyId);
+      return Math.max(0, pendingCount - this.getProcessedDbIdsPendingRemoval().size);
+    } catch (error) {
+      this.logOfflinePersistenceError("Failed to count pending responses in IndexedDB", error);
+      throw error;
+    }
+  }
+
+  private getProcessedDbIdsPendingRemoval(): Set<number> {
+    if (!this.config.surveyId) return new Set();
+
+    const existingIds = processedDbIdsPendingRemovalBySurvey.get(this.config.surveyId);
+    if (existingIds) return existingIds;
+
+    const ids = new Set<number>();
+    processedDbIdsPendingRemovalBySurvey.set(this.config.surveyId, ids);
+    return ids;
+  }
+
+  private removePendingDbId(dbId: number) {
+    for (const [responseUpdate, pendingDbId] of this.pendingDbIds.entries()) {
+      if (pendingDbId === dbId) {
+        this.pendingDbIds.delete(responseUpdate);
+        return;
+      }
+    }
+  }
+
+  private async removePendingResponseFromIndexedDB(
+    dbId: number,
+    context: string,
+    options: { removeTrackedDbIdOnSuccess?: boolean } = {}
+  ): Promise<boolean> {
+    try {
+      await removePendingResponseStrict(dbId);
+      this.getProcessedDbIdsPendingRemoval().delete(dbId);
+      if (options.removeTrackedDbIdOnSuccess ?? true) {
+        this.removePendingDbId(dbId);
+      }
+      return true;
+    } catch (error) {
+      this.getProcessedDbIdsPendingRemoval().add(dbId);
+      this.logOfflinePersistenceError(context, error);
+      return false;
+    }
+  }
+
+  private async retryProcessedDbIdCleanup() {
+    for (const dbId of Array.from(this.getProcessedDbIdsPendingRemoval())) {
+      await this.removePendingResponseFromIndexedDB(
+        dbId,
+        "Failed to remove processed response from IndexedDB"
+      );
+    }
+  }
+
+  private removeProcessedQueueItemsByDbId(processedDbIds: Set<number>) {
+    if (processedDbIds.size === 0) return;
+
+    for (let index = this.queue.length - 1; index >= 0; index--) {
+      const item = this.queue[index];
+      const pendingDbId = this.pendingDbIds.get(item);
+
+      if (pendingDbId !== undefined && processedDbIds.has(pendingDbId)) {
+        this.queue.splice(index, 1);
+      }
+    }
+
+    for (const [item, pendingDbId] of this.pendingDbIds.entries()) {
+      if (processedDbIds.has(pendingDbId)) {
+        this.pendingDbIds.delete(item);
+      }
+    }
+  }
+
+  /**
+   * 4xx client errors are permanent: the server is reachable and is rejecting the request.
+   * Re-sending the identical payload will keep failing, so these must not be retried
+   * (neither automatic backoff nor manual Retry) and the item must be dropped from the queue.
+   *
+   * Excluded (kept for retry) — the semantically transient/recoverable 4xx codes:
+   *   401 (auth may recover after a token refresh),
+   *   404 (the offline sync path treats it as "create never reached the server" and retries
+   *        as a fresh createResponse),
+   *   408 (Request Timeout) and 425 (Too Early) — explicitly retryable,
+   *   429 (rate limited — transient).
+   */
+  private static readonly RETRYABLE_CLIENT_ERROR_STATUSES = new Set([401, 404, 408, 425, 429]);
+
+  private isTerminalClientError(error?: ApiErrorResponse): boolean {
+    if (!error) return false;
+    return (
+      error.status >= 400 &&
+      error.status < 500 &&
+      !ResponseQueue.RETRYABLE_CLIENT_ERROR_STATUSES.has(error.status)
+    );
+  }
+
+  /**
+   * The response can no longer be updated because it was already finalized out-of-band
+   * (e.g. a second tab / email link scanner finished the same single-use response).
+   *
+   * Primary signal is the stable, locale-independent marker the server sets in details.code.
+   * The 409 status and the legacy English-message check are kept as fallbacks so detection
+   * still works against older servers that predate the marker.
+   */
+  private isResponseAlreadyCompletedError(error?: ApiErrorResponse): boolean {
+    if (!error) return false;
+    return (
+      error.details?.code === RESPONSE_ALREADY_FINISHED_ERROR_CODE ||
+      error.status === 409 ||
+      (error.status === 400 &&
+        typeof error.message === "string" &&
+        error.message.includes("already finished"))
+    );
+  }
+
+  private getTerminalClientErrorCode(error?: ApiErrorResponse): TResponseErrorCodesEnum {
+    // Terminal 4xx items are dropped from the queue, so a manual Retry is pointless — return a
+    // non-retryable code (never ResponseSendingError, which renders the retryable "servers
+    // cannot be reached" UI).
+    return this.isResponseAlreadyCompletedError(error)
+      ? TResponseErrorCodesEnum.ResponseAlreadyCompleted
+      : TResponseErrorCodesEnum.ResponseSendingErrorPermanent;
   }
 
   add(responseUpdate: TResponseUpdate) {
@@ -52,7 +264,29 @@ export class ResponseQueue {
     }
     // add response to queue
     this.queue.push(responseUpdate);
-    this.processQueue();
+
+    // persist to IndexedDB if offline persistence is enabled,
+    // then start processing only after the DB write completes
+    if (this.config.persistOffline && this.config.surveyId) {
+      void addPendingResponse({
+        surveyId: this.config.surveyId,
+        responseUpdate,
+        surveyStateSnapshot: this.serializeSurveyState(),
+        createdAt: Date.now(),
+      })
+        .then((dbId) => {
+          if (dbId > 0) {
+            this.pendingDbIds.set(responseUpdate, dbId);
+          }
+          this.processQueueInBackground("Failed to process queue after persisting response");
+        })
+        .catch((error) => {
+          this.logOfflinePersistenceError("Failed to persist pending response to IndexedDB", error);
+          this.processQueueInBackground("Failed to process queue after IndexedDB persistence failure");
+        });
+    } else {
+      this.processQueueInBackground("Failed to process queue after adding response");
+    }
   }
 
   async processQueue(): Promise<{ success: boolean }> {
@@ -60,17 +294,204 @@ export class ResponseQueue {
       return { success: false };
     }
 
-    this.isRequestInProgress = true;
-    const responseUpdate = this.queue[0];
+    // If offline and persistence is enabled, don't attempt to send — data is safe in IndexedDB.
+    if (this.config.persistOffline && typeof navigator !== "undefined" && !navigator.onLine) {
+      return { success: false };
+    }
 
+    // Don't send while syncPersistedResponses is draining IndexedDB — it handles everything.
+    if (this.isSyncing) {
+      return { success: false };
+    }
+
+    // When offline support is active and there are multiple pending entries in
+    // IndexedDB, defer to syncPersistedResponses which drains them in order.
+    // This prevents processQueue and syncPersistedResponses from racing to
+    // create the same response concurrently (duplicate POSTs).
+    if (this.config.persistOffline && this.config.surveyId) {
+      let pendingCount: number;
+      try {
+        await this.retryProcessedDbIdCleanup();
+        pendingCount = await this.countPersistedResponses();
+      } catch {
+        return { success: false };
+      }
+
+      // Re-check after await — another processQueue/sync may have started during the yield
+      if (this.isSyncing || this.isRequestInProgress || this.queue.length === 0) {
+        return { success: false };
+      }
+
+      if (pendingCount > 1) {
+        this.syncPersistedResponsesInBackground("Failed to sync persisted responses in background");
+        return { success: false };
+      }
+    }
+
+    const responseUpdate = this.queue[0];
+    this.isRequestInProgress = true;
     const result = await this.sendResponseWithRetry(responseUpdate);
 
     if (result.success) {
+      // Remove from IndexedDB on successful send
+      const dbId = this.pendingDbIds.get(responseUpdate);
+      if (dbId !== undefined) {
+        await this.removePendingResponseFromIndexedDB(dbId, "Failed to remove sent response from IndexedDB");
+      }
+
       this.handleSuccessfulResponse(responseUpdate, result.quotaFullResponse);
       return { success: true };
     } else {
-      this.handleFailedResponse(responseUpdate, result.isRecaptchaError);
+      // If offline persistence is enabled and we're now offline, don't treat it as a failure
+      if (this.config.persistOffline && typeof navigator !== "undefined" && !navigator.onLine) {
+        this.isRequestInProgress = false;
+        return { success: false };
+      }
+
+      // Permanent 4xx rejection: drop the dead item so the manual Retry button can't
+      // re-send the identical payload forever.
+      if (result.isTerminalClientError) {
+        this.queue.shift();
+        const dbId = this.pendingDbIds.get(responseUpdate);
+        if (dbId !== undefined) {
+          await this.removePendingResponseFromIndexedDB(
+            dbId,
+            "Failed to remove rejected response from IndexedDB"
+          );
+        }
+      }
+
+      this.handleFailedResponse(responseUpdate, result.isRecaptchaError, result.errorCode);
       return { success: false };
+    }
+  }
+
+  /**
+   * Returns the count of persisted pending responses without loading full data.
+   * Does NOT populate the in-memory queue — syncPersistedResponses reads directly from IndexedDB.
+   */
+  async loadPersistedQueue(): Promise<number> {
+    return this.getPendingCount();
+  }
+
+  async getPendingCount(): Promise<number> {
+    if (!this.config.persistOffline || !this.config.surveyId) return 0;
+    try {
+      await this.retryProcessedDbIdCleanup();
+      return await this.countPersistedResponses();
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Drains all persisted pending responses by sending them to the server in order.
+   * Reads directly from IndexedDB to avoid object-identity issues with the in-memory queue.
+   *
+   * responseId propagation: If a snapshot has responseId=null, the first sendResponse call
+   * will create a new response and set surveyState.responseId. Subsequent entries with
+   * null responseId in their snapshot will correctly use the now-set responseId because
+   * we only restore from snapshot when it has a non-null value.
+   */
+  async syncPersistedResponses(
+    onProgress?: (synced: number, total: number) => void
+  ): Promise<{ success: boolean; syncedCount: number }> {
+    if (!this.config.persistOffline || !this.config.surveyId) {
+      return { success: true, syncedCount: 0 };
+    }
+
+    // Concurrency guard: prevent duplicate syncs from online/offline flicker
+    if (this.isSyncing) return { success: false, syncedCount: 0 };
+
+    // If processQueue already has a request in flight, don't start syncing —
+    // let it finish first to avoid both paths creating the same response.
+    if (this.isRequestInProgress) return { success: false, syncedCount: 0 };
+
+    this.isSyncing = true;
+    let syncedCount = 0;
+
+    try {
+      await this.retryProcessedDbIdCleanup();
+      const entries = await getPendingResponsesStrict(this.config.surveyId);
+      const entriesToSync = entries.filter((entry) => {
+        return entry.id === undefined || !this.getProcessedDbIdsPendingRemoval().has(entry.id);
+      });
+      if (entriesToSync.length === 0) return { success: true, syncedCount: 0 };
+
+      const processedDbIds = new Set<number>();
+
+      for (const entry of entriesToSync) {
+        // Only restore responseId from snapshot when it was set at capture time.
+        // Otherwise, let the responseId from the previous sendResponse carry forward
+        // (i.e., a create response in the previous iteration sets the responseId for updates).
+        if (entry.surveyStateSnapshot.responseId) {
+          this.surveyState.updateResponseId(entry.surveyStateSnapshot.responseId);
+        }
+
+        let result = await this.sendResponse(entry.responseUpdate);
+
+        // If updateResponse returned 404, the original createResponse likely never reached
+        // the server. Reset responseId and retry as a fresh createResponse.
+        if (!result.ok && result.error?.status === 404 && this.surveyState.responseId !== null) {
+          this.surveyState.responseId = null;
+          if (entry.surveyStateSnapshot.displayId) {
+            this.surveyState.updateDisplayId(entry.surveyStateSnapshot.displayId);
+          }
+          result = await this.sendResponse(entry.responseUpdate);
+        }
+
+        if (result.ok) {
+          if (entry.id !== undefined) {
+            const removed = await this.removePendingResponseFromIndexedDB(
+              entry.id,
+              "Failed to remove synced response from IndexedDB",
+              { removeTrackedDbIdOnSuccess: false }
+            );
+            processedDbIds.add(entry.id);
+            if (!removed) {
+              this.removeProcessedQueueItemsByDbId(processedDbIds);
+              return { success: false, syncedCount };
+            }
+          }
+        } else {
+          if (entry.id !== undefined && result.error && this.isTerminalClientError(result.error)) {
+            // Permanent 4xx client error (e.g., 400 "already finished" or 409 stale) —
+            // this entry can never be accepted, remove it and continue with the next one.
+            const removed = await this.removePendingResponseFromIndexedDB(
+              entry.id,
+              "Failed to remove stale response from IndexedDB",
+              { removeTrackedDbIdOnSuccess: false }
+            );
+            processedDbIds.add(entry.id);
+            if (!removed) {
+              this.removeProcessedQueueItemsByDbId(processedDbIds);
+              return { success: false, syncedCount };
+            }
+            continue;
+          }
+
+          // Server/network error — stop syncing, remaining entries stay for next attempt
+          this.removeProcessedQueueItemsByDbId(processedDbIds);
+          return { success: false, syncedCount };
+        }
+
+        syncedCount++;
+        onProgress?.(syncedCount, entriesToSync.length);
+      }
+
+      this.removeProcessedQueueItemsByDbId(processedDbIds);
+
+      // Kick off processQueue for any entries added during sync
+      if (this.queue.length > 0) {
+        this.processQueueInBackground("Failed to process queue after persisted response sync");
+      }
+
+      return { success: true, syncedCount };
+    } catch (error) {
+      this.logOfflinePersistenceError("Failed to sync persisted responses from IndexedDB", error);
+      return { success: false, syncedCount };
+    } finally {
+      this.isSyncing = false;
     }
   }
 
@@ -78,6 +499,8 @@ export class ResponseQueue {
     success: boolean;
     quotaFullResponse?: TQuotaFullResponse;
     isRecaptchaError?: boolean;
+    isTerminalClientError?: boolean;
+    errorCode?: TResponseErrorCodesEnum;
   }> {
     let attempts = 0;
     let quotaFullResponse: TQuotaFullResponse | null = null;
@@ -105,6 +528,21 @@ export class ResponseQueue {
           responseId: this.surveyState.responseId,
         });
         return { success: false, isRecaptchaError: true };
+      }
+
+      // Permanent 4xx rejection — don't retry (backoff or manual Retry would just loop on the
+      // same rejection). Signal the caller to drop the item from the queue.
+      if (this.isTerminalClientError(res.error)) {
+        console.error("Formbricks: Response rejected permanently, dropping from queue", {
+          error: res.error,
+          responseId: this.surveyState.responseId,
+          queueLength: this.queue.length,
+        });
+        return {
+          success: false,
+          isTerminalClientError: true,
+          errorCode: this.getTerminalClientErrorCode(res.error),
+        };
       }
 
       console.error(`Formbricks: Response send failed`, {
@@ -138,6 +576,37 @@ export class ResponseQueue {
     return error.details?.code === RECAPTCHA_VERIFICATION_ERROR_CODE;
   }
 
+  private getCreatePayload(
+    responseUpdate: TResponseUpdate
+  ): Omit<
+    Parameters<ApiClient["createResponse"]>[0],
+    "contactId" | "userId" | "singleUseId" | "surveyId" | "displayId" | "recaptchaToken"
+  > {
+    if (!this.surveyState.shouldCreateResponseFromState) {
+      return {
+        finished: responseUpdate.finished,
+        data: { ...responseUpdate.data, ...responseUpdate.hiddenFields },
+        ttc: responseUpdate.ttc,
+        variables: responseUpdate.variables,
+        language: responseUpdate.language,
+        meta: responseUpdate.meta,
+        endingId: responseUpdate.endingId,
+      };
+    }
+
+    const accumulatedResponse = this.surveyState.responseAcc;
+
+    return {
+      finished: accumulatedResponse.finished,
+      data: { ...accumulatedResponse.data, ...responseUpdate.hiddenFields },
+      ttc: accumulatedResponse.ttc,
+      variables: accumulatedResponse.variables,
+      language: accumulatedResponse.language ?? responseUpdate.language,
+      meta: accumulatedResponse.meta ?? responseUpdate.meta,
+      endingId: accumulatedResponse.endingId ?? responseUpdate.endingId,
+    };
+  }
+
   private handleSuccessfulResponse(responseUpdate: TResponseUpdate, quotaFullResponse?: TQuotaFullResponse) {
     if (responseUpdate.finished) {
       this.config.onResponseSendingFinished?.();
@@ -149,10 +618,14 @@ export class ResponseQueue {
       this.config.onQuotaFull?.(quotaFullResponse);
     }
 
-    this.processQueue(); // process the next item in the queue if any
+    this.processQueueInBackground("Failed to process next queued response");
   }
 
-  private handleFailedResponse(responseUpdate: TResponseUpdate, isRecaptchaError?: boolean) {
+  private handleFailedResponse(
+    responseUpdate: TResponseUpdate,
+    isRecaptchaError?: boolean,
+    errorCode?: TResponseErrorCodesEnum
+  ) {
     this.isRequestInProgress = false;
 
     if (isRecaptchaError) {
@@ -160,7 +633,10 @@ export class ResponseQueue {
       return;
     }
 
-    this.config.onResponseSendingFailed?.(responseUpdate, TResponseErrorCodesEnum.ResponseSendingError);
+    this.config.onResponseSendingFailed?.(
+      responseUpdate,
+      errorCode ?? TResponseErrorCodesEnum.ResponseSendingError
+    );
   }
 
   async sendResponse(
@@ -172,20 +648,22 @@ export class ResponseQueue {
         response = await this.api.updateResponse({
           ...responseUpdate,
           responseId: this.surveyState.responseId,
+          pinAuthToken: this.surveyState.pinAuthToken || null,
         });
 
         if (!response.ok) {
           return err(response.error);
         }
       } else {
+        const createPayload = this.getCreatePayload(responseUpdate);
         response = await this.api.createResponse({
-          ...responseUpdate,
+          ...createPayload,
           surveyId: this.surveyState.surveyId,
           contactId: this.surveyState.contactId || null,
           userId: this.surveyState.userId || null,
           singleUseId: this.surveyState.singleUseId || null,
-          data: { ...responseUpdate.data, ...responseUpdate.hiddenFields },
           displayId: this.surveyState.displayId,
+          pinAuthToken: this.surveyState.pinAuthToken || null,
           recaptchaToken: this.responseRecaptchaToken ?? undefined,
         });
 
@@ -194,6 +672,8 @@ export class ResponseQueue {
         }
 
         this.surveyState.updateResponseId(response.data.id);
+        this.surveyState.disableBootstrapResponseCreate();
+        this.config.onResponseCreated?.(response.data.id);
         if (this.config.setSurveyState) {
           this.config.setSurveyState(this.surveyState);
         }

@@ -1,7 +1,9 @@
 import { render } from "@react-email/render";
+import { DeleteAccountEmail } from "../../emails/auth/delete-account-email";
 import { ForgotPasswordEmail } from "../../emails/auth/forgot-password-email";
 import { NewEmailVerification } from "../../emails/auth/new-email-verification";
 import { PasswordResetNotifyEmail } from "../../emails/auth/password-reset-notify-email";
+import { SsoRecoveryFactorsRemovedEmail } from "../../emails/auth/sso-recovery-factors-removed-email";
 import { VerificationEmail } from "../../emails/auth/verification-email";
 import { EmailCustomizationPreviewEmail } from "../../emails/general/email-customization-preview-email";
 import { InviteAcceptedEmail } from "../../emails/invite/invite-accepted-email";
@@ -36,6 +38,16 @@ export async function renderForgotPasswordEmail(
   return await render(ForgotPasswordEmail(props));
 }
 
+export async function renderAccountDeletionEmail(
+  props: {
+    deleteLink: string;
+    linkValidityInMinutes: number;
+    t: TFunction;
+  } & TEmailTemplateLegalProps
+): Promise<string> {
+  return await render(DeleteAccountEmail(props));
+}
+
 export async function renderNewEmailVerification(
   props: {
     verifyLink: string;
@@ -49,6 +61,17 @@ export async function renderPasswordResetNotifyEmail(
   props: { t: TFunction } & TEmailTemplateLegalProps
 ): Promise<string> {
   return await render(PasswordResetNotifyEmail(props));
+}
+
+export async function renderSsoRecoveryFactorsRemovedEmail(
+  props: {
+    passwordRemoved: boolean;
+    twoFactorRemoved: boolean;
+    securitySettingsLink: string;
+    t: TFunction;
+  } & TEmailTemplateLegalProps
+): Promise<string> {
+  return await render(SsoRecoveryFactorsRemovedEmail(props));
 }
 
 export async function renderInviteEmail(
@@ -86,7 +109,7 @@ export async function renderLinkSurveyEmail(
 export async function renderEmbedSurveyPreviewEmail(
   props: {
     html: string;
-    environmentId: string;
+    workspaceId: string;
     logoUrl?: string;
     t: TFunction;
   } & TEmailTemplateLegalProps

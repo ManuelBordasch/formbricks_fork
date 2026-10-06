@@ -1,68 +1,48 @@
-import { Prisma } from "@prisma/client";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { DatabaseError } from "@formbricks/types/errors";
-import { deleteSessionsByUserId } from "./auth-session-repository";
+import { getSessionTokensByUserId } from "./auth-session-repository";
 
 vi.mock("@formbricks/database", () => ({
   prisma: {
     session: {
-      deleteMany: vi.fn(),
+      findMany: vi.fn(),
     },
   },
 }));
 
 describe("auth-session-repository", () => {
-  const userId = "cm8z6bn2q000008l34h8g7k9m";
-
   afterEach(() => {
     vi.clearAllMocks();
   });
 
-  test("deletes all sessions for the target user", async () => {
-    vi.mocked(prisma.session.deleteMany).mockResolvedValue({ count: 2 });
+  test("lists a user's unexpired session tokens", async () => {
+    vi.mocked(prisma.session.findMany).mockResolvedValue([
+      { sessionToken: "token-a" },
+      { sessionToken: "token-b" },
+    ] as never);
 
-    const result = await deleteSessionsByUserId(userId);
-
-    expect(result).toBe(2);
-    expect(prisma.session.deleteMany).toHaveBeenCalledWith({
-      where: { userId },
+    await expect(getSessionTokensByUserId("user_1")).resolves.toEqual(["token-a", "token-b"]);
+    // Expired rows are excluded on purpose: the count feeds the SSO-recovery audit event, where it is
+    // read as "how many sessions the squatter was holding".
+    expect(prisma.session.findMany).toHaveBeenCalledWith({
+      where: { userId: "user_1", expires: { gt: expect.any(Date) } },
+      select: { sessionToken: true },
     });
   });
 
-  test("returns zero when the user has no sessions", async () => {
-    vi.mocked(prisma.session.deleteMany).mockResolvedValue({ count: 0 });
+  test("returns an empty list for a user with no sessions", async () => {
+    vi.mocked(prisma.session.findMany).mockResolvedValue([] as never);
 
-    const result = await deleteSessionsByUserId(userId);
-
-    expect(result).toBe(0);
-  });
-
-  test("uses the provided transaction client when available", async () => {
-    const txDeleteMany = vi.fn().mockResolvedValue({ count: 3 });
-    const tx = {
-      session: {
-        deleteMany: txDeleteMany,
-      },
-    } as unknown as Prisma.TransactionClient;
-
-    const result = await deleteSessionsByUserId(userId, tx);
-
-    expect(result).toBe(3);
-    expect(txDeleteMany).toHaveBeenCalledWith({
-      where: { userId },
-    });
-    expect(prisma.session.deleteMany).not.toHaveBeenCalled();
+    await expect(getSessionTokensByUserId("user_1")).resolves.toEqual([]);
   });
 
   test("wraps prisma known errors in DatabaseError", async () => {
-    vi.mocked(prisma.session.deleteMany).mockRejectedValue(
-      new Prisma.PrismaClientKnownRequestError("database failed", {
-        code: "P2021",
-        clientVersion: "test",
-      })
+    vi.mocked(prisma.session.findMany).mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError("boom", { code: "P2024", clientVersion: "7.x" })
     );
 
-    await expect(deleteSessionsByUserId(userId)).rejects.toThrow(DatabaseError);
+    await expect(getSessionTokensByUserId("user_1")).rejects.toThrow(DatabaseError);
   });
 });

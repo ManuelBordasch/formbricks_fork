@@ -1,9 +1,10 @@
 import "server-only";
-import { Prisma } from "@prisma/client";
 import { cache as reactCache } from "react";
 import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
 import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
 import { TSurvey } from "@formbricks/types/surveys/types";
+import { selectSurveyEmbeddedDataLinks } from "@/lib/embedded-data/survey-fields";
 import { getOrganizationBillingWithReadThroughSync } from "@/modules/ee/billing/lib/organization-billing";
 import { transformPrismaSurvey } from "@/modules/survey/lib/utils";
 
@@ -22,9 +23,10 @@ export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
         updatedAt: true,
         name: true,
         type: true,
-        environmentId: true,
+        workspaceId: true,
         createdBy: true,
         status: true,
+        archivedAt: true,
 
         // Survey configuration
         welcomeCard: true,
@@ -43,17 +45,18 @@ export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
 
         // Authentication & access
         isVerifyEmailEnabled: true,
-        isSingleResponsePerEmailEnabled: true,
         redirectUrl: true,
         pin: true,
         isBackButtonHidden: true,
+        isAutoProgressingEnabled: true,
         isCaptureIpEnabled: true,
+        isAnonymizeResponsesEnabled: true,
 
         // Single use configuration
         singleUse: true,
 
         // Styling & branding
-        projectOverwrites: true,
+        workspaceOverwrites: true,
         styling: true,
         surveyClosedMessage: true,
         showLanguageSwitch: true,
@@ -75,7 +78,7 @@ export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
                 createdAt: true,
                 updatedAt: true,
                 code: true,
-                projectId: true,
+                workspaceId: true,
                 alias: true,
               },
             },
@@ -88,7 +91,7 @@ export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
                 id: true,
                 createdAt: true,
                 updatedAt: true,
-                environmentId: true,
+                workspaceId: true,
                 name: true,
                 description: true,
                 type: true,
@@ -103,7 +106,7 @@ export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
             id: true,
             createdAt: true,
             updatedAt: true,
-            environmentId: true,
+            workspaceId: true,
             title: true,
             description: true,
             isPrivate: true,
@@ -116,6 +119,9 @@ export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
           },
         },
         followUps: true,
+
+        // ENG-1837: the definitions the renderer's recall and logic engines resolve through.
+        embeddedDataLinks: selectSurveyEmbeddedDataLinks,
       },
     });
 
@@ -123,7 +129,20 @@ export const getSurveyWithMetadata = reactCache(async (surveyId: string) => {
       throw new ResourceNotFoundError("Survey", surveyId);
     }
 
-    return transformPrismaSurvey<TSurvey>(survey);
+    const transformedSurvey = transformPrismaSurvey<TSurvey>(survey);
+
+    // This survey object is handed to a client component on the *public* link-survey page, so every
+    // field in it ends up in the page payload for anonymous visitors. Follow-up configuration carries
+    // internal recipient addresses, subjects and email bodies, and segment filters carry targeting
+    // rules built from contact attributes — none of which the survey renderer reads. They are selected
+    // above only because `TSurvey` requires the keys, so blank them out before they leave the server.
+    return {
+      ...transformedSurvey,
+      followUps: [],
+      ...(transformedSurvey.segment
+        ? { segment: { ...transformedSurvey.segment, filters: [], description: null } }
+        : {}),
+    };
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
       throw new DatabaseError(error.message);
@@ -144,7 +163,7 @@ export const getSurveyMetadata = async (surveyId: string) => {
     id: fullSurvey.id,
     type: fullSurvey.type,
     status: fullSurvey.status,
-    environmentId: fullSurvey.environmentId,
+    workspaceId: fullSurvey.workspaceId,
     name: fullSurvey.name,
     styling: fullSurvey.styling,
   };
@@ -171,32 +190,6 @@ export const getResponseBySingleUseId = reactCache((surveyId: string, singleUseI
     });
 
     return response;
-  } catch (error) {
-    if (error instanceof Prisma.PrismaClientKnownRequestError) {
-      throw new DatabaseError(error.message);
-    }
-    throw error;
-  }
-});
-
-/**
- * Check if email verification response exists
- * NO CACHING - response data changes frequently and needs to be fresh
- */
-export const isSurveyResponsePresent = reactCache((surveyId: string, email: string) => async () => {
-  try {
-    const response = await prisma.response.findFirst({
-      where: {
-        surveyId,
-        data: {
-          path: ["verifiedEmail"],
-          equals: email,
-        },
-      },
-      select: { id: true },
-    });
-
-    return !!response;
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
       throw new DatabaseError(error.message);

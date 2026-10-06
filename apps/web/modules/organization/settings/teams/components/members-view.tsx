@@ -1,10 +1,10 @@
 import { Suspense } from "react";
 import { TOrganizationRole } from "@formbricks/types/memberships";
 import { TOrganization } from "@formbricks/types/organizations";
-import { SettingsCard } from "@/app/(app)/environments/[environmentId]/settings/components/SettingsCard";
-import { INVITE_DISABLED, IS_FORMBRICKS_CLOUD, IS_STORAGE_CONFIGURED } from "@/lib/constants";
+import { SettingsCard } from "@/app/(app)/workspaces/[workspaceId]/settings/components/SettingsCard";
+import { ENTERPRISE_LICENSE_REQUEST_FORM_URL, INVITE_DISABLED, IS_FORMBRICKS_CLOUD } from "@/lib/constants";
 import { getTranslate } from "@/lingodotdev/server";
-import { getIsMultiOrgEnabled } from "@/modules/ee/license-check/lib/utils";
+import { getBulkInvitePermission, getIsMultiOrgEnabled } from "@/modules/ee/license-check/lib/utils";
 import { getTeamsWhereUserIsAdmin } from "@/modules/ee/teams/lib/roles";
 import { getTeamsByOrganizationId } from "@/modules/ee/teams/team-list/lib/team";
 import { TOrganizationTeam } from "@/modules/ee/teams/team-list/types/team";
@@ -16,13 +16,13 @@ interface MembersViewProps {
   membershipRole?: TOrganizationRole;
   organization: TOrganization;
   currentUserId: string;
-  environmentId: string;
   isAccessControlAllowed: boolean;
   isUserManagementDisabledFromUi: boolean;
 }
 
+// Carries its own gutter for the same reason the controls above do: the card body is flush.
 export const MembersLoading = () => (
-  <div className="px-2">
+  <div className="px-4">
     {Array.from(Array(2)).map((_, index) => (
       <div key={index} className="mt-4">
         <div className={`h-8 w-80 animate-pulse rounded-full bg-slate-200`} />
@@ -35,7 +35,6 @@ export const MembersView = async ({
   membershipRole,
   organization,
   currentUserId,
-  environmentId,
   isAccessControlAllowed,
   isUserManagementDisabledFromUi,
 }: MembersViewProps) => {
@@ -45,6 +44,7 @@ export const MembersView = async ({
   const isLeaveOrganizationDisabled = userMemberships.length <= 1;
 
   const isMultiOrgEnabled = await getIsMultiOrgEnabled();
+  const isBulkInviteAllowed = await getBulkInvitePermission(organization.id);
 
   // Fetch admin teams if they're a team admin
   const userAdminTeamIds = await getTeamsWhereUserIsAdmin(currentUserId, organization.id);
@@ -58,25 +58,29 @@ export const MembersView = async ({
 
   return (
     <SettingsCard
-      title={t("environments.settings.general.manage_members")}
-      description={t("environments.settings.general.manage_members_description")}>
+      title={t("workspace.settings.general.manage_members")}
+      description={t("workspace.settings.general.manage_members_description")}
+      bodyVariant="flush">
+      {/* The table is edge-to-edge, so the controls above it carry the card's gutter themselves. */}
       {membershipRole && (
-        <OrganizationActions
-          organization={organization}
-          membershipRole={membershipRole}
-          role={membershipRole}
-          isLeaveOrganizationDisabled={isLeaveOrganizationDisabled}
-          isInviteDisabled={INVITE_DISABLED}
-          isAccessControlAllowed={isAccessControlAllowed}
-          isFormbricksCloud={IS_FORMBRICKS_CLOUD}
-          isStorageConfigured={IS_STORAGE_CONFIGURED}
-          environmentId={environmentId}
-          isMultiOrgEnabled={isMultiOrgEnabled}
-          teams={teams}
-          isUserManagementDisabledFromUi={isUserManagementDisabledFromUi}
-          isTeamAdmin={isTeamAdminUser}
-          userAdminTeamIds={userAdminTeamIds}
-        />
+        <div className="px-4 pt-4">
+          <OrganizationActions
+            organization={organization}
+            membershipRole={membershipRole}
+            role={membershipRole}
+            isLeaveOrganizationDisabled={isLeaveOrganizationDisabled}
+            isInviteDisabled={INVITE_DISABLED}
+            isAccessControlAllowed={isAccessControlAllowed}
+            isFormbricksCloud={IS_FORMBRICKS_CLOUD}
+            enterpriseLicenseRequestFormUrl={ENTERPRISE_LICENSE_REQUEST_FORM_URL}
+            isMultiOrgEnabled={isMultiOrgEnabled}
+            teams={teams}
+            isUserManagementDisabledFromUi={isUserManagementDisabledFromUi}
+            isTeamAdmin={isTeamAdminUser}
+            userAdminTeamIds={userAdminTeamIds}
+            isBulkInviteAllowed={isBulkInviteAllowed}
+          />
+        </div>
       )}
 
       {membershipRole && (

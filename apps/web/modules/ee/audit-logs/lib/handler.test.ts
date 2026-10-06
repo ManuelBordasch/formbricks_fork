@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { getClientIpFromHeaders } from "@/lib/utils/client-ip";
 import { TActor, TAuditAction, TAuditStatus, TAuditTarget } from "../types/audit-log";
 // Import original module to access its original exports for the mock factory
 import * as OriginalHandler from "./handler";
@@ -88,7 +89,9 @@ const baseEventParams = {
   status: "success" as TAuditStatus,
   oldObject: { foo: "bar" },
   newObject: { foo: "baz" },
-  apiUrl: "/api/test",
+  // Absolute: the schema validates apiUrl with z.url(). This file mocks the service out, so a bare
+  // path would pass here while being dropped in production (see service.test.ts).
+  apiUrl: "http://localhost:3000/api/test",
 };
 
 const fullUser = {
@@ -131,6 +134,7 @@ const mockCtxBase = {
 function clearAllMockHandles() {
   if (serviceLogAuditEventMockHandle) serviceLogAuditEventMockHandle.mockClear().mockResolvedValue(undefined);
   if (loggerErrorMockHandle) loggerErrorMockHandle.mockClear();
+  vi.mocked(getClientIpFromHeaders).mockClear();
   if (mutableConstants) {
     // Check because it's a var and could be re-assigned (though not in this code)
     mutableConstants.AUDIT_LOG_ENABLED = true;
@@ -186,6 +190,29 @@ describe("queueAuditEventBackground", () => {
   });
 });
 
+describe("queueAuditEventWithoutRequest", () => {
+  beforeEach(() => {
+    clearAllMockHandles();
+  });
+  afterEach(() => {
+    vi.resetModules();
+  });
+
+  test("logs audit events without reading request headers", async () => {
+    await OriginalHandler.queueAuditEventWithoutRequest({
+      ...baseEventParams,
+      ipAddress: "worker-ip",
+    });
+
+    expect(serviceLogAuditEventMockHandle).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ipAddress: "worker-ip",
+      })
+    );
+    expect(vi.mocked(getClientIpFromHeaders)).not.toHaveBeenCalled();
+  });
+});
+
 describe("withAuditLogging", () => {
   beforeEach(() => {
     clearAllMockHandles();
@@ -222,6 +249,43 @@ describe("withAuditLogging", () => {
     expect(callArgs.target.id).toBe("t1");
   });
 
+  // ENG-2091: `action` is fixed when the wrapper is applied, so a handler whose success does NOT mean
+  // the audited thing happened (a duplicate sign-up answering identically to a real one) would otherwise
+  // record a false `created`.
+  test("skips the event when a successful handler sets suppressEvent", async () => {
+    const suppressedCtx = {
+      ...mockCtxBase,
+      auditLoggingCtx: { ...mockCtxBase.auditLoggingCtx, suppressEvent: true },
+    };
+    const handlerImpl = vi.fn().mockResolvedValue("ok");
+    const wrapped = OriginalHandler.withAuditLogging("created", "user", handlerImpl);
+
+    const result = await wrapped({ ctx: suppressedCtx as any, parsedInput: mockParsedInput });
+    await new Promise(setImmediate);
+
+    expect(result).toBe("ok"); // the response is unchanged — only the record is
+    expect(handlerImpl).toHaveBeenCalled();
+    expect(serviceLogAuditEventMockHandle).not.toHaveBeenCalled();
+  });
+
+  // The flag must never be usable to hide a failure, so it is honoured only on the success path.
+  test("still logs a FAILED handler even when suppressEvent is set", async () => {
+    const suppressedCtx = {
+      ...mockCtxBase,
+      auditLoggingCtx: { ...mockCtxBase.auditLoggingCtx, suppressEvent: true },
+    };
+    const handlerImpl = vi.fn().mockRejectedValue(new Error("fail"));
+    const wrapped = OriginalHandler.withAuditLogging("created", "user", handlerImpl);
+
+    await expect(wrapped({ ctx: suppressedCtx as any, parsedInput: mockParsedInput })).rejects.toThrow(
+      "fail"
+    );
+    await new Promise(setImmediate);
+
+    expect(serviceLogAuditEventMockHandle).toHaveBeenCalled();
+    expect(serviceLogAuditEventMockHandle.mock.calls[0][0].status).toBe("failure");
+  });
+
   test("does not log if AUDIT_LOG_ENABLED is false", async () => {
     if (mutableConstants) mutableConstants.AUDIT_LOG_ENABLED = false;
     const handlerImpl = vi.fn().mockResolvedValue("ok");
@@ -232,5 +296,65 @@ describe("withAuditLogging", () => {
     expect(serviceLogAuditEventMockHandle).not.toHaveBeenCalled();
     // Reset for other tests; clearAllMockHandles will also do this in the next beforeEach
     if (mutableConstants) mutableConstants.AUDIT_LOG_ENABLED = true;
+  });
+
+  test("resolves targetId for chart target type", async () => {
+    const chartCtx = {
+      ...mockCtxBase,
+      auditLoggingCtx: { ...mockCtxBase.auditLoggingCtx, chartId: "chart-1" },
+    };
+    const handlerImpl = vi.fn().mockResolvedValue("ok");
+    const wrapped = OriginalHandler.withAuditLogging("created", "chart", handlerImpl);
+    await wrapped({ ctx: chartCtx as any, parsedInput: mockParsedInput });
+    await new Promise(setImmediate);
+    expect(serviceLogAuditEventMockHandle).toHaveBeenCalled();
+    const callArgs = serviceLogAuditEventMockHandle.mock.calls[0][0];
+    expect(callArgs.target.type).toBe("chart");
+    expect(callArgs.target.id).toBe("chart-1");
+  });
+
+  test("resolves targetId for feedback source target type", async () => {
+    const feedbackSourceCtx = {
+      ...mockCtxBase,
+      auditLoggingCtx: { ...mockCtxBase.auditLoggingCtx, feedbackSourceId: "feedback-source-1" },
+    };
+    const handlerImpl = vi.fn().mockResolvedValue("ok");
+    const wrapped = OriginalHandler.withAuditLogging("created", "feedbackSource", handlerImpl);
+    await wrapped({ ctx: feedbackSourceCtx as any, parsedInput: mockParsedInput });
+    await new Promise(setImmediate);
+    expect(serviceLogAuditEventMockHandle).toHaveBeenCalled();
+    const callArgs = serviceLogAuditEventMockHandle.mock.calls[0][0];
+    expect(callArgs.target.type).toBe("feedbackSource");
+    expect(callArgs.target.id).toBe("feedback-source-1");
+  });
+
+  test("resolves targetId for dashboard target type", async () => {
+    const dashCtx = {
+      ...mockCtxBase,
+      auditLoggingCtx: { ...mockCtxBase.auditLoggingCtx, dashboardId: "dash-1" },
+    };
+    const handlerImpl = vi.fn().mockResolvedValue("ok");
+    const wrapped = OriginalHandler.withAuditLogging("created", "dashboard", handlerImpl);
+    await wrapped({ ctx: dashCtx as any, parsedInput: mockParsedInput });
+    await new Promise(setImmediate);
+    expect(serviceLogAuditEventMockHandle).toHaveBeenCalled();
+    const callArgs = serviceLogAuditEventMockHandle.mock.calls[0][0];
+    expect(callArgs.target.type).toBe("dashboard");
+    expect(callArgs.target.id).toBe("dash-1");
+  });
+
+  test("resolves targetId for dashboardWidget target type", async () => {
+    const widgetCtx = {
+      ...mockCtxBase,
+      auditLoggingCtx: { ...mockCtxBase.auditLoggingCtx, dashboardWidgetId: "widget-1" },
+    };
+    const handlerImpl = vi.fn().mockResolvedValue("ok");
+    const wrapped = OriginalHandler.withAuditLogging("created", "dashboardWidget", handlerImpl);
+    await wrapped({ ctx: widgetCtx as any, parsedInput: mockParsedInput });
+    await new Promise(setImmediate);
+    expect(serviceLogAuditEventMockHandle).toHaveBeenCalled();
+    const callArgs = serviceLogAuditEventMockHandle.mock.calls[0][0];
+    expect(callArgs.target.type).toBe("dashboardWidget");
+    expect(callArgs.target.id).toBe("widget-1");
   });
 });

@@ -1,6 +1,8 @@
+import { twMerge } from "tailwind-merge";
+import { type TPlacement } from "@formbricks/types/common";
 import { type Result, err, ok, wrapThrowsAsync } from "@formbricks/types/error-handlers";
 import { type ApiErrorResponse } from "@formbricks/types/errors";
-import { type TJsEnvironmentStateSurvey } from "@formbricks/types/js";
+import { type TJsWorkspaceStateSurvey } from "@formbricks/types/js";
 import { type TAllowedFileExtension } from "@formbricks/types/storage";
 import {
   type TSurveyBlock,
@@ -9,10 +11,17 @@ import {
 } from "@formbricks/types/surveys/blocks";
 import { type TSurveyElement, type TSurveyElementChoice } from "@formbricks/types/surveys/elements";
 import { type TShuffleOption } from "@formbricks/types/surveys/types";
+import { isSameLanguageCode } from "@/lib/language-options";
 import { ApiResponse, ApiSuccessResponse } from "@/types/api";
 
-export const cn = (...classes: string[]) => {
-  return classes.filter(Boolean).join(" ");
+type ClassValue = string | boolean | null | undefined | ClassValue[];
+export const cn = (...classes: ClassValue[]): string => {
+  return twMerge(
+    classes
+      .map((className) => (Array.isArray(className) ? cn(...className) : className))
+      .filter((className): className is string => typeof className === "string" && className.length > 0)
+      .join(" ")
+  );
 };
 
 export const getSecureRandom = (): number => {
@@ -109,7 +118,7 @@ export const getShuffledChoicesIds = (
 };
 
 export const calculateElementIdx = (
-  survey: TJsEnvironmentStateSurvey,
+  survey: TJsWorkspaceStateSurvey,
   currentQustionIdx: number,
   totalCards: number
 ): number => {
@@ -204,11 +213,62 @@ export const makeRequest = async <T>(
   return ok(successResponse.data);
 };
 
-export const getDefaultLanguageCode = (survey: TJsEnvironmentStateSurvey): string | undefined => {
+export const getDefaultLanguageCode = (survey: TJsWorkspaceStateSurvey): string | undefined => {
   const defaultSurveyLanguage = survey.languages.find((surveyLanguage) => {
     return surveyLanguage.default;
   });
   if (defaultSurveyLanguage) return defaultSurveyLanguage.language.code;
+};
+
+/**
+ * Resolves the survey's active language to a real language tag, usable as a `lang` attribute.
+ *
+ * The renderer tracks the active language as either a stored language code or the sentinel
+ * `"default"`. `"default"` is not a language tag and must never reach the DOM, so it is resolved to
+ * the code of the survey's default language. Returns `null` when the survey has no languages
+ * configured at all: such a survey has no language to declare and should inherit the host
+ * document's rather than assert a guess.
+ *
+ * The code is resolved AGAINST the survey's enabled languages rather than trusted, and falls back to
+ * the default language when it does not match one — the same rule the server's `getLanguageCode`
+ * applies to `?lang=`. Without that check a stale code declares a language whose content is not
+ * being rendered: `getLocalizedValue` falls back to the `default` text, so a screen reader would
+ * read English with (say) French pronunciation rules, which is worse than declaring nothing. The
+ * offline restore path is the concrete way to get there — it replays a persisted `selectedLanguage`
+ * without revalidating it against a survey whose languages may since have changed.
+ *
+ * Matching is canonical-aware, so a legacy alias (`hi`) resolves to its stored canonical row
+ * (`hi-IN`), and the STORED code is returned so the tag always matches the content lookup key.
+ */
+export const getSurveyLanguageTag = (
+  survey: TJsWorkspaceStateSurvey,
+  languageCode: string
+): string | null => {
+  if (languageCode && languageCode !== "default") {
+    const configured = survey.languages.find(
+      (surveyLanguage) =>
+        surveyLanguage.enabled && isSameLanguageCode(surveyLanguage.language.code, languageCode)
+    );
+    if (configured) return configured.language.code;
+  }
+  return getDefaultLanguageCode(survey) ?? null;
+};
+
+/**
+ * The code the renderer should store for a language the respondent picked.
+ *
+ * Returns the `"default"` sentinel when the pick IS the survey's default language, so selecting the
+ * default records the same thing as never touching the switcher — `survey.tsx` resolves that sentinel
+ * to the default language's stored code when it writes `response.language`.
+ *
+ * Both sides are compared canonically. The option list is deduped by canonical code and keeps the
+ * canonical row, so a survey whose default row holds a legacy alias (`hi`) shows `hi-IN`; comparing
+ * the raw strings would miss that match and store a concrete code where the sentinel belongs, making
+ * the two paths disagree about the same choice.
+ */
+export const resolveSelectedLanguageCode = (languageCode: string, defaultLanguageCode?: string): string => {
+  if (!defaultLanguageCode) return languageCode;
+  return isSameLanguageCode(languageCode, defaultLanguageCode) ? "default" : languageCode;
 };
 
 // Inlined from @formbricks/types/storage.ts to avoid Zod dependency
@@ -244,6 +304,36 @@ const mimeTypes: Record<string, string> = {
 export const getMimeType = (extension: TAllowedFileExtension): string => mimeTypes[extension];
 
 /**
+ * Mirrors a widget placement horizontally for a right-to-left survey.
+ *
+ * Placement is authored once, in LTR terms, and is not per-language — so an Arabic respondent would
+ * otherwise get the popup pinned to the side their eye reaches last, on top of the page corner an RTL
+ * host page is most likely to already be using. Mirroring the corner is the same thing CSS logical
+ * properties do for the survey's own text: the layout as a whole flips, so "bottomRight" means
+ * "bottom, reading-end side" and lands bottom-LEFT in Arabic or Hebrew.
+ *
+ * Vertical placement never flips (RTL reverses the inline axis only), and `center` has no side to
+ * flip. `auto` is left alone deliberately: it means the direction is sniffed from the content at
+ * render time, so there is nothing here to resolve it against.
+ */
+export const mirrorPlacementForDir = (placement: TPlacement, dir: "ltr" | "rtl" | "auto"): TPlacement => {
+  if (dir !== "rtl") return placement;
+
+  switch (placement) {
+    case "bottomRight":
+      return "bottomLeft";
+    case "bottomLeft":
+      return "bottomRight";
+    case "topRight":
+      return "topLeft";
+    case "topLeft":
+      return "topRight";
+    default:
+      return placement;
+  }
+};
+
+/**
  * Returns true if the string contains any RTL character.
  * @param text The input string to test
  */
@@ -261,7 +351,7 @@ const RTL_LANGUAGES = ["ar", "ar-SA", "ar-EG", "ar-AE", "ar-MA", "he", "fa", "ur
  * Returns true if the language code represents an RTL language.
  * @param languageCode The language code to test (e.g., "ar", "ar-SA", "he")
  */
-export function isRTLLanguage(survey: TJsEnvironmentStateSurvey, languageCode: string): boolean {
+export function isRTLLanguage(survey: TJsWorkspaceStateSurvey, languageCode: string): boolean {
   if (survey.languages.length === 0) {
     if (survey.welcomeCard.enabled) {
       const welcomeCardHeadline = survey.welcomeCard.headline?.[languageCode];
@@ -281,10 +371,7 @@ export function isRTLLanguage(survey: TJsEnvironmentStateSurvey, languageCode: s
     }
     return false;
   } else {
-    const code =
-      languageCode === "default"
-        ? survey.languages.find((language) => language.default)?.language.code
-        : languageCode;
+    const code = getSurveyLanguageTag(survey, languageCode);
     const baseCode = code?.split("-")[0].toLowerCase() ?? "en";
     return RTL_LANGUAGES.some((rtl) => rtl.toLowerCase().startsWith(baseCode));
   }
@@ -316,7 +403,7 @@ export const findBlockByElementId = (blocks: TSurveyBlock[], elementId: string) 
  * @returns The first element ID in the block, or undefined if block not found or empty
  */
 export const getFirstElementIdInBlock = (
-  survey: TJsEnvironmentStateSurvey,
+  survey: TJsWorkspaceStateSurvey,
   blockId: string
 ): string | undefined => {
   const block = survey.blocks.find((b) => b.id === blockId);

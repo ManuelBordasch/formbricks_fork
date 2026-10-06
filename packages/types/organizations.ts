@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ZStorageUrl } from "./common";
+import { ZStorageUrl, isValidIanaTimeZone } from "./common";
 
 export const ZCloudBillingPlan = z.enum(["hobby", "pro", "scale", "custom", "unknown"]);
 export type TCloudBillingPlan = z.infer<typeof ZCloudBillingPlan>;
@@ -37,14 +37,27 @@ export const ZOrganizationStripeBilling = z.object({
   lastSyncedEventId: z.string().nullable().optional(),
   trialEnd: z.string().nullable().optional(),
   pendingChange: ZOrganizationStripePendingChange.nullable().optional(),
+  paymentAttemptError: z
+    .object({
+      type: z.enum(["requires_action", "failed_invoice"]),
+      paymentIntentId: z.string(),
+      message: z.string(),
+      createdAt: z.string(),
+    })
+    .nullable()
+    .optional(),
 });
 export type TOrganizationStripeBilling = z.infer<typeof ZOrganizationStripeBilling>;
 
-// responses can be null to support the unlimited plan
+// responses / workflowRuns can be null to support the unlimited plan. workflowRuns is optional (not
+// yet present on billing rows written before workflows became metered, ENG-1936); consumers treat an
+// absent value as "not metered" (null). Kept optional rather than defaulted so the field stays
+// absent from the inferred type unless explicitly set, avoiding churn across every limits literal.
 export const ZOrganizationBillingPlanLimits = z.object({
-  projects: z.number().nullable(),
+  workspaces: z.number().nullable(),
   monthly: z.object({
     responses: z.number().nullable(),
+    workflowRuns: z.number().nullable().optional(),
   }),
 });
 
@@ -53,9 +66,10 @@ export type TOrganizationBillingPlanLimits = z.infer<typeof ZOrganizationBilling
 export const ZOrganizationBilling = z.object({
   stripeCustomerId: z.string().nullable(),
   limits: ZOrganizationBillingPlanLimits.default({
-    projects: 3,
+    workspaces: 3,
     monthly: {
       responses: 1500,
+      workflowRuns: null,
     },
   }),
   usageCycleAnchor: z.date().nullable(),
@@ -86,7 +100,13 @@ export const ZOrganization = z.object({
   whitelabel: ZOrganizationWhitelabel.optional(),
   billing: ZOrganizationBilling,
   isAISmartToolsEnabled: z.boolean().prefault(false),
-  isAIDataAnalysisEnabled: z.boolean().prefault(false),
+  displayTimeZone: z
+    .string()
+    .refine(isValidIanaTimeZone, {
+      error: "Must be a valid IANA time zone",
+    })
+    .nullable()
+    .optional(),
 });
 
 export const ZOrganizationCreateInput = z.object({
@@ -101,7 +121,13 @@ export const ZOrganizationUpdateInput = z.object({
   whitelabel: ZOrganizationWhitelabel.optional(),
   billing: ZOrganizationBilling.optional(),
   isAISmartToolsEnabled: z.boolean().optional(),
-  isAIDataAnalysisEnabled: z.boolean().optional(),
+  displayTimeZone: z
+    .string()
+    .refine(isValidIanaTimeZone, {
+      error: "Must be a valid IANA time zone",
+    })
+    .nullable()
+    .optional(),
 });
 
 export type TOrganizationUpdateInput = z.infer<typeof ZOrganizationUpdateInput>;

@@ -6,14 +6,106 @@ import { cache } from "@/lib/cache";
 import { RATE_LIMITING_DISABLED, SENTRY_DSN } from "@/lib/constants";
 import { TRateLimitConfig, type TRateLimitResponse } from "./types/rate-limit";
 
+const getRateLimitWindow = (config: TRateLimitConfig, identifier: string, now = Date.now()) => {
+  const windowStart = Math.floor(now / (config.interval * 1000)) * config.interval;
+  const key = createCacheKey.rateLimit.core(config.namespace, identifier, windowStart);
+  const windowEnd = windowStart + config.interval;
+  const ttlSeconds = Math.max(1, Math.ceil((windowEnd * 1000 - now) / 1000));
+
+  return { key, windowEnd, ttlSeconds };
+};
+
+const buildRateLimitResponse = (
+  config: TRateLimitConfig,
+  currentCount: number,
+  ttlSeconds: number
+): TRateLimitResponse => {
+  const allowed = currentCount < config.allowedPerInterval;
+
+  return {
+    allowed,
+    retryAfter: allowed ? undefined : ttlSeconds,
+  };
+};
+
+/**
+ * Read the current rate limit usage without incrementing the counter.
+ */
+export const peekRateLimit = async (
+  config: TRateLimitConfig,
+  identifier: string
+): Promise<Result<TRateLimitResponse, string>> => {
+  if (RATE_LIMITING_DISABLED) {
+    logger.debug(`Rate limiting disabled`);
+    return ok({
+      allowed: true,
+    });
+  }
+
+  try {
+    const redis = await cache.getRedisClient();
+    if (!redis) {
+      logger.debug(`Redis unavailable`);
+      return ok({
+        allowed: true,
+      });
+    }
+
+    const { key, ttlSeconds } = getRateLimitWindow(config, identifier);
+    const rawCount = await redis.get(key);
+    const currentCount = rawCount ? Number.parseInt(rawCount, 10) : 0;
+    const response = buildRateLimitResponse(config, currentCount, ttlSeconds);
+
+    if (!response.allowed) {
+      logger.error(
+        {
+          identifier,
+          currentCount,
+          limit: config.allowedPerInterval,
+          window: config.interval,
+          key,
+          namespace: config.namespace,
+        },
+        `Rate limit exceeded`
+      );
+    }
+
+    return ok(response);
+  } catch (error) {
+    const errorMessage = `Rate limit check failed`;
+    const errorContext = { error, identifier, namespace: config.namespace };
+
+    logger.error(errorContext, errorMessage);
+
+    if (SENTRY_DSN) {
+      Sentry.captureException(error, {
+        tags: {
+          component: "rate-limiter",
+          namespace: config.namespace,
+        },
+        extra: errorContext,
+      });
+    }
+
+    return ok({
+      allowed: true,
+    });
+  }
+};
+
 /**
  * Atomic Redis-based rate limiter using Lua scripts
  * Prevents race conditions in multi-pod Kubernetes environments
  */
 export const checkRateLimit = async (
   config: TRateLimitConfig,
-  identifier: string
+  identifier: string,
+  requested = 1
 ): Promise<Result<TRateLimitResponse, string>> => {
+  if (!Number.isInteger(requested) || requested < 1) {
+    throw new Error("Rate limit usage must be a positive integer");
+  }
+
   // Skip rate limiting if disabled
   if (RATE_LIMITING_DISABLED) {
     logger.debug(`Rate limiting disabled`);
@@ -32,37 +124,36 @@ export const checkRateLimit = async (
       });
     }
 
-    const now = Date.now();
-    const windowStart = Math.floor(now / (config.interval * 1000)) * config.interval;
-    const key = createCacheKey.rateLimit.core(config.namespace, identifier, windowStart);
+    const { key, windowEnd, ttlSeconds } = getRateLimitWindow(config, identifier);
 
-    // Calculate TTL to expire exactly at window end, value in seconds
-    const windowEnd = windowStart + config.interval;
-    // Convert window end from seconds to milliseconds, subtract current time, then convert back to seconds for Redis EXPIRE (at least 1 second)
-    const ttlSeconds = Math.max(1, Math.ceil((windowEnd * 1000 - now) / 1000));
-
-    // Lua script for atomic increment and conditional expire
-    // This prevents race conditions between INCR and EXPIRE operations
+    // Lua script for atomic weighted increment and conditional expire.
+    // Refusing before INCRBY prevents an oversized request from consuming the remaining budget.
     const luaScript = `
       local key = KEYS[1]
       local limit = tonumber(ARGV[1])
       local ttl = tonumber(ARGV[2])
-      
-      -- Atomically increment and get current count
-      local current = redis.call('INCR', key)
-      
-      -- Set TTL only if this is the first increment (avoids extending windows)
-      if current == 1 then
+      local requested = tonumber(ARGV[3])
+
+      local current = tonumber(redis.call('GET', key) or '0')
+      local next = current + requested
+
+      if next > limit then
+        return {next, 0}
+      end
+
+      local updated = redis.call('INCRBY', key, requested)
+
+      -- Set TTL only when creating the counter (avoids extending windows)
+      if current == 0 then
         redis.call('EXPIRE', key, ttl)
       end
-      
-      -- Return current count and whether it's within limit
-      return {current, current <= limit and 1 or 0}
+
+      return {updated, 1}
     `;
 
     const result = (await redis.eval(luaScript, {
       keys: [key],
-      arguments: [config.allowedPerInterval.toString(), ttlSeconds.toString()],
+      arguments: [config.allowedPerInterval.toString(), ttlSeconds.toString(), requested.toString()],
     })) as [number, number];
     const [currentCount, isAllowed] = result;
 
@@ -74,6 +165,7 @@ export const checkRateLimit = async (
         limit: config.allowedPerInterval,
         window: config.interval,
         key,
+        requested,
         allowed: isAllowed === 1,
         windowEnd,
       },
@@ -94,6 +186,7 @@ export const checkRateLimit = async (
         window: config.interval,
         key,
         namespace: config.namespace,
+        requested,
       };
 
       logger.error(violationContext, `Rate limit exceeded`);
