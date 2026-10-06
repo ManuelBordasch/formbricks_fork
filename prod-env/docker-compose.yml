@@ -1,5 +1,5 @@
 x-environment: &environment
-  environment:
+  environment: &app-environment
     ######################################################## REQUIRED ########################################################
 
     # The url of your Formbricks instance used in the admin panel
@@ -28,6 +28,20 @@ x-environment: &environment
     # Redis URL for caching, rate limiting, and audit logging
     # To use external Redis/Valkey: remove the redis service below and update this URL
     REDIS_URL: "${REDIS_URL}"
+
+    # Formbricks Hub & Cube (Pflicht laut env.ts). Die Dienste laufen hier nicht -> Platzhalter aus .env
+    HUB_API_URL: "${HUB_API_URL}"
+    HUB_API_KEY: "${HUB_API_KEY}"
+    CUBEJS_API_URL: "${CUBEJS_API_URL}"
+    CUBEJS_API_SECRET: "${CUBEJS_API_SECRET}"
+
+    # AuthZed / SpiceDB (Pflicht ab v6). INSECURE = unverschlüsseltes gRPC im internen Docker-Netz
+    AUTHZED_ENABLED: "true"
+    AUTHZED_ENDPOINT: "spicedb:50051"
+    AUTHZED_TOKEN: "${AUTHZED_TOKEN:?AUTHZED_TOKEN is required}"
+    AUTHZED_SYSTEM_KEY: "formbricks"
+    AUTHZED_INSECURE: "true"
+    AUTHZED_CONSISTENCY: "fully_consistent"
 
     # Set the minimum log level(debug, info, warn, error, fatal)
     # LOG_LEVEL: info
@@ -237,16 +251,89 @@ services:
     restart: always
     image: valkey/valkey@sha256:12ba4f45a7c3e1d0f076acd616cb230834e75a77e8516dde382720af32832d6d
     command: valkey-server --appendonly yes
+    # Kein Host-Port: Valkey hält die Session-Tokens und ist nur im internen Docker-Netz erreichbar
     volumes:
       - redis:/data
-    ports:
-      - "6379:6379"
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 30
       start_period: 10s
+
+  # --- AuthZed / SpiceDB (Pflicht ab Formbricks v6), analog docker/docker-compose.yml ---
+  authzed-db-bootstrap:
+    image: pgvector/pgvector:pg17
+    restart: "no"
+    entrypoint: ["/bin/sh", "/usr/local/bin/authzed-postgres-bootstrap.sh"]
+    environment:
+      POSTGRES_ADMIN_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/postgres?sslmode=disable
+      AUTHZED_DATABASE_NAME: spicedb
+      AUTHZED_DATABASE_USERNAME: spicedb
+      AUTHZED_DATABASE_PASSWORD: ${AUTHZED_DATABASE_PASSWORD:?AUTHZED_DATABASE_PASSWORD is required}
+    volumes:
+      - ./authzed-postgres-bootstrap.sh:/usr/local/bin/authzed-postgres-bootstrap.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  spicedb-migrate:
+    image: authzed/spicedb:v1.52.0
+    restart: "no"
+    command: datastore migrate head
+    environment:
+      SPICEDB_DATASTORE_ENGINE: postgres
+      SPICEDB_DATASTORE_CONN_URI: postgresql://spicedb:${AUTHZED_DATABASE_PASSWORD:?AUTHZED_DATABASE_PASSWORD is required}@postgres:5432/spicedb?sslmode=disable
+    depends_on:
+      authzed-db-bootstrap:
+        condition: service_completed_successfully
+
+  spicedb:
+    image: authzed/spicedb:v1.52.0
+    restart: always
+    command: serve
+    mem_limit: 512m
+    environment:
+      SPICEDB_DATASTORE_ENGINE: postgres
+      SPICEDB_DATASTORE_CONN_URI: postgresql://spicedb:${AUTHZED_DATABASE_PASSWORD:?AUTHZED_DATABASE_PASSWORD is required}@postgres:5432/spicedb?sslmode=disable
+      SPICEDB_GRPC_PRESHARED_KEY: ${AUTHZED_TOKEN:?AUTHZED_TOKEN is required}
+      SPICEDB_LOG_FORMAT: json
+      SPICEDB_LOG_LEVEL: info
+      SPICEDB_TELEMETRY_ENDPOINT: ""
+    depends_on:
+      spicedb-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=localhost:50051"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Prisma-Migrationen als eigener Schritt (formbricks startet mit SKIP_STARTUP_MIGRATION)
+  formbricks-migrate:
+    image: mbordasch/formbricks_cl:latest
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command: ["node /home/nextjs/validate-env.mjs && node packages/database/dist/scripts/apply-migrations.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    <<: *environment
+
+  # Wartungsbefehle, startet nie mit dem normalen Stack.
+  # Beispiel: docker compose --profile authzed-ops run --rm authzed-ops upgrade check
+  authzed-ops:
+    profiles: ["authzed-ops"]
+    image: mbordasch/formbricks_cl:latest
+    entrypoint: ["formbricks-authzed"]
+    command: ["health"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      spicedb:
+        condition: service_healthy
+    <<: *environment
 
   formbricks:
     restart: always
@@ -256,8 +343,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    ports:
-      - 3000:3000
+      spicedb:
+        condition: service_healthy
+      formbricks-migrate:
+        condition: service_completed_successfully
+    # Kein Host-Port 3000: Traefik erreicht den Container über das Docker-Netz
     volumes:
       - ./saml-connection:/home/nextjs/apps/web/saml-connection
     labels:
@@ -271,7 +361,9 @@ services:
       - "traefik.http.middlewares.hstsHeader.headers.forceSTSHeader=true"
       - "traefik.http.middlewares.hstsHeader.headers.stsPreload=true"
       - "traefik.http.middlewares.hstsHeader.headers.stsIncludeSubdomains=true"
-    <<: *environment
+    environment:
+      <<: *app-environment
+      SKIP_STARTUP_MIGRATION: "true"
 
 volumes:
   postgres:

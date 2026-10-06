@@ -1,3 +1,42 @@
+x-authzed-token: &authzed-token "043381f4e8fdaad734e5b21157b2bdf918ad48c2ff6f2e427399ce13e5ba4d3e"
+
+x-formbricks-env: &formbricks-env
+  WEBAPP_URL: "http://localhost:3000"
+  NEXTAUTH_URL: "http://localhost:3000"
+  DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/postgres?schema=public"
+  # Secrets – vor dem ersten Start mit echten Werten befüllen:
+  # openssl rand -hex 32
+  NEXTAUTH_SECRET: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
+  ENCRYPTION_KEY: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
+  CRON_SECRET: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
+  REDIS_URL: "redis://valkey:6379"
+  EMAIL_VERIFICATION_DISABLED: 1
+  PASSWORD_RESET_DISABLED: 1
+  # Mailhog für lokales E-Mail-Testing
+  MAIL_FROM: "admin@companlabs.de"
+  SMTP_HOST: "mailhog"
+  SMTP_PORT: "1025"
+  SMTP_AUTHENTICATED: "0"
+  # MinIO als S3-kompatibler Speicher
+  S3_ACCESS_KEY: "devminio"
+  S3_SECRET_KEY: "devminio123"
+  S3_REGION: "us-east-1"
+  S3_BUCKET_NAME: "formbricks"
+  S3_ENDPOINT_URL: "http://minio:9000"
+  S3_FORCE_PATH_STYLE: "1"
+  # Pflichtvariablen (env.ts) – Hub & Cube laufen hier nicht, daher Platzhalter
+  HUB_API_URL: "http://localhost:8080"
+  HUB_API_KEY: "unused-hub-key"
+  CUBEJS_API_URL: "http://localhost:4000"
+  CUBEJS_API_SECRET: "unused-cube-secret"
+  # AuthZed / SpiceDB (Pflicht ab v6)
+  AUTHZED_ENABLED: "true"
+  AUTHZED_ENDPOINT: "spicedb:50051"
+  AUTHZED_TOKEN: *authzed-token
+  AUTHZED_SYSTEM_KEY: "formbricks"
+  AUTHZED_INSECURE: "true"
+  AUTHZED_CONSISTENCY: "fully_consistent"
+
 services:
   postgres:
     image: pgvector/pgvector:pg17
@@ -37,7 +76,8 @@ services:
       start_period: 10s
 
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # minio/minio wurde von Docker Hub entfernt -> Community-Build (pgsty)
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
     command: server /data --console-address ":9001"
     environment:
       - MINIO_ROOT_USER=devminio
@@ -48,6 +88,78 @@ services:
     volumes:
       - minio-data:/data
 
+  # --- AuthZed / SpiceDB (Pflicht ab Formbricks v6), analog docker/docker-compose.yml ---
+  authzed-db-bootstrap:
+    image: pgvector/pgvector:pg17
+    restart: "no"
+    entrypoint: ["/bin/sh", "/usr/local/bin/authzed-postgres-bootstrap.sh"]
+    environment:
+      POSTGRES_ADMIN_URL: postgresql://postgres:postgres@postgres:5432/postgres?sslmode=disable
+      AUTHZED_DATABASE_NAME: spicedb
+      AUTHZED_DATABASE_USERNAME: spicedb
+      AUTHZED_DATABASE_PASSWORD: spicedb
+    volumes:
+      - ./docker/authzed-postgres-bootstrap.sh:/usr/local/bin/authzed-postgres-bootstrap.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  spicedb-migrate:
+    image: authzed/spicedb:v1.52.0
+    restart: "no"
+    command: datastore migrate head
+    environment:
+      SPICEDB_DATASTORE_ENGINE: postgres
+      SPICEDB_DATASTORE_CONN_URI: postgresql://spicedb:spicedb@postgres:5432/spicedb?sslmode=disable
+    depends_on:
+      authzed-db-bootstrap:
+        condition: service_completed_successfully
+
+  spicedb:
+    image: authzed/spicedb:v1.52.0
+    restart: always
+    command: serve
+    environment:
+      SPICEDB_DATASTORE_ENGINE: postgres
+      SPICEDB_DATASTORE_CONN_URI: postgresql://spicedb:spicedb@postgres:5432/spicedb?sslmode=disable
+      SPICEDB_GRPC_PRESHARED_KEY: *authzed-token
+      SPICEDB_LOG_FORMAT: json
+      SPICEDB_LOG_LEVEL: info
+      SPICEDB_TELEMETRY_ENDPOINT: ""
+    depends_on:
+      spicedb-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=localhost:50051"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Prisma-Migrationen vor dem AuthZed-Setup (formbricks selbst überspringt sie dann)
+  formbricks-migrate:
+    image: formbricks_cl:latest
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command: ["node /home/nextjs/validate-env.mjs && node packages/database/dist/scripts/apply-migrations.js"]
+    environment: *formbricks-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Bereitet das SpiceDB-Schema/Relationen idempotent vor
+  authzed-initialize:
+    image: formbricks_cl:latest
+    restart: "no"
+    entrypoint: ["formbricks-authzed"]
+    command: ["upgrade", "prepare"]
+    environment: *formbricks-env
+    depends_on:
+      formbricks-migrate:
+        condition: service_completed_successfully
+      spicedb:
+        condition: service_healthy
+
   formbricks:
     build:
       context: .
@@ -55,38 +167,17 @@ services:
     image: formbricks_cl:latest
     restart: always
     depends_on:
-      postgres:
-        condition: service_healthy
       valkey:
         condition: service_healthy
+      authzed-initialize:
+        condition: service_completed_successfully
     ports:
       - 3000:3000
     volumes:
       - uploads:/home/nextjs/apps/web/uploads
     environment:
-      WEBAPP_URL: "http://localhost:3000"
-      NEXTAUTH_URL: "http://localhost:3000"
-      DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/postgres?schema=public"
-      # Secrets – vor dem ersten Start mit echten Werten befüllen:
-      # openssl rand -hex 32
-      NEXTAUTH_SECRET: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
-      ENCRYPTION_KEY: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
-      CRON_SECRET: "4cf6b2fff1c3ddb854adb39b7730bc4d136d3d7aa1f3ffbb84e445aeb3a2e159"
-      REDIS_URL: "redis://valkey:6379"
-      EMAIL_VERIFICATION_DISABLED: 1
-      PASSWORD_RESET_DISABLED: 1
-      # Mailhog für lokales E-Mail-Testing
-      MAIL_FROM: "admin@companlabs.de"
-      SMTP_HOST: "mailhog"
-      SMTP_PORT: "1025"
-      SMTP_AUTHENTICATED: "0"
-      # MinIO als S3-kompatibler Speicher
-      S3_ACCESS_KEY: "devminio"
-      S3_SECRET_KEY: "devminio123"
-      S3_REGION: "us-east-1"
-      S3_BUCKET_NAME: "formbricks"
-      S3_ENDPOINT_URL: "http://minio:9000"
-      S3_FORCE_PATH_STYLE: "1"
+      <<: *formbricks-env
+      SKIP_STARTUP_MIGRATION: "true"
 
 volumes:
   postgres:

@@ -108,7 +108,7 @@ fi
 
 # ── 7. Verify required config files ──────────
 echo "Checking required config files..."
-for FILE in docker-compose.yml traefik.yaml traefik-dynamic.yaml; do
+for FILE in docker-compose.yml traefik.yaml traefik-dynamic.yaml authzed-postgres-bootstrap.sh; do
   if [[ ! -f "$SCRIPT_DIR/$FILE" ]]; then
     fail "$FILE not found in $SCRIPT_DIR."
   fi
@@ -123,8 +123,19 @@ ok "Images pulled."
 
 # ── 9. Start services ────────────────────────
 echo ""
+echo "Starting database and SpiceDB, running migrations..."
+DC=(docker compose --project-directory "$SCRIPT_DIR")
+"${DC[@]}" up -d postgres authzed-db-bootstrap spicedb-migrate spicedb
+"${DC[@]}" run --rm formbricks-migrate
+ok "Database migrated."
+
+echo "Preparing AuthZed (SpiceDB schema & relationships)..."
+"${DC[@]}" --profile authzed-ops run --rm authzed-ops upgrade prepare
+"${DC[@]}" --profile authzed-ops run --rm authzed-ops upgrade check || fail "AuthZed check failed – Formbricks not started."
+ok "AuthZed ready."
+
 echo "Starting services..."
-docker compose --project-directory "$SCRIPT_DIR" up -d
+"${DC[@]}" up -d
 ok "Services started."
 
 # ── 10. Health summary ───────────────────────
