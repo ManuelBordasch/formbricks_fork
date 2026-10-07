@@ -117,7 +117,7 @@ services:
 
   spicedb:
     image: authzed/spicedb:v1.52.0
-    restart: always
+    restart: on-failure:5
     command: serve
     environment:
       SPICEDB_DATASTORE_ENGINE: postgres
@@ -165,7 +165,7 @@ services:
       context: .
       dockerfile: apps/web/Dockerfile
     image: formbricks_cl:latest
-    restart: always
+    restart: on-failure:5
     depends_on:
       valkey:
         condition: service_healthy
