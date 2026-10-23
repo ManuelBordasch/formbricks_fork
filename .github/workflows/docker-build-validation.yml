@@ -69,6 +69,7 @@ jobs:
   validate-docker-build:
     name: Validate Docker Build
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
 
@@ -154,6 +155,12 @@ jobs:
             hub_api_key=build-time-placeholder
             cubejs_api_url=http://localhost:4000
             cubejs_api_secret=build-time-placeholder
+
+      # Node must trust the OS CA bundle, or a CA-package fix such as the eMudhra distrust never reaches it.
+      - name: Verify Node trusts the OS CA bundle
+        env:
+          IMAGE: formbricks-test:${{ github.sha }}
+        run: bash apps/web/scripts/docker/verify-tls-image.sh "$IMAGE"
 
       - name: Verify Runtime Image Excludes npm
         shell: bash

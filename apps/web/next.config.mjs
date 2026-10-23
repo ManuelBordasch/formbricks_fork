@@ -77,7 +77,13 @@ const nextConfig = {
     "pino-pretty",
     "pino-opentelemetry-transport",
     "posthog-node",
+    "typeorm",
   ],
+  // Jackson is configured exclusively with PostgreSQL (modules/ee/auth/saml/lib/jackson.ts).
+  // TypeORM's lazy SQL Server driver traces unused mssql/tedious code and vulnerable sprintf-js.
+  outputFileTracingExcludes: {
+    "/*": ["../../**/node_modules/{mssql,tedious,sprintf-js}/**/*"],
+  },
   outputFileTracingIncludes: {
     "/api/auth/**/*": ["../../node_modules/jose/**/*"],
     // pino loads transport code in worker threads via dynamic require() — the file tracer
@@ -93,6 +99,10 @@ const nextConfig = {
   },
   turbopack: {},
   experimental: {
+    // With patches/next@16.3.8.patch applied, Next clones no request body for proxy.ts or for an external
+    // rewrite such as the PostHog /ingest proxy (ENG-3972), so this only bounds the body Next hands an
+    // edge-runtime function, and this app has none. Kept as the fallback for a Next without the patch, which
+    // would clone again and cut bodies off at this size, so the import routes keep their limits below it.
     proxyClientMaxBodySize: "16mb",
   },
   transpilePackages: ["@formbricks/database", "@formbricks/workflows"],
